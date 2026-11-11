@@ -111,38 +111,6 @@ firewall:
 	require.Nil(t, ctrl, "a config test hands back nothing to stop, so it must stop itself")
 }
 
-// TestMain_configTestRejectsABadDNSStanza pins that a dns stanza that does not load stops Main, in a config test
-// as at startup. That makes the config test the place an operator hears about it before deploying it.
-func TestMain_configTestRejectsABadDNSStanza(t *testing.T) {
-	l := test.NewLogger()
-	caPath, certPath, keyPath := writeTestPKI(t, t.TempDir())
-
-	c := config.NewC(l)
-	require.NoError(t, c.LoadString(fmt.Sprintf(`
-pki:
-  ca: %s
-  cert: %s
-  key: %s
-dns:
-  enabled: true
-  nameservers: [nope]
-  search_domains: [mesh.example.com]
-firewall:
-  outbound:
-    - port: any
-      proto: any
-      host: any
-  inbound:
-    - port: any
-      proto: any
-      host: any
-`, caPath, certPath, keyPath)))
-
-	ctrl, err := Main(c, true, "config-test", l, nil)
-	require.ErrorContains(t, err, "entry 1 in dns.nameservers is not an IP address")
-	assert.Nil(t, ctrl)
-}
-
 // writeTestPKI writes a CA and a cert signed by it to dir, and returns their paths for a pki stanza.
 func writeTestPKI(t *testing.T, dir string) (caPath, certPath, keyPath string) {
 	t.Helper()

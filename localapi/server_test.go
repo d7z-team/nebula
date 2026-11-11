@@ -695,9 +695,8 @@ func TestPresentationParametersAreRefused(t *testing.T) {
 	assert.JSONEq(t, `{"a":1}`, string(res.Result), "the API default is JSON")
 }
 
-// TestTextRequestToATextlessCommand: a command with no human rendering still answers a
-// text request when the answer is a refusal, since a refusal always has one. Only a
-// successful result has nothing to say in text, and that is reported then, by the daemon.
+// TestTextRequestToATextlessCommand: a command with no human rendering falls back to
+// compact JSON for a successful value. A refusal remains a sentence.
 func TestTextRequestToATextlessCommand(t *testing.T) {
 	reg := commands.New()
 	reg.Register(&commands.Command{
@@ -709,7 +708,6 @@ func TestTextRequestToATextlessCommand(t *testing.T) {
 			}
 			return commands.Value(map[string]int{"index": 7}), nil
 		},
-		JSONOnly: true,
 	})
 	_, path := serve(t, reg)
 	c := &Client{Path: path}
@@ -720,8 +718,8 @@ func TestTextRequestToATextlessCommand(t *testing.T) {
 
 	res, err = c.Invoke("tunnel", nil, []string{"10.0.0.1"}, "text")
 	require.NoError(t, err)
-	assert.Contains(t, res.Error, "tunnel has no human readable output yet; pass -json or -pretty")
-	assert.Empty(t, res.Result)
+	require.Empty(t, res.Error)
+	assert.JSONEq(t, `{"index":7}`, string(res.Text))
 
 	res, err = c.Invoke("tunnel", nil, []string{"10.0.0.1"}, "json")
 	require.NoError(t, err)
@@ -765,8 +763,7 @@ func TestRebindAfterFailedBindStillStopsOnCancel(t *testing.T) {
 }
 
 // TestCommandRegisteredAfterStartIsServed: the server filters the registry per request,
-// so a command an embedder registers after wiring the socket is served, and described,
-// just as it would be over ssh.
+// so a command an embedder registers after wiring the socket is served and described.
 func TestCommandRegisteredAfterStartIsServed(t *testing.T) {
 	reg := basicRegistry()
 	_, path := serve(t, reg)
@@ -793,71 +790,6 @@ func TestCommandRegisteredAfterStartIsServed(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, res.Error)
 	assert.JSONEq(t, `"late"`, string(res.Result))
-}
-
-// TestThenIsAnsweredInTheOneReply: this surface answers in one piece, so a command that
-// acts does so before the reply, and the reply carries Run's line and Then's outcome in
-// text, and the outcome alone in JSON.
-func TestThenIsAnsweredInTheOneReply(t *testing.T) {
-	reg := commands.New()
-	acted := false
-	reg.Register(&commands.Command{
-		Name:             "act",
-		ShortDescription: "replies, then acts",
-		Run: func(fs any, a []string) (commands.Result, error) {
-			return commands.Did("about to act"), nil
-		},
-		Then: func() commands.Result {
-			acted = true
-			return commands.Did("acted")
-		},
-	})
-	_, path := serve(t, reg)
-
-	res, err := (&Client{Path: path}).Invoke("act", nil, nil, "text")
-	require.NoError(t, err)
-	assert.True(t, acted)
-	assert.Empty(t, res.Error)
-	assert.Equal(t, "about to act\nacted\n", string(res.Text))
-
-	res, err = (&Client{Path: path}).Invoke("act", nil, nil, "")
-	require.NoError(t, err)
-	assert.JSONEq(t, `{"ok":true,"reason":"acted"}`, string(res.Result))
-
-	// A refusal from Then still carries Run's line ahead of it in text, as ssh prints it.
-	acted = false
-	reg.Register(&commands.Command{
-		Name:             "fail",
-		ShortDescription: "replies, then fails to act",
-		Run: func(fs any, a []string) (commands.Result, error) {
-			return commands.Did("about to act"), nil
-		},
-		Then: func() commands.Result {
-			return commands.Failed("could not act")
-		},
-	})
-	res, err = (&Client{Path: path}).Invoke("fail", nil, nil, "text")
-	require.NoError(t, err)
-	assert.Equal(t, "about to act\ncould not act\n", res.Error)
-	assert.Empty(t, res.Text)
-
-	// A Run that refused is the outcome, and Then does not run.
-	acted = false
-	reg.Register(&commands.Command{
-		Name:             "refuse",
-		ShortDescription: "refuses, so never acts",
-		Run: func(fs any, a []string) (commands.Result, error) {
-			return commands.Failed("not like that"), nil
-		},
-		Then: func() commands.Result {
-			acted = true
-			return commands.Did("acted anyway")
-		},
-	})
-	res, err = (&Client{Path: path}).Invoke("refuse", nil, nil, "text")
-	require.NoError(t, err)
-	assert.Equal(t, "not like that\n", res.Error)
-	assert.False(t, acted)
 }
 
 // TestRebindRefusesDuringShutdown: a reload that lands after the daemon's context is
@@ -959,7 +891,7 @@ func TestTrailingBytesOnARequestAreRefused(t *testing.T) {
 
 // TestTextOutputKeepsTheBytes: a text rendering travels as the bytes the command wrote.
 // A JSON string would have had to be UTF-8, and a byte that is not would have come out
-// as U+FFFD, where the ssh server passes it through.
+// as U+FFFD.
 func TestTextOutputKeepsTheBytes(t *testing.T) {
 	reg := commands.New()
 	raw := []byte{'n', 'a', 'm', 'e', ' ', 0xff, 0xfe, '\n'}

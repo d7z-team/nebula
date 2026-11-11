@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the SSH debug server. Runtime inspection and administrative commands remain
+  available through `nebula ctl` and the local control API.
+- Removed the lighthouse DNS responder and the experimental host DNS configuration.
+
 ## [1.12.0] - 2026-10-29
 
 This release introduces udp/tun offloading support that can be enabled for greater performance. This will be enabled by default in a future release. See the `listen.udp_offloads` and `tun.use_offloads` example config settings for more details.

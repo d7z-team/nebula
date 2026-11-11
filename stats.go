@@ -22,8 +22,8 @@ import (
 )
 
 // statsServer owns nebula's stats subsystem: the periodic metric capture
-// goroutine and (for prometheus) an HTTP listener. It mirrors the lifecycle
-// shape of dnsServer: constructor wires the reload callback, reload records
+// goroutine and (for prometheus) an HTTP listener. It mirrors the lifecycle shape of
+// the other reloadable services: constructor wires the reload callback, reload records
 // config, Start builds and runs the runtime, Stop tears it down.
 type statsServer struct {
 	l            *slog.Logger

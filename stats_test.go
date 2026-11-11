@@ -40,6 +40,18 @@ func currentRuntime(s *statsServer) *statsRuntime {
 	return s.run
 }
 
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for condition")
+}
+
 func TestStatsServer_reload_initial_disabled(t *testing.T) {
 	s, c := newTestStatsServer(t)
 	setStatsConfig(c, map[string]any{"type": "none"})

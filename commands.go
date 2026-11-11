@@ -18,9 +18,7 @@ import (
 	"github.com/slackhq/nebula/logging"
 )
 
-// The commands nebula serves. attachCommands builds the one registry every surface
-// reads; the ssh debug server is a consumer of it, not its owner, which is why this
-// is not ssh.go. See the commands package for what a Command is.
+// The commands nebula serves. attachCommands builds the registry used by the local API.
 
 type listHostMapFlags struct {
 	ByIndex bool
@@ -127,13 +125,8 @@ func attachCommands(l *slog.Logger, c *config.C, reg *commands.Registry, f *Inte
 	reg.Register(&commands.Command{
 		Name:             commands.Reload,
 		ShortDescription: "Reloads configuration from disk, same as sending HUP to the process",
-		// The line goes out before the reload: a reload that restarts the ssh server ends
-		// the session that asked, and this is what it sees.
 		Run: func(fs any, a []string) (commands.Result, error) {
-			return commands.Did("Reloading config"), nil
-		},
-		Then: func() commands.Result {
-			return runReload(l, c)
+			return runReload(l, c), nil
 		},
 	})
 
@@ -200,9 +193,6 @@ func attachCommands(l *slog.Logger, c *config.C, reg *commands.Registry, f *Inte
 		Run: func(fs any, a []string) (commands.Result, error) {
 			return runPrintTunnel(f, a)
 		},
-		// No Text on purpose: nothing human readable exists yet, and shipping an interim
-		// form would invite scripts against it. ssh defaults these to JSON; ctl asks.
-		JSONOnly: true,
 	})
 
 	reg.Register(&commands.Command{
@@ -211,8 +201,6 @@ func attachCommands(l *slog.Logger, c *config.C, reg *commands.Registry, f *Inte
 		Run: func(fs any, a []string) (commands.Result, error) {
 			return commands.Value(runPrintRelays(f)), nil
 		},
-		// No Text on purpose; see print-tunnel.
-		JSONOnly: true,
 	})
 
 	reg.Register(commands.Flagged(&commands.Command{
@@ -250,8 +238,6 @@ func attachCommands(l *slog.Logger, c *config.C, reg *commands.Registry, f *Inte
 		Run: func(fs any, a []string) (commands.Result, error) {
 			return runQueryLighthouse(f, a)
 		},
-		// No Text on purpose; see print-tunnel.
-		JSONOnly: true,
 	})
 }
 
@@ -623,8 +609,8 @@ func textDeviceInfo(d deviceInfo, w io.Writer) error {
 	return err
 }
 
-// runReload reloads the config and reports how it went. A reload that failed is a
-// refusal, exit 1 over ssh; one that merely needs a restart is not.
+// runReload reloads the config and reports how it went. A failed reload is a refusal;
+// one that merely needs a restart is not.
 func runReload(l *slog.Logger, c *config.C) commands.Result {
 	res := c.ReloadConfig()
 	res.Log(l)

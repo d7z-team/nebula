@@ -5,16 +5,13 @@ go 1.27.3
 require (
 	dario.cat/mergo v1.0.2
 	filippo.io/bigmod v0.1.0
-	github.com/DefinedNet/dnsconfig v0.0.0-20261028201825-617c971e7a6a
 	github.com/DefinedNet/netlink v1.3.2-dn.1
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be
 	github.com/flynn/noise v1.1.0
 	github.com/gaissmai/bart v0.30.0
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/gopacket v1.1.19
 	github.com/kardianos/service v1.3.0
-	github.com/miekg/dns v1.1.73
 	github.com/miekg/pkcs11 v1.1.2
 	github.com/nbrownus/go-metrics-prometheus v0.0.0-20210712211119-974a6260965f
 	github.com/prometheus/client_golang v1.25.0

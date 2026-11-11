@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -13,8 +14,7 @@ import (
 
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/cert_test"
-	"github.com/slackhq/nebula/commands"
-	"github.com/slackhq/nebula/sshd"
+	"github.com/slackhq/nebula/localapi"
 	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/require"
 )
@@ -43,15 +43,14 @@ func normalise(s string) string {
 	return s
 }
 
-// outputCase is one command line to run through the ssh dispatch path.
+// outputCase is one command line to run through nebula ctl.
 type outputCase struct {
 	name string
 	args []string
 }
 
 // TestCommandOutput pins the bytes every command produces, in every format, through the
-// ssh dispatch path. It is the safety net for moving rendering out of the commands: a
-// change here is a change someone at an ssh prompt would see. Regenerate with:
+// local control API. Regenerate with:
 //
 //	go test -tags e2e_testing ./e2e -run TestCommandOutput -update
 func TestCommandOutput(t *testing.T) {
@@ -65,19 +64,30 @@ func TestCommandOutput(t *testing.T) {
 	control.Start()
 	t.Cleanup(func() { control.Stop() })
 
-	// As an ssh session does: a clone of the daemon's registry with logout added, which
-	// help on the clone lists and describes. There is no session to end here.
-	reg := control.Commands().Clone()
-	reg.Register(sshd.LogoutCommand(func() {}))
-	// Dispatch with ssh's default-format policy, so the no-flag column records what an
-	// operator at an ssh prompt sees.
-	reg.DefaultFormat = sshd.DefaultFormat
+	api := localapi.NewServer(test.NewLogger(), control.Commands())
+	socket := filepath.Join(t.TempDir(), "ctl.sock")
+	require.NoError(t, api.Rebind(context.Background(), socket, localapi.OwnerOnly()))
+	t.Cleanup(api.Stop)
+	client := &localapi.Client{Path: socket}
 
-	// run dispatches as the ssh exec path does and returns the output and the error, which
-	// over ssh is exit status 1.
+	// run follows the CLI's stdout/stderr rules, merging the two into the golden.
 	run := func(args ...string) (string, error) {
+		help := &bytes.Buffer{}
+		out, err := client.InvokeLine(args, "nebula ctl", help)
+
 		buf := &bytes.Buffer{}
-		err := reg.DispatchArgs(args, commands.MergedOutput(buf))
+		buf.Write(help.Bytes())
+		if out != "" {
+			buf.WriteString(out)
+			if !strings.HasSuffix(out, "\n") {
+				buf.WriteByte('\n')
+			}
+		} else if err != nil {
+			buf.WriteString(err.Error())
+			if !strings.HasSuffix(err.Error(), "\n") {
+				buf.WriteByte('\n')
+			}
+		}
 		return buf.String(), err
 	}
 
@@ -145,8 +155,7 @@ func TestCommandOutput(t *testing.T) {
 		{"close-tunnel", []string{"not-an-address"}},
 		{"help", nil},
 		{"help", []string{"print-cert"}},
-		{"help", []string{"logout"}},
-		{"logout", []string{"-h"}},
+		{"help", []string{"print-tunnel"}},
 		{"not-a-command", []string{"10.222.0.9"}},
 		// reload is last so that whatever a reload does to the daemon cannot leak into an
 		// earlier case. In this harness it fails: the config was loaded from a string and
@@ -169,8 +178,7 @@ func TestCommandOutput(t *testing.T) {
 			if out != "" && !strings.HasSuffix(out, "\n") {
 				got.WriteString("\\ No newline at end of output\n")
 			}
-			// A failed command is recorded as the exit status an ssh caller sees, so the
-			// golden pins which outcomes count as failures.
+			// The golden also pins which outcomes make nebula ctl exit unsuccessfully.
 			if err != nil {
 				got.WriteString("exit status 1\n")
 			}

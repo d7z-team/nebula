@@ -47,13 +47,6 @@ lighthouse:
   # am_lighthouse is used to enable lighthouse functionality for a node. This should ONLY be true on nodes
   # you have configured to be lighthouses in your network. Not reloadable.
   am_lighthouse: false
-  # serve_dns optionally starts a dns listener that responds to various queries and can even be
-  # delegated to for resolution
-  #serve_dns: false
-  #dns:
-    # The DNS host defines the IP to bind the dns listener to. This also allows binding to the nebula node IP.
-    #host: 0.0.0.0
-    #port: 53
   # interval is the number of seconds between updates from this node to a lighthouse.
   # during updates, a node sends information about its current IP addresses to each node.
   interval: 60
@@ -214,26 +207,6 @@ punchy:
 # path to a network adjacent nebula node.
 # This setting is reloadable.
 #preferred_ranges: ["172.16.0.0/24"]
-
-# sshd can expose informational and administrative functions via ssh. This can expose informational and administrative
-# functions, and allows manual tweaking of various network settings when debugging or testing.
-#sshd:
-  # Toggles the feature
-  #enabled: true
-  # Host and port to listen on, port 22 is not allowed for your safety
-  #listen: 127.0.0.1:2222
-  # A file containing the ssh host private key to use
-  # A decent way to generate one: ssh-keygen -t ed25519 -f ssh_host_ed25519_key -N "" < /dev/null
-  #host_key: ./ssh_host_ed25519_key
-  # Authorized users and their public keys
-  #authorized_users:
-    #- user: steeeeve
-      # keys can be an array of strings or single string
-      #keys:
-        #- "ssh public key string"
-  # Trusted SSH CA public keys. These are the public keys of the CAs that are allowed to sign SSH keys for access.
-  #trusted_cas:
-    #- "ssh public key string"
 
 # Local APIs allow accessing running nebula state.
 #local_api:
@@ -428,42 +401,6 @@ tun:
   # If using massive routes updates, for example BGP, you may need to increase this value to avoid packet loss.
   # SO_RCVBUFFORCE is used to avoid having to raise the system wide max. Not reloadable.
   #use_system_route_table_buffer_size: 0
-
-# EXPERIMENTAL: this option may change or disappear in the future.
-# The dns section configures this host's OS resolver to send queries to a user specified DNS server.
-#
-# macOS and Windows only, it requires running with elevated privileges.
-#
-# A dns section that fails to load stops nebula from starting, the same as a bad firewall section.
-#dns:
-  # enabled turns host DNS configuration on. Default false.
-  #enabled: false
-
-  # A list of DNS server IPs to send matching queries to. Required.
-  #nameservers:
-  #  - 192.168.100.1
-
-  # match_domains restricts `nameservers` to just the specified suffixes.
-  #
-  # Setting it to an explicitly empty list attempts to redirect all resolution
-  # to the specified nameservers. If unset, it defaults to search_domains.
-  #match_domains:
-  #  - mesh.example.com
-
-  # search_domains is a list of domains that will be tried when handling requests for a bare label.
-  # These must fall under a configured match_domains entry. If no match_domains is specified, it
-  # defaults to search_domains.
-  #search_domains:
-  #  - mesh.example.com
-
-  # identity is used to prevent multiple consumers of the dnsconfig library from stepping on
-  # each other's toes (this includes multiple instances of nebula.) At startup nebula removes
-  # any host DNS configuration a previous run under this identity left behind, such as after
-  # a crash, whether or not `enabled` is set.
-  #
-  # It must start with a lowercase letter or digit and hold only lowercase letters, digits, '.',
-  # '_' and '-', up to 63 characters.
-  #identity: nebula
 
 # Configure logging level
 logging:

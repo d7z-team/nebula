@@ -17,7 +17,6 @@ import (
 	"github.com/slackhq/nebula/cpupick"
 	"github.com/slackhq/nebula/noiseutil"
 	"github.com/slackhq/nebula/overlay"
-	"github.com/slackhq/nebula/sshd"
 	"github.com/slackhq/nebula/udp"
 	"github.com/slackhq/nebula/util"
 	"go.yaml.in/yaml/v3"
@@ -61,35 +60,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		l.Info(string(b))
 	}
 
-	// Host DNS recovery is the one thing that touches the system this early: a previous run that crashed
-	// may have left the resolver pointed at stale DNS configuration, and we want to clean that up in case
-	// we're stuck in some kind of crash loop.
-	//
-	// A stanza that does not load is fatal, but recovery runs first: the broken stanza may be the
-	// reason we are crash looping, and nothing else is going to put the host's resolver back.
-	var hd *hostDNS
-	var hdErr error
-	if configTest {
-		// Avoid actually building a manager when we're just validating the config. Doing so might
-		// cause dnsconfig to log an error on unsupported hosts.
-		_, hdErr = loadHostDNSConfig(c, c.GetBool("tun.disabled", false))
-	} else {
-		// Set up a hostDNS whether it's configured or not, so we can remove stale
-		// host config in the event of a restart after an unclean shutdown.
-		hd, hdErr = newHostDNSFromConfig(l, c)
-		defer func() {
-			if retcon == nil {
-				hd.Restore()
-			}
-		}()
-		// Start recovery before everything is up, to give us the best chance of recovering
-		// in a persistent failure case.
-		hd.Recover()
-	}
-	if hdErr != nil {
-		return nil, util.ContextualizeIfNeeded("Failed to configure host DNS", hdErr)
-	}
-
 	pki, err := NewPKIFromConfig(l, c)
 	if err != nil {
 		return nil, util.ContextualizeIfNeeded("Failed to load PKI from config", err)
@@ -104,20 +74,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 	// The command registry is shared by every surface that exposes these commands, so a
 	// command cannot reach one of them without reaching the others.
 	cmdRegistry := commands.New()
-
-	ssh, err := sshd.NewSSHServer(ctx, l.With("subsystem", "sshd"), cmdRegistry)
-	if err != nil {
-		return nil, util.ContextualizeIfNeeded("Error while creating SSH server", err)
-	}
-	wireSSHReload(l, ssh, c)
-	var sshStart func()
-	if c.GetBool("sshd.enabled", false) {
-		sshStart, err = configSSH(l, ssh, c, nil)
-		if err != nil {
-			l.Warn("Failed to configure sshd, ssh debugging will not be available", "error", err)
-			sshStart = nil
-		}
-	}
 
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// All non system modifying configuration consumption should live above this line
@@ -271,11 +227,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 	handshakeManager := NewHandshakeManager(l, hostMap, lightHouse, udpConns[0], handshakeConfig)
 	lightHouse.handshakeTrigger = handshakeManager.trigger
 
-	ds, err := newDnsServerFromConfig(ctx, l, pki, hostMap, c)
-	if err != nil {
-		l.Warn("Failed to start DNS responder", "error", err)
-	}
-
 	pinThreads := c.GetBool("tun.pin_threads", true)
 	cpuAffinity := parseCpuAffinity(c, l, routines)
 	if pinThreads && routines > 1 && len(cpuAffinity) == 0 && !configTest {
@@ -313,7 +264,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		Outside:               udpConns[0],
 		pki:                   pki,
 		Firewall:              fw,
-		DnsServer:             ds,
 		HandshakeManager:      handshakeManager,
 		connectionManager:     connManager,
 		lightHouse:            lightHouse,
@@ -388,14 +338,10 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		l:                      l,
 		ctx:                    ctx,
 		cancel:                 cancel,
-		sshStart:               sshStart,
 		statsStart:             stats.Start,
-		dnsStart:               ds.Start,
 		lighthouseStart:        lightHouse.StartUpdateWorker,
 		networkChangeStart:     networkChanges.Start,
 		connectionManagerStart: connManager.Start,
-		hostDNSStart:           hd.Start,
-		hostDNSRestore:         hd.Restore,
 	}, nil
 }
 

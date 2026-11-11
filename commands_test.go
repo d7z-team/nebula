@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/cert_test"
 	"github.com/slackhq/nebula/commands"
@@ -18,7 +19,7 @@ import (
 )
 
 // TestLogFormatRefusalIsShown: a format the logger does not know is a refusal the user
-// sees, rather than a bare error, which over ssh was silence.
+// sees rather than a bare error.
 func TestLogFormatRefusalIsShown(t *testing.T) {
 	l := logging.NewLogger(io.Discard)
 
@@ -93,6 +94,32 @@ func tunnelFixture(t *testing.T) *Interface {
 	}
 
 	return &Interface{pki: newTestPKI(t, "me", []netip.Addr{me}), hostMap: hm}
+}
+
+// newTestPKI builds a minimal PKI with one v2 certificate.
+func newTestPKI(t *testing.T, name string, addrs []netip.Addr) *PKI {
+	t.Helper()
+	networks := make([]netip.Prefix, 0, len(addrs))
+	for _, a := range addrs {
+		networks = append(networks, netip.PrefixFrom(a, a.BitLen()))
+	}
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version2, cert.Curve_CURVE25519, time.Time{}, time.Time{}, nil, nil, nil)
+	c, _, _, _ := cert_test.NewTestCert(cert.Version2, cert.Curve_CURVE25519, ca, caKey, name, time.Time{}, time.Time{}, networks, nil, nil)
+
+	addrsTable := new(bart.Lite)
+	for _, a := range addrs {
+		addrsTable.Insert(netip.PrefixFrom(a, a.BitLen()))
+	}
+
+	cs := &CertState{
+		v2Cert:            c,
+		initiatingVersion: cert.Version2,
+		myVpnAddrs:        addrs,
+		myVpnAddrsTable:   addrsTable,
+	}
+	pki := &PKI{}
+	pki.cs.Store(cs)
+	return pki
 }
 
 // TestPrintCertOfATunnelWithoutACertificate: a tunnel still handshaking, or one being
