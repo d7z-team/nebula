@@ -1,6 +1,10 @@
 ## `cert`
 
-This is a library for interacting with `nebula` style certificates and authorities.
+This package parses, verifies, creates, and signs Nebula certificates and authorities.
+
+Use `CreateCA` and `IssueCertificate` for in-process certificate issuance. Key-only
+workflows can use `GenerateSigningKey` and `GenerateKeyAgreementKey`. PEM, CA pool,
+and encrypted signing-key APIs remain available.
 
 There are now 2 versions of `nebula` certificates:
 
@@ -15,7 +19,7 @@ To compile the definition you will need `protoc` installed.
 To compile for `go` with the same version of protobuf specified in go.mod:
 
 ```bash
-make proto
+make -C cert proto
 ```
 
 ## v2

@@ -208,12 +208,3 @@ func IsValidSubType(t MessageType, s MessageSubType) bool {
 		return false
 	}
 }
-
-// NewHeader turns bytes into a header
-func NewHeader(b []byte) (*H, error) {
-	h := new(H)
-	if err := h.Parse(b); err != nil {
-		return nil, err
-	}
-	return h, nil
-}

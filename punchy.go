@@ -4,12 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
-	"sync/atomic"
 	"time"
 
-	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/udp"
 )
 
 // holepunchQueueSize buffers the channel that pending holepunchJobs land on after their delay timer fires.
@@ -25,146 +22,97 @@ type holepunchJob struct {
 	vpnAddr netip.Addr
 }
 
-// lighthouseChecker is the slice of LightHouse that Punchy actually needs.
-// Defined here so Punchy doesn't take a *LightHouse dependency (LightHouse
-// already holds a *Punchy, and the bidirectional pointer reference is awkward
+// lighthouseChecker is the slice of lighthouse that punchManager actually needs.
+// Defined here so punchManager doesn't take a *lighthouse dependency (lighthouse
+// already holds a *punchManager, and the bidirectional pointer reference is awkward
 // even within the same package). Tests can also substitute a fake.
 type lighthouseChecker interface {
 	IsAnyLighthouseAddr(vpnAddrs []netip.Addr) bool
 }
 
-type Punchy struct {
-	punch           atomic.Bool
-	respond         atomic.Bool
-	delay           atomic.Int64
-	respondDelay    atomic.Int64
-	punchEverything atomic.Bool
+type punchManager struct {
+	punch           bool
+	respond         bool
+	delay           time.Duration
+	respondDelay    time.Duration
+	punchEverything bool
 
-	sched     *Scheduler[holepunchJob]
-	punchConn udp.Conn
+	sched     *scheduler[holepunchJob]
+	punchConn DatagramTransport
 
 	ctx  context.Context
-	ifce EncWriter
-	hm   *HostMap
+	ifce encWriter
+	hm   *hostMap
 	lh   lighthouseChecker
 
 	l *slog.Logger
 }
 
-func NewPunchyFromConfig(l *slog.Logger, c *config.C, punchConn udp.Conn) *Punchy {
-	p := &Punchy{
-		l:         l,
-		punchConn: punchConn,
-		sched:     NewScheduler[holepunchJob](holepunchQueueSize),
-	}
-
-	p.reload(c, true)
-	c.RegisterReloadCallback(func(c *config.C, _ *config.Reload) {
-		p.reload(c, false)
-	})
-
-	return p
+type punchyConfig struct {
+	punch           bool
+	respond         bool
+	delay           time.Duration
+	respondDelay    time.Duration
+	punchEverything bool
 }
 
-func (p *Punchy) reload(c *config.C, initial bool) {
-	if initial || c.HasChanged("punchy.punch") || c.HasChanged("punchy") {
-		var yes bool
-		if c.IsSet("punchy.punch") {
-			yes = c.GetBool("punchy.punch", false)
-		} else {
-			// Deprecated fallback
-			yes = c.GetBool("punchy", false)
-		}
-
-		old := p.punch.Swap(yes)
-		switch {
-		case initial && yes:
-			p.l.Info("punchy enabled")
-		case initial:
-			p.l.Info("punchy disabled")
-		case old != yes:
-			p.l.Info("punchy.punch changed", "punch", yes)
-		}
+func newPunchy(l *slog.Logger, transport DatagramTransport, cfg punchyConfig) *punchManager {
+	if cfg.delay <= 0 {
+		cfg.delay = time.Second
 	}
-
-	if initial || c.HasChanged("punchy.respond") || c.HasChanged("punch_back") {
-		var yes bool
-		if c.IsSet("punchy.respond") {
-			yes = c.GetBool("punchy.respond", false)
-		} else {
-			// Deprecated fallback
-			yes = c.GetBool("punch_back", false)
-		}
-
-		old := p.respond.Swap(yes)
-		if !initial && old != yes {
-			p.l.Info("punchy.respond changed", "respond", yes)
-		}
+	if cfg.respondDelay <= 0 {
+		cfg.respondDelay = 5 * time.Second
 	}
-
-	//NOTE: this will not apply to any in progress operations, only the next one
-	if initial || c.HasChanged("punchy.delay") {
-		newDelay := int64(c.GetDuration("punchy.delay", time.Second))
-		old := p.delay.Swap(newDelay)
-		if !initial && old != newDelay {
-			p.l.Info("punchy.delay changed", "delay", time.Duration(newDelay))
-		}
+	p := &punchManager{
+		l:         l,
+		punchConn: transport,
+		sched:     newScheduler[holepunchJob](holepunchQueueSize),
 	}
-
-	if initial || c.HasChanged("punchy.target_all_remotes") {
-		yes := c.GetBool("punchy.target_all_remotes", false)
-		old := p.punchEverything.Swap(yes)
-		if !initial && old != yes {
-			p.l.Info("punchy.target_all_remotes changed", "target_all_remotes", yes)
-		}
-	}
-
-	if initial || c.HasChanged("punchy.respond_delay") {
-		newDelay := int64(c.GetDuration("punchy.respond_delay", 5*time.Second))
-		old := p.respondDelay.Swap(newDelay)
-		if !initial && old != newDelay {
-			p.l.Info("punchy.respond_delay changed", "respond_delay", time.Duration(newDelay))
-		}
-	}
+	p.punch = cfg.punch
+	p.respond = cfg.respond
+	p.delay = cfg.delay
+	p.respondDelay = cfg.respondDelay
+	p.punchEverything = cfg.punchEverything
+	return p
 }
 
 // Schedule queues a punch packet to target, to be sent after the configured delay.
 // vpnAddr is the peer's vpn addr, used for log context when the packet actually fires.
 // No-op if target is not a valid AddrPort or if Start has not yet been called. Safe to call from any goroutine.
-func (p *Punchy) Schedule(target netip.AddrPort, vpnAddr netip.Addr) {
+func (p *punchManager) Schedule(target netip.AddrPort, vpnAddr netip.Addr) {
 	if !target.IsValid() || p.ctx == nil {
 		return
 	}
-	p.scheduleJob(holepunchJob{target: target, vpnAddr: vpnAddr}, time.Duration(p.delay.Load()))
+	p.scheduleJob(holepunchJob{target: target, vpnAddr: vpnAddr}, p.delay)
 }
 
 // ScheduleRespond queues a punchback test packet to vpnAddr after the configured respond delay,
 // gated on punchy.respond. No-op when respond is disabled or before Start has been called.
-func (p *Punchy) ScheduleRespond(vpnAddr netip.Addr) {
-	if !p.respond.Load() || p.ctx == nil {
+func (p *punchManager) ScheduleRespond(vpnAddr netip.Addr) {
+	if !p.respond || p.ctx == nil {
 		return
 	}
-	p.scheduleJob(holepunchJob{vpnAddr: vpnAddr}, time.Duration(p.respondDelay.Load()))
+	p.scheduleJob(holepunchJob{vpnAddr: vpnAddr}, p.respondDelay)
 }
 
-// scheduleJob delegates to the pooled Scheduler.
+// scheduleJob delegates to the pooled scheduler.
 // The callback observes p.ctx so a job that becomes due after Stop is dropped instead of queued.
-func (p *Punchy) scheduleJob(job holepunchJob, delay time.Duration) {
+func (p *punchManager) scheduleJob(job holepunchJob, delay time.Duration) {
 	p.sched.Schedule(p.ctx, job, delay)
 }
 
 // SendPunch sends an immediate keepalive punch for an idle hostinfo.
-// The configured punchy.target_all_remotes mode picks the targets. Gated on punchy.punch and the lighthouse-skip rule
+// Target-all-remotes mode picks the targets. It is gated by PunchyOptions.Punch and the lighthouse-skip rule
 // (lighthouses don't get keepalive punches because the regular update interval keeps their NAT state warm).
-func (p *Punchy) SendPunch(hostinfo *HostInfo) {
-	if !p.punch.Load() {
+func (p *punchManager) SendPunch(hostinfo *hostInfo) {
+	if !p.punch {
 		return
 	}
 	if p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
 		return
 	}
 
-	if p.punchEverything.Load() {
+	if p.punchEverything {
 		p.sendPunchToAllRemotes(hostinfo)
 	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
 		p.punchConn.WriteTo(punchPacket, hr)
@@ -175,11 +123,11 @@ func (p *Punchy) SendPunch(hostinfo *HostInfo) {
 // The connection manager calls this during outbound-only traffic: the outbound traffic itself keeps the primary's
 // NAT state warm, but non-primary remotes need separate refresh, so we fan out to all of them (the redundant
 // primary punch is harmless). Gated on punchy.punch and the lighthouse-skip rule.
-func (p *Punchy) SendPunchToAll(hostinfo *HostInfo) {
-	if !p.punchEverything.Load() {
+func (p *punchManager) SendPunchToAll(hostinfo *hostInfo) {
+	if !p.punchEverything {
 		return
 	}
-	if !p.punch.Load() {
+	if !p.punch {
 		return
 	}
 	if p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
@@ -188,24 +136,26 @@ func (p *Punchy) SendPunchToAll(hostinfo *HostInfo) {
 	p.sendPunchToAllRemotes(hostinfo)
 }
 
-func (p *Punchy) sendPunchToAllRemotes(hostinfo *HostInfo) {
+func (p *punchManager) sendPunchToAllRemotes(hostinfo *hostInfo) {
 	hostinfo.remotes.ForEach(p.hm.GetPreferredRanges(), func(addr netip.AddrPort, preferred bool) {
 		p.punchConn.WriteTo(punchPacket, addr)
 	})
 }
 
-// Start wires the runtime dependencies and spawns the scheduler worker.
-func (p *Punchy) Start(ctx context.Context, ifce EncWriter, hm *HostMap, lh lighthouseChecker) {
+func (p *punchManager) configure(ctx context.Context, ifce encWriter, hm *hostMap, lh lighthouseChecker) {
 	p.ctx = ctx
 	p.ifce = ifce
 	p.hm = hm
 	p.lh = lh
+}
 
+// run drains scheduled punch work until the node context is cancelled.
+func (p *punchManager) run(ctx context.Context) {
 	nb := make([]byte, 12, 12)
 	out := make([]byte, mtu)
 	empty := []byte{0}
 
-	go p.sched.Run(ctx, func(job holepunchJob) {
+	p.sched.Run(ctx, func(job holepunchJob) {
 		switch {
 		case job.target.IsValid():
 			if p.l.Enabled(context.Background(), slog.LevelDebug) {

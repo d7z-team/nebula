@@ -8,24 +8,24 @@ import (
 // How many timer objects should be cached
 const timerCacheMax = 50000
 
-// TimerWheel is a hashed timing wheel: a fixed slot array indexed by (now + delay) % wheelLen,
+// timerWheel is a hashed timing wheel: a fixed slot array indexed by (now + delay) % wheelLen,
 // with each slot a singly linked list of items due in that bucket.
 // Adds are O(1), Purges return items in arrival-within-slot order, and an internal cache of TimeoutItems
 // keeps steady-state inserts allocation-free.
 //
-// The TimerWheel does not handle concurrency or lifecycle on its own.
-// Callers drive Advance/Purge from their own ticker loop, take their own locks (or use LockingTimerWheel),
+// The timerWheel does not handle concurrency or lifecycle on its own.
+// Callers drive Advance/Purge from their own ticker loop, take their own locks (or use lockingTimerWheel),
 // and decide whether to keep ticking when the wheel is empty.
 //
-// Pick a TimerWheel when scheduling is high-rate and uniform: line-rate conntrack inserts,
-// per-tunnel traffic checks at fixed intervals. O(1) insert plus the item cache means the hot path doesn't allocate.
+// Pick a timerWheel when scheduling is high-rate and uniform, such as handshake
+// retransmits and per-tunnel traffic checks. O(1) insertion keeps the hot path small.
 // Items added in the same tick are dispatched together when that slot rotates current,
 // which amortizes the cost of waking the worker.
 //
-// Pick a Scheduler when delay precision matters or scheduling is sparse or uneven.
+// Pick a scheduler when delay precision matters or scheduling is sparse or uneven.
 // The wheel rounds requested timeouts up to its tick resolution and clamps anything beyond its wheel duration;
 // both are silent in this implementation.
-type TimerWheel[T any] struct {
+type timerWheel[T any] struct {
 	// Current tick
 	current int
 
@@ -41,38 +41,38 @@ type TimerWheel[T any] struct {
 	wheelDuration time.Duration
 
 	// The actual wheel which is just a set of singly linked lists, head/tail pointers
-	wheel []*TimeoutList[T]
+	wheel []*timeoutList[T]
 
 	// Singly linked list of items that have timed out of the wheel
-	expired *TimeoutList[T]
+	expired *timeoutList[T]
 
 	// Item cache to avoid garbage collect
-	itemCache   *TimeoutItem[T]
+	itemCache   *timeoutItem[T]
 	itemsCached int
 }
 
-type LockingTimerWheel[T any] struct {
+type lockingTimerWheel[T any] struct {
 	m sync.Mutex
-	t *TimerWheel[T]
+	t *timerWheel[T]
 }
 
-// TimeoutList Represents a tick in the wheel
-type TimeoutList[T any] struct {
-	Head *TimeoutItem[T]
-	Tail *TimeoutItem[T]
+// timeoutList Represents a tick in the wheel
+type timeoutList[T any] struct {
+	Head *timeoutItem[T]
+	Tail *timeoutItem[T]
 }
 
-// TimeoutItem Represents an item within a tick
-type TimeoutItem[T any] struct {
+// timeoutItem Represents an item within a tick
+type timeoutItem[T any] struct {
 	Item T
-	Next *TimeoutItem[T]
+	Next *timeoutItem[T]
 }
 
-// NewTimerWheel Builds a timer wheel and identifies the tick duration and wheel duration from the provided values
+// newTimerWheel Builds a timer wheel and identifies the tick duration and wheel duration from the provided values
 // Purge must be called once per entry to actually remove anything
-// The TimerWheel does not handle concurrency on its own.
+// The timerWheel does not handle concurrency on its own.
 // Locks around access to it must be used if multiple routines are manipulating it.
-func NewTimerWheel[T any](min, max time.Duration) *TimerWheel[T] {
+func newTimerWheel[T any](min, max time.Duration) *timerWheel[T] {
 	//TODO provide an error
 	//if min >= max {
 	//	return nil
@@ -83,31 +83,31 @@ func NewTimerWheel[T any](min, max time.Duration) *TimerWheel[T] {
 	// timeout
 	wLen := int((max / min) + 2)
 
-	tw := TimerWheel[T]{
+	tw := timerWheel[T]{
 		wheelLen:      wLen,
-		wheel:         make([]*TimeoutList[T], wLen),
+		wheel:         make([]*timeoutList[T], wLen),
 		tickDuration:  min,
 		wheelDuration: max,
-		expired:       &TimeoutList[T]{},
+		expired:       &timeoutList[T]{},
 	}
 
 	for i := range tw.wheel {
-		tw.wheel[i] = &TimeoutList[T]{}
+		tw.wheel[i] = &timeoutList[T]{}
 	}
 
 	return &tw
 }
 
-// NewLockingTimerWheel is version of TimerWheel that is safe for concurrent use with a small performance penalty
-func NewLockingTimerWheel[T any](min, max time.Duration) *LockingTimerWheel[T] {
-	return &LockingTimerWheel[T]{
-		t: NewTimerWheel[T](min, max),
+// newLockingTimerWheel is version of timerWheel that is safe for concurrent use with a small performance penalty
+func newLockingTimerWheel[T any](min, max time.Duration) *lockingTimerWheel[T] {
+	return &lockingTimerWheel[T]{
+		t: newTimerWheel[T](min, max),
 	}
 }
 
 // Add will add an item to the wheel in its proper timeout.
 // Caller should Advance the wheel prior to ensure the proper slot is used.
-func (tw *TimerWheel[T]) Add(v T, timeout time.Duration) *TimeoutItem[T] {
+func (tw *timerWheel[T]) Add(v T, timeout time.Duration) *timeoutItem[T] {
 	i := tw.findWheel(timeout)
 
 	// Try to fetch off the cache
@@ -117,7 +117,7 @@ func (tw *TimerWheel[T]) Add(v T, timeout time.Duration) *TimeoutItem[T] {
 		tw.itemsCached--
 		ti.Next = nil
 	} else {
-		ti = &TimeoutItem[T]{}
+		ti = &timeoutItem[T]{}
 	}
 
 	// Relink and return
@@ -135,7 +135,7 @@ func (tw *TimerWheel[T]) Add(v T, timeout time.Duration) *TimeoutItem[T] {
 
 // Purge removes and returns the first available expired item from the wheel and the 2nd argument is true.
 // If no item is available then an empty T is returned and the 2nd argument is false.
-func (tw *TimerWheel[T]) Purge() (T, bool) {
+func (tw *timerWheel[T]) Purge() (T, bool) {
 	if tw.expired.Head == nil {
 		var na T
 		return na, false
@@ -162,7 +162,7 @@ func (tw *TimerWheel[T]) Purge() (T, bool) {
 }
 
 // findWheel find the next position in the wheel for the provided timeout given the current tick
-func (tw *TimerWheel[T]) findWheel(timeout time.Duration) (i int) {
+func (tw *timerWheel[T]) findWheel(timeout time.Duration) (i int) {
 	if timeout < tw.tickDuration {
 		// Can't track anything below the set resolution
 		timeout = tw.tickDuration
@@ -186,7 +186,7 @@ func (tw *TimerWheel[T]) findWheel(timeout time.Duration) (i int) {
 
 // Advance will move the wheel forward by the appropriate number of ticks for the provided time and all items
 // passed over will be moved to the expired list. Calling Purge is necessary to remove them entirely.
-func (tw *TimerWheel[T]) Advance(now1 time.Time) {
+func (tw *timerWheel[T]) Advance(now1 time.Time) {
 	if !tw.lastTickValid {
 		tw.lastTick = now1
 		tw.lastTickValid = true
@@ -225,19 +225,19 @@ func (tw *TimerWheel[T]) Advance(now1 time.Time) {
 	tw.lastTick = newTick
 }
 
-func (lw *LockingTimerWheel[T]) Add(v T, timeout time.Duration) *TimeoutItem[T] {
+func (lw *lockingTimerWheel[T]) Add(v T, timeout time.Duration) *timeoutItem[T] {
 	lw.m.Lock()
 	defer lw.m.Unlock()
 	return lw.t.Add(v, timeout)
 }
 
-func (lw *LockingTimerWheel[T]) Purge() (T, bool) {
+func (lw *lockingTimerWheel[T]) Purge() (T, bool) {
 	lw.m.Lock()
 	defer lw.m.Unlock()
 	return lw.t.Purge()
 }
 
-func (lw *LockingTimerWheel[T]) Advance(now time.Time) {
+func (lw *lockingTimerWheel[T]) Advance(now time.Time) {
 	lw.m.Lock()
 	defer lw.m.Unlock()
 	lw.t.Advance(now)

@@ -2,7 +2,6 @@ package nebula
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,37 +13,36 @@ import (
 
 	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
 )
 
 const defaultPromoteEvery = 1000       // Count of packets sent before we try moving a tunnel to a preferred underlay ip address
 const defaultReQueryEvery = 5000       // Count of packets sent before re-querying a hostinfo to the lighthouse
 const defaultReQueryWait = time.Minute // Minimum amount of seconds to wait before re-querying a hostinfo the lighthouse. Evaluated every ReQueryEvery
-const MaxRemotes = 10
+const maxRemotes = 10
 
-// MaxHostInfosPerVpnIp is the max number of hostinfos we will track for a given vpn ip
+// maxHostInfosPerVPNAddr is the max number of hostinfos we will track for a given vpn ip
 // 5 allows for an initial handshake and each host pair re-handshaking twice
-const MaxHostInfosPerVpnIp = 5
+const maxHostInfosPerVPNAddr = 5
 
-// How long we should prevent roaming back to the previous IP.
-// This helps prevent flapping due to packets already in flight
-const RoamingSuppressSeconds = 2
+// roamingSuppressDuration prevents flapping back to a previous endpoint while
+// packets from the old path are still in flight.
+const roamingSuppressDuration = 2 * time.Second
 
 const (
-	Requested = iota
-	PeerRequested
-	Established
-	Disestablished
+	relayRequested = iota
+	relayPeerRequested
+	relayEstablished
+	relayDisestablished
 )
 
 const (
-	Unknowntype = iota
-	ForwardingType
-	TerminalType
+	relayTypeUnknown = iota
+	relayTypeForwarding
+	relayTypeTerminal
 )
 
-type Relay struct {
+type relay struct {
 	Type        int
 	State       int
 	LocalIndex  uint32
@@ -52,11 +50,11 @@ type Relay struct {
 	PeerAddr    netip.Addr
 }
 
-type HostMap struct {
+type hostMap struct {
 	sync.RWMutex  //Because we concurrently read and write to our maps
-	Indexes       map[uint32]*HostInfo
-	Relays        map[uint32]*HostInfo // Maps a Relay IDX to a Relay HostInfo object
-	RemoteIndexes map[uint32]*HostInfo
+	Indexes       map[uint32]*hostInfo
+	Relays        map[uint32]*hostInfo // Maps a relay IDX to a relay hostInfo object
+	RemoteIndexes map[uint32]*hostInfo
 	// Hosts maps a vpn address to its primary hostinfo, one entry per address we hold a tunnel
 	// for. moreHosts only has an entry while an address is held by 2 or more hostinfos and stores
 	// the full most-recent-first list; moreHosts[a][0] is always the same hostinfo as Hosts[a].
@@ -65,27 +63,27 @@ type HostMap struct {
 	// Entries in moreHosts are only ever written by unlockedSetHostsForAddr; Hosts is written
 	// directly only in the single-hostinfo fast paths where moreHosts is known to have no entry,
 	// and unlockedDeleteHostInfo swaps either map for a fresh one when it fully drains.
-	Hosts           map[netip.Addr]*HostInfo
-	moreHosts       map[netip.Addr][]*HostInfo
-	preferredRanges atomic.Pointer[[]netip.Prefix]
+	Hosts           map[netip.Addr]*hostInfo
+	moreHosts       map[netip.Addr][]*hostInfo
+	preferredRanges []netip.Prefix
 	l               *slog.Logger
 }
 
-// For synchronization, treat the pointed-to Relay struct as immutable. To edit the Relay
+// For synchronization, treat the pointed-to relay struct as immutable. To edit the relay
 // struct, make a copy of an existing value, edit the fileds in the copy, and
 // then store a pointer to the new copy in both realyForBy* maps.
-type RelayState struct {
+type relayState struct {
 	sync.RWMutex
 
 	relays []netip.Addr // Ordered set of VpnAddrs of Hosts to use as relays to access this peer
-	// For data race avoidance, the contents of a *Relay are treated immutably. To update a *Relay, copy the existing data,
+	// For data race avoidance, the contents of a *relay are treated immutably. To update a *relay, copy the existing data,
 	// modify what needs to be updated, and store the new modified copy in the relayForByIp and relayForByIdx maps (with
-	// the RelayState Lock held)
-	relayForByAddr map[netip.Addr]*Relay // Maps vpnAddr of peers for which this HostInfo is a relay to some Relay info
-	relayForByIdx  map[uint32]*Relay     // Maps a local index to some Relay info
+	// the relayState Lock held)
+	relayForByAddr map[netip.Addr]*relay // Maps vpnAddr of peers for which this hostInfo is a relay to some relay info
+	relayForByIdx  map[uint32]*relay     // Maps a local index to some relay info
 }
 
-func (rs *RelayState) DeleteRelay(ip netip.Addr) {
+func (rs *relayState) DeleteRelay(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
 	for idx, val := range rs.relays {
@@ -96,7 +94,7 @@ func (rs *RelayState) DeleteRelay(ip netip.Addr) {
 	}
 }
 
-func (rs *RelayState) UpdateRelayForByIpState(vpnIp netip.Addr, state int) {
+func (rs *relayState) UpdateRelayForByIpState(vpnIp netip.Addr, state int) {
 	rs.Lock()
 	defer rs.Unlock()
 	if r, ok := rs.relayForByAddr[vpnIp]; ok {
@@ -107,7 +105,7 @@ func (rs *RelayState) UpdateRelayForByIpState(vpnIp netip.Addr, state int) {
 	}
 }
 
-func (rs *RelayState) UpdateRelayForByIdxState(idx uint32, state int) {
+func (rs *relayState) UpdateRelayForByIdxState(idx uint32, state int) {
 	rs.Lock()
 	defer rs.Unlock()
 	if r, ok := rs.relayForByIdx[idx]; ok {
@@ -118,24 +116,24 @@ func (rs *RelayState) UpdateRelayForByIdxState(idx uint32, state int) {
 	}
 }
 
-func (rs *RelayState) CopyAllRelayFor() []*Relay {
+func (rs *relayState) CopyAllRelayFor() []*relay {
 	rs.RLock()
 	defer rs.RUnlock()
-	ret := make([]*Relay, 0, len(rs.relayForByIdx))
+	ret := make([]*relay, 0, len(rs.relayForByIdx))
 	for _, r := range rs.relayForByIdx {
 		ret = append(ret, r)
 	}
 	return ret
 }
 
-func (rs *RelayState) GetRelayForByAddr(addr netip.Addr) (*Relay, bool) {
+func (rs *relayState) GetRelayForByAddr(addr netip.Addr) (*relay, bool) {
 	rs.RLock()
 	defer rs.RUnlock()
 	r, ok := rs.relayForByAddr[addr]
 	return r, ok
 }
 
-func (rs *RelayState) InsertRelayTo(ip netip.Addr) {
+func (rs *relayState) InsertRelayTo(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
 	if !slices.Contains(rs.relays, ip) {
@@ -143,7 +141,7 @@ func (rs *RelayState) InsertRelayTo(ip netip.Addr) {
 	}
 }
 
-func (rs *RelayState) CopyRelayIps() []netip.Addr {
+func (rs *relayState) CopyRelayIps() []netip.Addr {
 	rs.RLock()
 	defer rs.RUnlock()
 	ret := make([]netip.Addr, len(rs.relays))
@@ -151,7 +149,7 @@ func (rs *RelayState) CopyRelayIps() []netip.Addr {
 	return ret
 }
 
-func (rs *RelayState) CopyRelayForIps() []netip.Addr {
+func (rs *relayState) CopyRelayForIps() []netip.Addr {
 	rs.RLock()
 	defer rs.RUnlock()
 	currentRelays := make([]netip.Addr, 0, len(rs.relayForByAddr))
@@ -161,7 +159,7 @@ func (rs *RelayState) CopyRelayForIps() []netip.Addr {
 	return currentRelays
 }
 
-func (rs *RelayState) CopyRelayForIdxs() []uint32 {
+func (rs *relayState) CopyRelayForIdxs() []uint32 {
 	rs.RLock()
 	defer rs.RUnlock()
 	ret := make([]uint32, 0, len(rs.relayForByIdx))
@@ -171,7 +169,7 @@ func (rs *RelayState) CopyRelayForIdxs() []uint32 {
 	return ret
 }
 
-func (rs *RelayState) CompleteRelayByIP(vpnIp netip.Addr, remoteIdx uint32) bool {
+func (rs *relayState) CompleteRelayByIP(vpnIp netip.Addr, remoteIdx uint32) bool {
 	rs.Lock()
 	defer rs.Unlock()
 	r, ok := rs.relayForByAddr[vpnIp]
@@ -179,14 +177,14 @@ func (rs *RelayState) CompleteRelayByIP(vpnIp netip.Addr, remoteIdx uint32) bool
 		return false
 	}
 	newRelay := *r
-	newRelay.State = Established
+	newRelay.State = relayEstablished
 	newRelay.RemoteIndex = remoteIdx
 	rs.relayForByIdx[r.LocalIndex] = &newRelay
 	rs.relayForByAddr[r.PeerAddr] = &newRelay
 	return true
 }
 
-func (rs *RelayState) CompleteRelayByIdx(localIdx uint32, remoteIdx uint32) (*Relay, bool) {
+func (rs *relayState) CompleteRelayByIdx(localIdx uint32, remoteIdx uint32) (*relay, bool) {
 	rs.Lock()
 	defer rs.Unlock()
 	r, ok := rs.relayForByIdx[localIdx]
@@ -194,52 +192,52 @@ func (rs *RelayState) CompleteRelayByIdx(localIdx uint32, remoteIdx uint32) (*Re
 		return nil, false
 	}
 	newRelay := *r
-	newRelay.State = Established
+	newRelay.State = relayEstablished
 	newRelay.RemoteIndex = remoteIdx
 	rs.relayForByIdx[r.LocalIndex] = &newRelay
 	rs.relayForByAddr[r.PeerAddr] = &newRelay
 	return &newRelay, true
 }
 
-func (rs *RelayState) QueryRelayForByIp(vpnIp netip.Addr) (*Relay, bool) {
+func (rs *relayState) QueryRelayForByIp(vpnIp netip.Addr) (*relay, bool) {
 	rs.RLock()
 	defer rs.RUnlock()
 	r, ok := rs.relayForByAddr[vpnIp]
 	return r, ok
 }
 
-func (rs *RelayState) QueryRelayForByIdx(idx uint32) (*Relay, bool) {
+func (rs *relayState) QueryRelayForByIdx(idx uint32) (*relay, bool) {
 	rs.RLock()
 	defer rs.RUnlock()
 	r, ok := rs.relayForByIdx[idx]
 	return r, ok
 }
 
-func (rs *RelayState) InsertRelay(ip netip.Addr, idx uint32, r *Relay) {
+func (rs *relayState) InsertRelay(ip netip.Addr, idx uint32, r *relay) {
 	rs.Lock()
 	defer rs.Unlock()
 	rs.relayForByAddr[ip] = r
 	rs.relayForByIdx[idx] = r
 }
 
-type NetworkType uint8
+type networkType uint8
 
 const (
-	NetworkTypeUnknown NetworkType = iota
-	// NetworkTypeVPN is a network that overlaps one or more of the vpnNetworks in our certificate
-	NetworkTypeVPN
-	// NetworkTypeVPNPeer is a network that does not overlap one of our networks
-	NetworkTypeVPNPeer
-	// NetworkTypeUnsafe is a network from Certificate.UnsafeNetworks()
-	NetworkTypeUnsafe
-	// NetworkTypeUnsafeVPNOverlap is the overlap between a network from Certificate.UnsafeNetworks()
+	networkTypeUnknown networkType = iota
+	// networkTypeVPN is a network that overlaps one or more of the vpnNetworks in our certificate
+	networkTypeVPN
+	// networkTypeVPNPeer is a network that does not overlap one of our networks
+	networkTypeVPNPeer
+	// networkTypeUnsafe is a network from Certificate.UnsafeNetworks()
+	networkTypeUnsafe
+	// networkTypeUnsafeVPNOverlap is the overlap between a network from Certificate.UnsafeNetworks()
 	// and one of the vpnNetworks in our certificate
-	NetworkTypeUnsafeVPNOverlap
+	networkTypeUnsafeVPNOverlap
 )
 
-type HostInfo struct {
+type hostInfo struct {
 	remote          atomic.Pointer[netip.AddrPort]
-	ConnectionState *ConnectionState
+	connectionState *connectionState
 
 	// Traffic bits, pendingDeletion, and the rebind epoch we last sent under
 	state atomic.Uint32
@@ -247,7 +245,7 @@ type HostInfo struct {
 	promoteCounter atomic.Uint32
 	remoteIndexId  uint32
 	localIndexId   uint32
-	remotes        *RemoteList
+	remotes        *remoteList
 
 	// vpnAddrs is a list of vpn addresses assigned to this host that are within our own vpn networks
 	// The host may have other vpn addresses that are outside our
@@ -255,8 +253,8 @@ type HostInfo struct {
 	vpnAddrs []netip.Addr
 
 	// networks is a combination of specific vpn addresses (not prefixes!) and full unsafe networks assigned to this host.
-	networks   *bart.Table[NetworkType]
-	relayState RelayState
+	networks   *bart.Table[networkType]
+	relayState relayState
 
 	// HandshakePacket records the packets used to create this hostinfo
 	// We need these to avoid replayed handshake packets creating new hostinfos which causes churn
@@ -280,25 +278,18 @@ type HostInfo struct {
 	lastUsed time.Time
 }
 
-type ViaSender struct {
+type packetSender struct {
 	UdpAddr   netip.AddrPort
-	relayHI   *HostInfo // relayHI is the host info object of the relay
-	relay     *Relay    // relay contains the rest of the relay information, including the PeerIP of the host trying to communicate with us.
+	relayHI   *hostInfo // relayHI is the host info object of the relay
+	relay     *relay    // relay contains the rest of the relay information, including the PeerIP of the host trying to communicate with us.
 	IsRelayed bool      // IsRelayed is true if the packet was sent through a relay
 }
 
-func (v ViaSender) String() string {
+func (v packetSender) String() string {
 	if v.IsRelayed {
 		return fmt.Sprintf("%s (relayed)", v.UdpAddr)
 	}
 	return v.UdpAddr.String()
-}
-
-func (v ViaSender) MarshalJSON() ([]byte, error) {
-	if v.IsRelayed {
-		return json.Marshal(m{"relay": v.UdpAddr})
-	}
-	return json.Marshal(m{"direct": v.UdpAddr})
 }
 
 type cachedPacket struct {
@@ -308,67 +299,29 @@ type cachedPacket struct {
 	packet         []byte
 }
 
-type packetCallback func(t header.MessageType, st header.MessageSubType, h *HostInfo, p, nb, out []byte)
+type packetCallback func(t header.MessageType, st header.MessageSubType, h *hostInfo, p, nb, out []byte)
 
-func NewHostMapFromConfig(l *slog.Logger, c *config.C) *HostMap {
-	hm := newHostMap(l)
-
-	hm.reload(c, true, nil)
-	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
-		hm.reload(c, false, r)
-	})
-
-	l.Info("Main HostMap created", "preferredRanges", hm.GetPreferredRanges())
-
-	return hm
-}
-
-func newHostMap(l *slog.Logger) *HostMap {
-	return &HostMap{
-		Indexes:       map[uint32]*HostInfo{},
-		Relays:        map[uint32]*HostInfo{},
-		RemoteIndexes: map[uint32]*HostInfo{},
-		Hosts:         map[netip.Addr]*HostInfo{},
-		moreHosts:     map[netip.Addr][]*HostInfo{},
+func newHostMap(l *slog.Logger, preferred ...[]netip.Prefix) *hostMap {
+	ranges := []netip.Prefix{}
+	if len(preferred) > 0 {
+		ranges = slices.Clone(preferred[0])
+	}
+	hm := &hostMap{
+		Indexes:       map[uint32]*hostInfo{},
+		Relays:        map[uint32]*hostInfo{},
+		RemoteIndexes: map[uint32]*hostInfo{},
+		Hosts:         map[netip.Addr]*hostInfo{},
+		moreHosts:     map[netip.Addr][]*hostInfo{},
 		l:             l,
 	}
-}
-
-// r is nil on the initial load
-func (hm *HostMap) reload(c *config.C, initial bool, r *config.Reload) {
-	if initial || c.HasChanged("preferred_ranges") {
-		var preferredRanges []netip.Prefix
-		rawPreferredRanges := c.GetStringSlice("preferred_ranges", []string{})
-
-		for _, rawPreferredRange := range rawPreferredRanges {
-			preferredRange, err := netip.ParsePrefix(rawPreferredRange)
-
-			if err != nil {
-				hm.l.Warn("Failed to parse preferred ranges, ignoring",
-					"error", err,
-					"range", rawPreferredRange,
-				)
-				r.Failed()
-				continue
-			}
-
-			preferredRanges = append(preferredRanges, preferredRange)
-		}
-
-		oldRanges := hm.preferredRanges.Swap(&preferredRanges)
-		if !initial {
-			hm.l.Info("preferred_ranges changed",
-				"oldPreferredRanges", *oldRanges,
-				"newPreferredRanges", preferredRanges,
-			)
-		}
-	}
+	hm.preferredRanges = ranges
+	return hm
 }
 
 // unlockedSetHostsForAddr stores the per-address hostinfo list (list[0] is the primary). An empty
 // list removes the address. This is the one place Hosts and moreHosts are written together, keep
 // it that way. Callers must hold the write lock.
-func (hm *HostMap) unlockedSetHostsForAddr(addr netip.Addr, list []*HostInfo) {
+func (hm *hostMap) unlockedSetHostsForAddr(addr netip.Addr, list []*hostInfo) {
 	if len(list) == 0 {
 		delete(hm.Hosts, addr)
 		delete(hm.moreHosts, addr)
@@ -386,12 +339,12 @@ func (hm *HostMap) unlockedSetHostsForAddr(addr netip.Addr, list []*HostInfo) {
 // tunnel for addr. The common single-hostinfo case builds a fresh one element list, so keep this
 // off the packet hot path; the primary is a direct Hosts read. Callers must hold the lock (read
 // or write).
-func (hm *HostMap) unlockedGetHostList(addr netip.Addr) []*HostInfo {
+func (hm *hostMap) unlockedGetHostList(addr netip.Addr) []*hostInfo {
 	if list, ok := hm.moreHosts[addr]; ok {
 		return list
 	}
 	if h, ok := hm.Hosts[addr]; ok {
-		return []*HostInfo{h}
+		return []*hostInfo{h}
 	}
 	return nil
 }
@@ -400,7 +353,7 @@ func (hm *HostMap) unlockedGetHostList(addr netip.Addr) []*HostInfo {
 // absent. It deletes in place: every mutator holds the hostmap write lock and no reader ever
 // retains a slice across a mutation (readers iterate under RLock), so there is no snapshot to
 // invalidate.
-func removeHostInfo(list []*HostInfo, hi *HostInfo) []*HostInfo {
+func removeHostInfo(list []*hostInfo, hi *hostInfo) []*hostInfo {
 	idx := slices.Index(list, hi)
 	if idx < 0 {
 		return list
@@ -410,7 +363,7 @@ func removeHostInfo(list []*HostInfo, hi *HostInfo) []*HostInfo {
 
 // DeleteHostInfo will fully unlink the hostinfo and return true if no other hostinfo still holds
 // any of its vpn addrs, meaning we no longer have a tunnel to the peer
-func (hm *HostMap) DeleteHostInfo(hostinfo *HostInfo) bool {
+func (hm *hostMap) DeleteHostInfo(hostinfo *hostInfo) bool {
 	// Delete the host itself, ensuring it's not modified anymore
 	hm.Lock()
 	final := hm.unlockedDeleteHostInfo(hostinfo)
@@ -419,7 +372,7 @@ func (hm *HostMap) DeleteHostInfo(hostinfo *HostInfo) bool {
 	return final
 }
 
-func (hm *HostMap) MakePrimary(hostinfo *HostInfo) {
+func (hm *hostMap) MakePrimary(hostinfo *hostInfo) {
 	hm.Lock()
 	defer hm.Unlock()
 	hm.unlockedMakePrimary(hostinfo)
@@ -427,10 +380,10 @@ func (hm *HostMap) MakePrimary(hostinfo *HostInfo) {
 
 // unlockedMakePrimary reports whether hostinfo is (now) the primary for each of its addresses,
 // false only when it is no longer in the hostmap at all.
-func (hm *HostMap) unlockedMakePrimary(hostinfo *HostInfo) bool {
+func (hm *hostMap) unlockedMakePrimary(hostinfo *hostInfo) bool {
 	// A hostinfo that is no longer in the hostmap must not be re-inserted here. Callers can race
 	// tunnel teardown, deciding to promote under the read lock and only taking the write lock
-	// after a delete fully unlinked the hostinfo (connection manager swapPrimary, AddRelay). Every
+	// after a delete fully unlinked the hostinfo (connection manager swapPrimary, addRelay). Every
 	// live hostinfo is registered in Indexes by unlockedAddHostInfo, so this is a membership test.
 	if hm.Indexes[hostinfo.localIndexId] != hostinfo {
 		return false
@@ -445,7 +398,7 @@ func (hm *HostMap) unlockedMakePrimary(hostinfo *HostInfo) bool {
 			continue
 		}
 		list := removeHostInfo(hm.unlockedGetHostList(addr), hostinfo)
-		list = append([]*HostInfo{hostinfo}, list...)
+		list = append([]*hostInfo{hostinfo}, list...)
 		hm.unlockedSetHostsForAddr(addr, list)
 	}
 	return true
@@ -455,7 +408,7 @@ func (hm *HostMap) unlockedMakePrimary(hostinfo *HostInfo) bool {
 // maps. It returns true if this was the last hostinfo for all of its addresses (we no longer have
 // any tunnel to the peer), which the caller uses to decide whether to clear learned lighthouse
 // state and disestablish relays.
-func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) bool {
+func (hm *hostMap) unlockedDeleteHostInfo(hostinfo *hostInfo) bool {
 	// Remove this hostinfo from each of its address lists. The lists are independent, so a
 	// sibling is never promoted to an address it does not own and no other list is touched.
 	final := true
@@ -480,10 +433,10 @@ func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) bool {
 	// Go maps never shrink their buckets, replace fully drained maps so a node that churned
 	// through a large peer count gives the memory back. Same idiom as the index maps below.
 	if len(hm.Hosts) == 0 {
-		hm.Hosts = map[netip.Addr]*HostInfo{}
+		hm.Hosts = map[netip.Addr]*hostInfo{}
 	}
 	if len(hm.moreHosts) == 0 {
-		hm.moreHosts = map[netip.Addr][]*HostInfo{}
+		hm.moreHosts = map[netip.Addr][]*hostInfo{}
 	}
 
 	// The remote index uses index ids outside our control so lets make sure we are only removing
@@ -492,25 +445,25 @@ func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) bool {
 	if ok && hostinfo2 == hostinfo {
 		delete(hm.RemoteIndexes, hostinfo.remoteIndexId)
 		if len(hm.RemoteIndexes) == 0 {
-			hm.RemoteIndexes = map[uint32]*HostInfo{}
+			hm.RemoteIndexes = map[uint32]*hostInfo{}
 		}
 	}
 
 	delete(hm.Indexes, hostinfo.localIndexId)
 	if len(hm.Indexes) == 0 {
-		hm.Indexes = map[uint32]*HostInfo{}
+		hm.Indexes = map[uint32]*hostInfo{}
 	}
 
 	if hm.l.Enabled(context.Background(), slog.LevelDebug) {
 		hm.l.Debug("Hostmap hostInfo deleted",
-			"hostMap", m{"mapTotalSize": len(hm.Hosts),
+			"hostMap", structuredMap{"mapTotalSize": len(hm.Hosts),
 				"vpnAddrs": hostinfo.vpnAddrs, "indexNumber": hostinfo.localIndexId, "remoteIndexNumber": hostinfo.remoteIndexId},
 		)
 	}
 
 	if final {
 		// I have lost connectivity to my peers. My relay tunnel is likely broken. Mark the next
-		// hops as 'Requested' so that new relay tunnels are created in the future.
+		// hops as requested so that new relay tunnels are created in the future.
 		hm.unlockedDisestablishVpnAddrRelayFor(hostinfo)
 	}
 	// Clean up any local relay indexes for which I am acting as a relay hop
@@ -521,7 +474,7 @@ func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) bool {
 	return final
 }
 
-func (hm *HostMap) QueryIndexCached(index uint32, cache map[uint32]*HostInfo) *HostInfo {
+func (hm *hostMap) QueryIndexCached(index uint32, cache map[uint32]*hostInfo) *hostInfo {
 	if out, ok := cache[index]; ok {
 		return out
 	}
@@ -532,7 +485,7 @@ func (hm *HostMap) QueryIndexCached(index uint32, cache map[uint32]*HostInfo) *H
 	return out
 }
 
-func (hm *HostMap) QueryIndex(index uint32) *HostInfo {
+func (hm *hostMap) QueryIndex(index uint32) *hostInfo {
 	hm.RLock()
 	if h, ok := hm.Indexes[index]; ok {
 		hm.RUnlock()
@@ -543,7 +496,7 @@ func (hm *HostMap) QueryIndex(index uint32) *HostInfo {
 	}
 }
 
-func (hm *HostMap) QueryRelayIndex(index uint32) *HostInfo {
+func (hm *hostMap) QueryRelayIndex(index uint32) *hostInfo {
 	hm.RLock()
 	if h, ok := hm.Relays[index]; ok {
 		hm.RUnlock()
@@ -554,7 +507,7 @@ func (hm *HostMap) QueryRelayIndex(index uint32) *HostInfo {
 	}
 }
 
-func (hm *HostMap) QueryReverseIndex(index uint32) *HostInfo {
+func (hm *hostMap) QueryReverseIndex(index uint32) *hostInfo {
 	hm.RLock()
 	if h, ok := hm.RemoteIndexes[index]; ok {
 		hm.RUnlock()
@@ -565,11 +518,11 @@ func (hm *HostMap) QueryReverseIndex(index uint32) *HostInfo {
 	}
 }
 
-func (hm *HostMap) QueryVpnAddr(vpnIp netip.Addr) *HostInfo {
+func (hm *hostMap) QueryVpnAddr(vpnIp netip.Addr) *hostInfo {
 	return hm.queryVpnAddr(vpnIp, nil)
 }
 
-func (hm *HostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp netip.Addr) (*HostInfo, *Relay, error) {
+func (hm *hostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp netip.Addr) (*hostInfo, *relay, error) {
 	hm.RLock()
 	defer hm.RUnlock()
 
@@ -582,7 +535,7 @@ func (hm *HostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp net
 
 	for _, targetIp := range targetIps {
 		r, ok := h.relayState.QueryRelayForByIp(targetIp)
-		if ok && r.State == Established {
+		if ok && r.State == relayEstablished {
 			return h, r, nil
 		}
 	}
@@ -592,7 +545,7 @@ func (hm *HostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp net
 		for _, h := range list[1:] {
 			for _, targetIp := range targetIps {
 				r, ok := h.relayState.QueryRelayForByIp(targetIp)
-				if ok && r.State == Established {
+				if ok && r.State == relayEstablished {
 					return h, r, nil
 				}
 			}
@@ -602,22 +555,22 @@ func (hm *HostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp net
 	return nil, nil, errors.New("unable to find host with relay")
 }
 
-func (hm *HostMap) unlockedDisestablishVpnAddrRelayFor(hi *HostInfo) {
+func (hm *hostMap) unlockedDisestablishVpnAddrRelayFor(hi *hostInfo) {
 	for _, relayHostIp := range hi.relayState.CopyRelayIps() {
 		for _, h := range hm.unlockedGetHostList(relayHostIp) {
-			h.relayState.UpdateRelayForByIpState(hi.vpnAddrs[0], Disestablished)
+			h.relayState.UpdateRelayForByIpState(hi.vpnAddrs[0], relayDisestablished)
 		}
 	}
 	for _, rs := range hi.relayState.CopyAllRelayFor() {
-		if rs.Type == ForwardingType {
+		if rs.Type == relayTypeForwarding {
 			for _, h := range hm.unlockedGetHostList(rs.PeerAddr) {
-				h.relayState.UpdateRelayForByIpState(hi.vpnAddrs[0], Disestablished)
+				h.relayState.UpdateRelayForByIpState(hi.vpnAddrs[0], relayDisestablished)
 			}
 		}
 	}
 }
 
-func (hm *HostMap) queryVpnAddr(vpnIp netip.Addr, promoteIfce *Interface) *HostInfo {
+func (hm *hostMap) queryVpnAddr(vpnIp netip.Addr, promoteIfce *packetEngine) *hostInfo {
 	hm.RLock()
 	if h, ok := hm.Hosts[vpnIp]; ok {
 		hm.RUnlock()
@@ -635,7 +588,7 @@ func (hm *HostMap) queryVpnAddr(vpnIp netip.Addr, promoteIfce *Interface) *HostI
 
 // unlockedAddHostInfo assumes you have a write-lock and will add a hostinfo object to the hostmap Indexes and RemoteIndexes maps.
 // If an entry exists for the Hosts table (vpnIp -> hostinfo) then the provided hostinfo will be made primary
-func (hm *HostMap) unlockedAddHostInfo(hostinfo *HostInfo, f *Interface) {
+func (hm *hostMap) unlockedAddHostInfo(hostinfo *hostInfo, f *packetEngine) {
 	for _, addr := range hostinfo.vpnAddrs {
 		hm.unlockedInnerAddHostInfo(addr, hostinfo, f)
 	}
@@ -650,13 +603,13 @@ func (hm *HostMap) unlockedAddHostInfo(hostinfo *HostInfo, f *Interface) {
 
 	if hm.l.Enabled(context.Background(), slog.LevelDebug) {
 		hm.l.Debug("Hostmap vpnIp added",
-			"hostMap", m{"vpnAddrs": hostinfo.vpnAddrs, "mapTotalSize": len(hm.Hosts),
-				"hostinfo": m{"existing": true, "localIndexId": hostinfo.localIndexId, "vpnAddrs": hostinfo.vpnAddrs}},
+			"hostMap", structuredMap{"vpnAddrs": hostinfo.vpnAddrs, "mapTotalSize": len(hm.Hosts),
+				"hostinfo": structuredMap{"existing": true, "localIndexId": hostinfo.localIndexId, "vpnAddrs": hostinfo.vpnAddrs}},
 		)
 	}
 }
 
-func (hm *HostMap) unlockedInnerAddHostInfo(vpnAddr netip.Addr, hostinfo *HostInfo, f *Interface) {
+func (hm *hostMap) unlockedInnerAddHostInfo(vpnAddr netip.Addr, hostinfo *hostInfo, f *packetEngine) {
 	existing, ok := hm.Hosts[vpnAddr]
 	if !ok {
 		// Common case, the first hostinfo for this address. moreHosts stays empty.
@@ -668,47 +621,26 @@ func (hm *HostMap) unlockedInnerAddHostInfo(vpnAddr netip.Addr, hostinfo *HostIn
 	// we never hold a duplicate, then prepend.
 	list, ok := hm.moreHosts[vpnAddr]
 	if !ok {
-		list = []*HostInfo{existing}
+		list = []*hostInfo{existing}
 	}
 	list = removeHostInfo(list, hostinfo)
-	list = append([]*HostInfo{hostinfo}, list...)
+	list = append([]*hostInfo{hostinfo}, list...)
 	hm.unlockedSetHostsForAddr(vpnAddr, list)
 
 	// Enforce the per-address cap by fully retiring the oldest hostinfo once we exceed it.
 	// Deleting it removes it from all of its addresses and the index maps, matching prior behavior.
-	if len(list) > MaxHostInfosPerVpnIp {
+	if len(list) > maxHostInfosPerVPNAddr {
 		hm.unlockedDeleteHostInfo(list[len(list)-1])
 	}
 }
 
-func (hm *HostMap) GetPreferredRanges() []netip.Prefix {
-	//NOTE: if preferredRanges is ever not stored before a load this will fail to dereference a nil pointer
-	return *hm.preferredRanges.Load()
+func (hm *hostMap) GetPreferredRanges() []netip.Prefix {
+	return hm.preferredRanges
 }
 
-func (hm *HostMap) ForEachVpnAddr(f controlEach) {
-	hm.RLock()
-	defer hm.RUnlock()
-
-	for _, v := range hm.Hosts {
-		f(v)
-	}
-}
-
-func (hm *HostMap) ForEachIndex(f controlEach) {
-	hm.RLock()
-	defer hm.RUnlock()
-
-	for _, v := range hm.Indexes {
-		f(v)
-	}
-}
-
-// TryPromoteBest handles re-querying lighthouses and probing for better paths
-// NOTE: It is an error to call this if you are a lighthouse since they should not roam clients!
-func (i *HostInfo) TryPromoteBest(preferredRanges []netip.Prefix, ifce *Interface) {
+func (i *hostInfo) TryPromoteBest(preferredRanges []netip.Prefix, ifce *packetEngine) {
 	c := i.promoteCounter.Add(1)
-	if c%ifce.tryPromoteEvery.Load() == 0 {
+	if c%ifce.tryPromoteEvery == 0 {
 		remote := i.GetRemote()
 
 		// return early if we are already on a preferred remote
@@ -728,23 +660,23 @@ func (i *HostInfo) TryPromoteBest(preferredRanges []netip.Prefix, ifce *Interfac
 
 			// Try to send a test packet to that host, this should
 			// cause it to detect a roaming event and switch remotes
-			ifce.sendTo(header.Test, header.TestRequest, i.ConnectionState, i, addr, []byte(""), make([]byte, 12, 12), make([]byte, mtu))
+			ifce.sendTo(header.Test, header.TestRequest, i.connectionState, i, addr, []byte(""), make([]byte, 12, 12), make([]byte, mtu))
 		})
 	}
 
 	// Re query our lighthouses for new remotes occasionally
-	if c%ifce.reQueryEvery.Load() == 0 && ifce.lightHouse != nil {
+	if c%ifce.reQueryEvery == 0 && ifce.lightHouse != nil {
 		now := time.Now().UnixNano()
 		if now < i.nextLHQuery.Load() {
 			return
 		}
 
-		i.nextLHQuery.Store(now + ifce.reQueryWait.Load())
+		i.nextLHQuery.Store(now + int64(ifce.reQueryWait))
 		ifce.lightHouse.QueryServer(i.vpnAddrs[0])
 	}
 }
 
-// Bits within HostInfo.state, everything above stateEpochShift is the epoch
+// replayWindowBits within hostInfo.state, everything above stateEpochShift is the epoch
 const (
 	stateIn uint32 = 1 << iota
 	stateOut
@@ -756,14 +688,14 @@ const (
 )
 
 // markIn records inbound traffic
-func (i *HostInfo) markIn() {
+func (i *hostInfo) markIn() {
 	if i.state.Load()&stateIn == 0 {
 		i.state.Or(stateIn)
 	}
 }
 
 // markOut records a send and reports whether the epoch moved, meaning we want a punch from the far side
-func (i *HostInfo) markOut(epoch uint32) bool {
+func (i *hostInfo) markOut(epoch uint32) bool {
 	e := epoch << stateEpochShift
 	for {
 		old := i.state.Load()
@@ -778,19 +710,19 @@ func (i *HostInfo) markOut(epoch uint32) bool {
 }
 
 // markOutOnly records a send without consuming the rebind epoch, for paths that cannot act on a requery
-func (i *HostInfo) markOutOnly() {
+func (i *hostInfo) markOutOnly() {
 	if i.state.Load()&stateOut == 0 {
 		i.state.Or(stateOut)
 	}
 }
 
 // takeTraffic clears both traffic bits, leaving the epoch alone, and reports what they were
-func (i *HostInfo) takeTraffic() (in bool, out bool) {
+func (i *hostInfo) takeTraffic() (in bool, out bool) {
 	old := i.state.And(^(stateIn | stateOut))
 	return old&stateIn != 0, old&stateOut != 0
 }
 
-func (i *HostInfo) setPendingDeletion(v bool) {
+func (i *hostInfo) setPendingDeletion(v bool) {
 	if v {
 		i.state.Or(statePendingDeletion)
 	} else {
@@ -798,26 +730,26 @@ func (i *HostInfo) setPendingDeletion(v bool) {
 	}
 }
 
-func (i *HostInfo) isPendingDeletion() bool {
+func (i *hostInfo) isPendingDeletion() bool {
 	return i.state.Load()&statePendingDeletion != 0
 }
 
-func (i *HostInfo) GetCert() *cert.CachedCertificate {
-	if i.ConnectionState != nil {
-		return i.ConnectionState.peerCert
+func (i *hostInfo) GetCert() *cert.CachedCertificate {
+	if i.connectionState != nil {
+		return i.connectionState.peerCert
 	}
 	return nil
 }
 
-func (i *HostInfo) GetRemote() netip.AddrPort {
+func (i *hostInfo) GetRemote() netip.AddrPort {
 	if p := i.remote.Load(); p != nil {
 		return *p
 	}
 	return netip.AddrPort{}
 }
 
-// TODO: Maybe use ViaSender here?
-func (i *HostInfo) SetRemote(remote netip.AddrPort) {
+// TODO: Maybe use packetSender here?
+func (i *hostInfo) SetRemote(remote netip.AddrPort) {
 	// We copy here because we likely got this remote from a source that reuses the object
 	if i.GetRemote() != remote {
 		i.remote.Store(&remote)
@@ -826,8 +758,8 @@ func (i *HostInfo) SetRemote(remote netip.AddrPort) {
 }
 
 // SetRemoteIfPreferred returns true if the remote was changed. The lastRoam
-// time on the HostInfo will also be updated.
-func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, via ViaSender) bool {
+// time on the hostInfo will also be updated.
+func (i *hostInfo) SetRemoteIfPreferred(hm *hostMap, via packetSender) bool {
 	if via.IsRelayed {
 		return false
 	}
@@ -865,29 +797,29 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, via ViaSender) bool {
 	return false
 }
 
-// buildNetworks fills in the networks field of HostInfo. It accepts a cert.Certificate so you never ever mix the network types up.
-func (i *HostInfo) buildNetworks(myVpnNetworksTable *bart.Lite, c cert.Certificate) {
+// buildNetworks fills in the networks field of hostInfo. It accepts a cert.Certificate so you never ever mix the network types up.
+func (i *hostInfo) buildNetworks(myVpnNetworksTable *bart.Lite, c cert.Certificate) {
 	if len(c.Networks()) == 1 && len(c.UnsafeNetworks()) == 0 {
 		if myVpnNetworksTable.Contains(c.Networks()[0].Addr()) {
 			return // Simple case, no BART needed
 		}
 	}
 
-	i.networks = new(bart.Table[NetworkType])
+	i.networks = new(bart.Table[networkType])
 	for _, network := range c.UnsafeNetworks() {
-		// Mark where an unsafe network overlaps our vpn networks, the firewall must not let the
-		// peer send from vpn addresses that belong to other nodes
+		// Mark overlap so packet identity validation cannot let this peer impersonate
+		// overlay addresses assigned to other nodes.
 		if myVpnNetworksTable.LookupPrefix(network) {
 			// The unsafe network is inside one of our vpn networks, all of it is overlap.
 			// Ex: vpn network 10.1.0.0/16, unsafe network 10.1.2.0/24, all of 10.1.2.0/24 is overlap
-			i.networks.Insert(network, NetworkTypeUnsafeVPNOverlap)
+			i.networks.Insert(network, networkTypeUnsafeVPNOverlap)
 		} else {
 			// Any of our vpn networks inside the unsafe network are the overlap, the rest is unsafe.
 			// Ex: vpn network 10.1.0.0/16, unsafe network 10.0.0.0/8, 10.1.0.0/16 is overlap and the rest of 10.0.0.0/8 is unsafe.
 			// On the other hand, an unsafe network assignment of 192.168.0.0/16 would have no overlap.
-			i.networks.Insert(network, NetworkTypeUnsafe)
+			i.networks.Insert(network, networkTypeUnsafe)
 			for overlap := range myVpnNetworksTable.Subnets(network) {
-				i.networks.Insert(overlap, NetworkTypeUnsafeVPNOverlap)
+				i.networks.Insert(overlap, networkTypeUnsafeVPNOverlap)
 			}
 		}
 	}
@@ -896,15 +828,15 @@ func (i *HostInfo) buildNetworks(myVpnNetworksTable *bart.Lite, c cert.Certifica
 	for _, network := range c.Networks() {
 		nprefix := netip.PrefixFrom(network.Addr(), network.Addr().BitLen())
 		if myVpnNetworksTable.Contains(network.Addr()) {
-			i.networks.Insert(nprefix, NetworkTypeVPN)
+			i.networks.Insert(nprefix, networkTypeVPN)
 		} else {
-			i.networks.Insert(nprefix, NetworkTypeVPNPeer)
+			i.networks.Insert(nprefix, networkTypeVPNPeer)
 		}
 	}
 }
 
 // logger returns a derived slog.Logger with per-hostinfo fields pre-bound.
-func (i *HostInfo) logger(l *slog.Logger) *slog.Logger {
+func (i *hostInfo) logger(l *slog.Logger) *slog.Logger {
 	if i == nil {
 		return l
 	}
@@ -915,7 +847,7 @@ func (i *HostInfo) logger(l *slog.Logger) *slog.Logger {
 		"remoteIndex", i.remoteIndexId,
 	)
 
-	if connState := i.ConnectionState; connState != nil {
+	if connState := i.connectionState; connState != nil {
 		if peerCert := connState.peerCert; peerCert != nil {
 			li = li.With("certName", peerCert.Certificate.Name())
 		}

@@ -11,40 +11,24 @@ import (
 	"sync/atomic"
 
 	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
 )
 
 type relayManager struct {
 	l         *slog.Logger
-	hostmap   *HostMap
+	hostmap   *hostMap
 	amRelay   atomic.Bool
 	useRelays atomic.Bool
 }
 
-func NewRelayManager(ctx context.Context, l *slog.Logger, hostmap *HostMap, c *config.C) *relayManager {
+func newRelayManager(l *slog.Logger, hostmap *hostMap, amRelay, useRelays bool) *relayManager {
 	rm := &relayManager{
 		l:       l,
 		hostmap: hostmap,
 	}
-	rm.reload(c, true)
-	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
-		err := rm.reload(c, false)
-		if err != nil {
-			rm.l.Error("Failed to reload relay_manager", "error", err)
-			r.Failed()
-		}
-	})
+	rm.amRelay.Store(amRelay)
+	rm.useRelays.Store(useRelays && !amRelay)
 	return rm
-}
-
-func (rm *relayManager) reload(c *config.C, initial bool) error {
-	if initial || c.HasChanged("relay.am_relay") || c.HasChanged("relay.use_relays") {
-		amRelay := c.GetBool("relay.am_relay", false)
-		rm.amRelay.Store(amRelay)
-		rm.useRelays.Store(c.GetBool("relay.use_relays", true) && !amRelay)
-	}
-	return nil
 }
 
 func (rm *relayManager) GetAmRelay() bool {
@@ -57,9 +41,9 @@ func (rm *relayManager) GetUseRelays() bool {
 
 // StartRelays drives the relay-establishment side of an outbound handshake attempt.
 // For each candidate relay it either kicks off a handshake to the relay, sends a CreateRelayRequest, retransmits
-// one that may have been lost, or, once the relay is Established, forwards the in-progress
+// one that may have been lost, or, once the relay is established, forwards the in-progress
 // stage 0 handshake packet for vpnIp through it.
-func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *HandshakeHostInfo, stage0 []byte) {
+func (rm *relayManager) StartRelays(f *packetEngine, vpnIp netip.Addr, hh *handshakeHostInfo, stage0 []byte) {
 	hostinfo := hh.hostinfo
 	if !rm.GetUseRelays() || len(hostinfo.remotes.relays) == 0 {
 		hh.lastRelays = nil
@@ -76,7 +60,7 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 	hl := hostinfo.logger(rm.l)
 	hl.Log(context.Background(), listLevel, "Attempt to relay through hosts", "relays", relays)
 
-	// Send a RelayRequest to all known Relay IP's
+	// Send a RelayRequest to all known relay IP's
 	for _, relay := range relays {
 		// Don't relay through the host I'm trying to connect to
 		if relay == vpnIp {
@@ -101,12 +85,12 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 			continue
 		}
 
-		// Check the relay HostInfo to see if we already established a relay through
+		// Check the relay hostInfo to see if we already established a relay through
 		existingRelay, ok := relayHostInfo.relayState.QueryRelayForByIp(vpnIp)
 		if !ok {
 			// No relays exist or requested yet.
 			if relayHostInfo.GetRemote().IsValid() {
-				idx, err := AddRelay(rm.l, relayHostInfo, rm.hostmap, vpnIp, nil, TerminalType, Requested)
+				idx, err := addRelay(rm.l, relayHostInfo, rm.hostmap, vpnIp, nil, relayTypeTerminal, relayRequested)
 				if err != nil {
 					// No local relay state was installed, so a CreateRelayRequest would hand the
 					// peer an index we could never resolve. Skip it.
@@ -160,14 +144,14 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 		}
 
 		switch existingRelay.State {
-		case Established:
+		case relayEstablished:
 			hl.Log(context.Background(), level, "Send handshake via relay", "relay", relay.String())
-			f.SendVia(relayHostInfo, existingRelay, stage0, make([]byte, 12), make([]byte, mtu), false, 0)
-		case Disestablished:
+			f.SendVia(relayHostInfo, existingRelay, stage0, make([]byte, 12), make([]byte, mtu), false)
+		case relayDisestablished:
 			// Mark this relay as 'requested'
-			relayHostInfo.relayState.UpdateRelayForByIpState(vpnIp, Requested)
+			relayHostInfo.relayState.UpdateRelayForByIpState(vpnIp, relayRequested)
 			fallthrough
-		case Requested:
+		case relayRequested:
 			hl.Log(context.Background(), level, "Re-send CreateRelay request", "relay", relay.String())
 			// Re-send the CreateRelay request, in case the previous one was lost.
 			m := NebulaControl{
@@ -211,11 +195,11 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 					"relay", relay,
 				)
 			}
-		case PeerRequested:
-			// PeerRequested only occurs in Forwarding relays, not Terminal relays, and this is a Terminal relay case.
+		case relayPeerRequested:
+			// A peer-requested state only occurs in forwarding relays, not terminal relays.
 			fallthrough
 		default:
-			hl.Error("Relay unexpected state",
+			hl.Error("relay unexpected state",
 				"vpnAddr", vpnIp,
 				"state", existingRelay.State,
 				"relay", relay,
@@ -225,9 +209,9 @@ func (rm *relayManager) StartRelays(f *Interface, vpnIp netip.Addr, hh *Handshak
 	}
 }
 
-// AddRelay finds an available relay index on the hostmap, and associates the relay info with it.
+// addRelay finds an available relay index on the hostmap, and associates the relay info with it.
 // relayHostInfo is the Nebula peer which can be used as a relay to access the target vpnIp.
-func AddRelay(l *slog.Logger, relayHostInfo *HostInfo, hm *HostMap, vpnIp netip.Addr, remoteIdx *uint32, relayType int, state int) (uint32, error) {
+func addRelay(l *slog.Logger, relayHostInfo *hostInfo, hm *hostMap, vpnIp netip.Addr, remoteIdx *uint32, relayType int, state int) (uint32, error) {
 	hm.Lock()
 	defer hm.Unlock()
 	for range 32 {
@@ -249,7 +233,7 @@ func AddRelay(l *slog.Logger, relayHostInfo *HostInfo, hm *HostMap, vpnIp netip.
 			}
 
 			hm.Relays[index] = relayHostInfo
-			newRelay := Relay{
+			newRelay := relay{
 				Type:       relayType,
 				State:      state,
 				LocalIndex: index,
@@ -268,8 +252,8 @@ func AddRelay(l *slog.Logger, relayHostInfo *HostInfo, hm *HostMap, vpnIp netip.
 	return 0, errors.New("failed to generate unique localIndexId")
 }
 
-// EstablishRelay updates a Requested Relay to become an Established Relay, which can pass traffic.
-func (rm *relayManager) EstablishRelay(relayHostInfo *HostInfo, m *NebulaControl) (*Relay, error) {
+// EstablishRelay moves a requested relay into the established state so it can pass traffic.
+func (rm *relayManager) EstablishRelay(relayHostInfo *hostInfo, m *NebulaControl) (*relay, error) {
 	relay, ok := relayHostInfo.relayState.CompleteRelayByIdx(m.InitiatorRelayIndex, m.ResponderRelayIndex)
 	if !ok {
 		var relayFrom, relayTo any
@@ -296,7 +280,7 @@ func (rm *relayManager) EstablishRelay(relayHostInfo *HostInfo, m *NebulaControl
 	return relay, nil
 }
 
-func (rm *relayManager) HandleControlMsg(h *HostInfo, d []byte, f *Interface) {
+func (rm *relayManager) HandleControlMsg(h *hostInfo, d []byte, f *packetEngine) {
 	msg := &NebulaControl{}
 	err := msg.Unmarshal(d)
 	if err != nil {
@@ -342,7 +326,7 @@ func (rm *relayManager) HandleControlMsg(h *HostInfo, d []byte, f *Interface) {
 	}
 }
 
-func (rm *relayManager) handleCreateRelayResponse(v cert.Version, h *HostInfo, f *Interface, m *NebulaControl) {
+func (rm *relayManager) handleCreateRelayResponse(v cert.Version, h *hostInfo, f *packetEngine, m *NebulaControl) {
 	//nil-checks for protoAddrToNetAddr handled by caller
 	relayFrom := protoAddrToNetAddr(m.RelayFromAddr)
 	relayTo := protoAddrToNetAddr(m.RelayToAddr)
@@ -360,26 +344,26 @@ func (rm *relayManager) handleCreateRelayResponse(v cert.Version, h *HostInfo, f
 		return
 	}
 	// Do I need to complete the relays now?
-	if relay.Type == TerminalType {
+	if relay.Type == relayTypeTerminal {
 		return
 	}
 	// I'm the middle man. Let the initiator know that the I've established the relay they requested.
 	peerHostInfo := rm.hostmap.QueryVpnAddr(relay.PeerAddr)
 	if peerHostInfo == nil {
-		rm.l.Error("Can't find a HostInfo for peer", "relayTo", relay.PeerAddr)
+		rm.l.Error("Can't find a hostInfo for peer", "relayTo", relay.PeerAddr)
 		return
 	}
 	peerRelay, ok := peerHostInfo.relayState.QueryRelayForByIp(relayTo)
 	if !ok {
-		rm.l.Error("peerRelay does not have Relay state for relayTo", "relayTo", peerHostInfo.vpnAddrs[0])
+		rm.l.Error("peerRelay does not have relay state for relayTo", "relayTo", peerHostInfo.vpnAddrs[0])
 		return
 	}
 	switch peerRelay.State {
-	case Requested:
+	case relayRequested:
 		// I initiated the request to this peer, but haven't heard back from the peer yet. I must wait for this peer
 		// to respond to complete the connection.
-	case PeerRequested, Disestablished, Established:
-		peerHostInfo.relayState.UpdateRelayForByIpState(relayTo, Established)
+	case relayPeerRequested, relayDisestablished, relayEstablished:
+		peerHostInfo.relayState.UpdateRelayForByIpState(relayTo, relayEstablished)
 		resp := NebulaControl{
 			Type:                NebulaControl_CreateRelayResponse,
 			ResponderRelayIndex: peerRelay.LocalIndex,
@@ -424,7 +408,7 @@ func (rm *relayManager) handleCreateRelayResponse(v cert.Version, h *HostInfo, f
 	}
 }
 
-func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *HostInfo, f *Interface, m *NebulaControl) {
+func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *hostInfo, f *packetEngine, m *NebulaControl) {
 	//nil-checks for protoAddrToNetAddr handled by caller
 	from := protoAddrToNetAddr(m.RelayFromAddr)
 	target := protoAddrToNetAddr(m.RelayToAddr)
@@ -449,38 +433,38 @@ func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *HostInfo, f 
 		existingRelay, ok := h.relayState.QueryRelayForByIp(from)
 		if ok {
 			switch existingRelay.State {
-			case Requested:
+			case relayRequested:
 				ok = h.relayState.CompleteRelayByIP(from, m.InitiatorRelayIndex)
 				if !ok {
-					logMsg.Error("Relay State not found")
+					logMsg.Error("relay State not found")
 					return
 				}
-			case Established:
+			case relayEstablished:
 				if existingRelay.RemoteIndex != m.InitiatorRelayIndex {
-					// We got a brand new Relay request, because its index is different than what we saw before.
+					// We got a brand new relay request, because its index is different than what we saw before.
 					// This should never happen. The peer should never change an index, once created.
 					logMsg.Error("Existing relay mismatch with CreateRelayRequest",
 						"existingRemoteIndex", existingRelay.RemoteIndex)
 					return
 				}
-			case Disestablished:
+			case relayDisestablished:
 				if existingRelay.RemoteIndex != m.InitiatorRelayIndex {
-					// We got a brand new Relay request, because its index is different than what we saw before.
+					// We got a brand new relay request, because its index is different than what we saw before.
 					// This should never happen. The peer should never change an index, once created.
 					logMsg.Error("Existing relay mismatch with CreateRelayRequest",
 						"existingRemoteIndex", existingRelay.RemoteIndex)
 					return
 				}
-				// Mark the relay as 'Established' because it's safe to use again
-				h.relayState.UpdateRelayForByIpState(from, Established)
-			case PeerRequested:
+				// Mark the relay established because it is safe to use again.
+				h.relayState.UpdateRelayForByIpState(from, relayEstablished)
+			case relayPeerRequested:
 				// I should never be in this state, because I am terminal, not forwarding.
-				logMsg.Error("Unexpected Relay State found",
+				logMsg.Error("Unexpected relay State found",
 					"existingRemoteIndex", existingRelay.RemoteIndex,
 					"state", existingRelay.State)
 			}
 		} else {
-			_, err := AddRelay(rm.l, h, f.hostMap, from, &m.InitiatorRelayIndex, TerminalType, Established)
+			_, err := addRelay(rm.l, h, f.hostMap, from, &m.InitiatorRelayIndex, relayTypeTerminal, relayEstablished)
 			if err != nil {
 				logMsg.Error("Failed to add relay", "error", err)
 				return
@@ -489,7 +473,7 @@ func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *HostInfo, f 
 
 		relay, ok := h.relayState.QueryRelayForByIp(from)
 		if !ok {
-			logMsg.Error("Relay State not found", "from", from)
+			logMsg.Error("relay State not found", "from", from)
 			return
 		}
 
@@ -550,12 +534,12 @@ func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *HostInfo, f 
 			index = targetRelay.LocalIndex
 		} else {
 			// Allocate an index in the hostMap for this relay peer
-			index, err = AddRelay(rm.l, peer, f.hostMap, from, nil, ForwardingType, Requested)
+			index, err = addRelay(rm.l, peer, f.hostMap, from, nil, relayTypeForwarding, relayRequested)
 			if err != nil {
 				return
 			}
 		}
-		peer.relayState.UpdateRelayForByIpState(from, Requested)
+		peer.relayState.UpdateRelayForByIpState(from, relayRequested)
 		// Send a CreateRelayRequest to the peer.
 		req := NebulaControl{
 			Type:                NebulaControl_CreateRelayRequest,
@@ -597,10 +581,10 @@ func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *HostInfo, f 
 			)
 		}
 
-		// Also track the half-created Relay state just received
+		// Also track the half-created relay state just received
 		_, ok = h.relayState.QueryRelayForByIp(target)
 		if !ok {
-			_, err := AddRelay(rm.l, h, f.hostMap, target, &m.InitiatorRelayIndex, ForwardingType, PeerRequested)
+			_, err := addRelay(rm.l, h, f.hostMap, target, &m.InitiatorRelayIndex, relayTypeForwarding, relayPeerRequested)
 			if err != nil {
 				logMsg.Error("relayManager Failed to allocate a local index for relay", "error", err)
 				return

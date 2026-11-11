@@ -1,174 +1,141 @@
-## What is Nebula?
-Nebula is a scalable overlay networking tool with a focus on performance, simplicity and security.
-It lets you seamlessly connect computers anywhere in the world. Nebula is portable, and runs on Linux, OSX, Windows, iOS, and Android.
-It can be used to connect a small number of computers, but is also able to connect tens of thousands of computers.
+## Nebula Fork
 
-Nebula incorporates a number of existing concepts like encryption, security groups, certificates,
-and tunneling.
-What makes Nebula different to existing offerings is that it brings all of these ideas together,
-resulting in a sum that is greater than its individual parts.
+> 这是 Nebula 的 Fork 项目 做自用用途
 
-Further documentation can be found [here](https://nebula.defined.net/docs/).
+本分支是一个仅供 Go 程序嵌入的 Nebula 节点库。它保留 Nebula 的证书、Noise
+握手、lighthouse、NAT punch、relay 和 wire protocol，数据面则使用 gVisor
+userspace netstack。它不会创建 TUN/TAP/Wintun、修改系统路由、扫描网卡或自行
+绑定宿主端口，也不提供 CLI、YAML 配置、ctl/local API、DNS、SSH、metrics、
+端口转发或 firewall policy。
 
-You can read more about Nebula [here](https://medium.com/p/884110a5579).
+## 创建节点
 
-You can also join the NebulaOSS Slack group [here](https://join.slack.com/t/nebulaoss/shared_invite/zt-39pk4xopc-CUKlGcb5Z39dQ0cK1v7ehA).
+应用负责创建外层数据报传输。普通 UDP socket 可直接通过 `WrapPacketConn`
+注入；测试、移动端或已有网络框架也可以实现最小的 `DatagramTransport` 接口。
 
-## Supported Platforms
+```go
+packetConn, err := net.ListenPacket("udp", ":4242")
+if err != nil {
+	return err
+}
 
-#### Desktop and Server
+hostCertificate, _, err := cert.UnmarshalCertificateFromPEM(hostCertificatePEM)
+if err != nil {
+	return err
+}
+hostKey, _, _, err := cert.UnmarshalPrivateKeyFromPEM(hostKeyPEM)
+if err != nil {
+	return err
+}
+caPool, err := cert.NewCAPoolFromPEM(caPEM)
+if err != nil {
+	return err
+}
 
-Check the [releases](https://github.com/slackhq/nebula/releases/latest) page for downloads or see the [Distribution Packages](https://github.com/slackhq/nebula#distribution-packages) section.
-
-- Linux - 64 and 32 bit, arm, and others
-- Windows
-- MacOS
-- Freebsd
-
-#### Distribution Packages
-
-- [Arch Linux](https://archlinux.org/packages/extra/x86_64/nebula/)
-    ```sh
-    sudo pacman -S nebula
-    ```
-
-- [Fedora Linux](https://src.fedoraproject.org/rpms/nebula)
-    ```sh
-    sudo dnf install nebula
-    ```
-
-- [Debian Linux](https://packages.debian.org/source/stable/nebula)
-    ```sh
-    sudo apt install nebula
-    ```
-
-- [Alpine Linux](https://pkgs.alpinelinux.org/packages?name=nebula)
-    ```sh
-    sudo apk add nebula
-    ```
-
-- [macOS Homebrew](https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/n/nebula.rb)
-    ```sh
-    brew install nebula
-    ```
-
-- [Docker](https://hub.docker.com/r/nebulaoss/nebula)
-    ```sh
-    docker pull nebulaoss/nebula
-    ```
-
-#### Mobile ([source code](https://github.com/DefinedNet/mobile_nebula))
-
-- [iOS](https://apps.apple.com/us/app/mobile-nebula/id1509587936?itsct=apps_box&amp;itscg=30200)
-- [Android](https://play.google.com/store/apps/details?id=net.defined.mobile_nebula&pcampaignid=pcampaignidMKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1)
-
-## Technical Overview
-
-Nebula is a mutually authenticated peer-to-peer software-defined network based on the [Noise Protocol Framework](https://noiseprotocol.org/).
-Nebula uses certificates to assert a node's IP address, name, and membership within user-defined groups.
-Nebula's user-defined groups allow for provider agnostic traffic filtering between nodes.
-Discovery nodes (aka lighthouses) allow individual peers to find each other and optionally use UDP hole punching to establish connections from behind most firewalls or NATs.
-Users can move data between nodes in any number of cloud service providers, datacenters, and endpoints, without needing to maintain a particular addressing scheme.
-
-Nebula uses Elliptic-curve Diffie-Hellman (`ECDH`) key exchange and `AES-256-GCM` in its default configuration.
-
-Nebula was created to provide a mechanism for groups of hosts to communicate securely, even across the internet, while enabling expressive firewall definitions similar in style to cloud security groups.
-
-## Getting started (quickly)
-
-**Don't want to manage your own PKI and lighthouses?** [Managed Nebula](https://www.defined.net/) from Defined Networking handles all of this for you.
-
-To set up a Nebula network, you'll need:
-
-#### 1. The [Nebula binaries](https://github.com/slackhq/nebula/releases) or [Distribution Packages](https://github.com/slackhq/nebula#distribution-packages) for your specific platform. Specifically you'll need `nebula-cert` and the specific nebula binary for each platform you use.
-
-#### 2. (Optional, but you really should..) At least one discovery node with a routable IP address, which we call a lighthouse.
-
-Nebula lighthouses allow nodes to find each other, anywhere in the world. A lighthouse is the only node in a Nebula network whose IP should not change. Running a lighthouse requires very few compute resources, and you can easily use the least expensive option from a cloud hosting provider. If you're not sure which provider to use, a number of us have used $6/mo [DigitalOcean](https://digitalocean.com) droplets as lighthouses.
-
-Once you have launched an instance, ensure that Nebula udp traffic (default port udp/4242) can reach it over the internet.
-
-#### 3. A Nebula certificate authority, which will be the root of trust for a particular Nebula network.
-
-```sh
-./nebula-cert ca -name "Myorganization, Inc"
+node, err := nebula.New(ctx, nebula.Options{
+	Identities: []nebula.Identity{{
+		Certificate: hostCertificate,
+		PrivateKey:  hostKey,
+	}},
+	CAPool:    caPool,
+	Transport: nebula.WrapPacketConn(packetConn),
+	Lighthouse: nebula.LighthouseOptions{
+		StaticHosts: map[netip.Addr][]netip.AddrPort{
+			netip.MustParseAddr("10.42.0.1"): {
+				netip.MustParseAddrPort("203.0.113.10:4242"),
+			},
+		},
+	},
+})
+if err != nil {
+	return err
+}
+if err := node.Start(); err != nil {
+	return err
+}
+defer func() {
+	_ = node.Close()
+	_ = node.Wait()
+}()
 ```
 
-This will create files named `ca.key` and `ca.cert` in the current directory. The `ca.key` file is the most sensitive file you'll create, because it is the key used to sign the certificates for individual nebula nodes/hosts. Please store this file somewhere safe, preferably with strong encryption.
+`Node` 在构造成功后拥有 transport，并在关闭时关闭它以中断读取。transport
+的 `Close` 必须能中断 `ReadFrom`。`Close` 可重复调用，`Wait` 等待全部内部 worker；
+transport 发生 fatal read error 时，`Wait` 返回原始错误。实现了
+`RebindableTransport` 的传输可通过 `Node.Rebind` 切换底层网络并触发
+lighthouse update 和 punch。
 
-**Be aware!** By default, certificate authorities have a 1-year lifetime before expiration. See [this guide](https://nebula.defined.net/docs/guides/rotating-certificate-authority/) for details on rotating a CA.
+## TCP、UDP 和 HTTP
 
-#### 4. Nebula host keys and certificates generated from that certificate authority
+`Dial` 和 `DialContext` 支持 `tcp`/`tcp4`/`tcp6` 与
+`udp`/`udp4`/`udp6`；`Listen` 仅创建 TCP listener，`ListenPacket` 仅创建 UDP
+packet connection。监听地址必须是本节点证书地址、已注册虚拟地址或通配地址；
+端口 `0` 会由 gVisor 分配动态端口。`tcp`/`udp` 通配监听使用单个双栈 endpoint，
+`tcp6`/`udp6` 通配监听严格限制为 IPv6。地址只接受 IP literal；名称解析由宿主
+应用负责。listener 和 connection 的具体 gVisor 类型属于内部实现，公共契约仅为
+标准库的 `net.Listener`、`net.PacketConn` 和 `net.Conn`。
 
-This assumes you have four nodes, named lighthouse1, laptop, server1, host3. You can name the nodes any way you'd like, including FQDN. You'll also need to choose IP addresses and the associated subnet. In this example, we are creating a nebula network that will use 192.168.100.x/24 as its network range. This example also demonstrates nebula groups, which can later be used to define traffic rules in a nebula network.
-```sh
-./nebula-cert sign -name "lighthouse1" -ip "192.168.100.1/24"
-./nebula-cert sign -name "laptop" -ip "192.168.100.2/24" -groups "laptop,home,ssh"
-./nebula-cert sign -name "server1" -ip "192.168.100.9/24" -groups "servers"
-./nebula-cert sign -name "host3" -ip "192.168.100.10/24"
+```go
+listener, err := node.Listen("tcp", "10.42.0.2:8080")
+if err != nil {
+	return err
+}
+go http.Serve(listener, handler)
+
+client := &http.Client{Transport: &http.Transport{
+	DialContext: node.DialContext,
+}}
+
+packetConn, err := node.ListenPacket("udp", ":5353")
 ```
 
-By default, host certificates will expire 1 second before the CA expires. Use the `-duration` flag to specify a shorter lifetime.
+本库没有端口级 firewall。应用必须决定创建哪些 listener，并在 HTTP、RPC 或
+其他应用协议层完成认证和授权。
 
-#### 5. Configuration files for each host
+`LighthouseOptions`、`PunchyOptions` 和 `RelayOptions` 分别控制动态地址发现、
+NAT 打洞与中继。静态部署只需 `StaticHosts`；动态部署应配置 lighthouse 的静态
+入口，并通过 `AdvertiseEndpoints` 或 `EndpointProvider` 提供宿主实际可达地址。
 
-Download a copy of the nebula [example configuration](https://github.com/slackhq/nebula/blob/master/examples/config.yml).
+## 虚拟地址和 unsafe route
 
-* On the lighthouse node, you'll need to ensure `am_lighthouse: true` is set.
+虚拟地址可用于在证书 overlay 地址以外监听或作为主动连接的源地址。每个虚拟
+地址都必须由本节点每张 identity 的 `UnsafeNetworks` 覆盖。unsafe route 使用
+最长前缀匹配，`Via` 必须是本地 overlay 网段内的 Nebula peer 地址。
 
-* On the individual hosts, ensure the lighthouse is defined properly in the `static_host_map` section, and is added to the lighthouse `hosts` section.
+```go
+node, err := nebula.New(ctx, nebula.Options{
+	// Identities、CAPool、Transport 等略
+	VirtualAddresses: []netip.Addr{
+		netip.MustParseAddr("172.30.0.10"),
+	},
+	UnsafeRoutes: []nebula.Route{{
+		Prefix: netip.MustParsePrefix("172.31.0.0/16"),
+		Via:    netip.MustParseAddr("10.42.0.254"),
+	}},
+})
 
-
-#### 6. Copy nebula credentials, configuration, and binaries to each host
-
-For each host, copy the nebula binary to the host, along with `config.yml` from step 5, and the files `ca.crt`, `{host}.crt`, and `{host}.key` from step 4.
-
-**DO NOT COPY `ca.key` TO INDIVIDUAL NODES.**
-
-#### 7. Run nebula on each host
-
-```sh
-./nebula -config /path/to/config.yml
+dialer := node.Dialer(nebula.DialerOptions{
+	LocalAddr: netip.MustParseAddr("172.30.0.10"),
+})
+conn, err := dialer.DialContext(ctx, "tcp", "10.42.0.3:443")
 ```
 
-For more detailed instructions, [find the full documentation here](https://nebula.defined.net/docs/).
+入站和出站仍强制校验 certificate address、`UnsafeNetworks`、实际 tunnel peer
+和配置的 `Via`，并禁止 unsafe route 覆盖 overlay 身份。嵌入式节点只接收以
+自身 overlay/virtual address 为目的的数据，不充当收到流量的通用 IP 转发器。
 
-## Building Nebula from source
+## 证书 API
 
-Make sure you have [go](https://go.dev/doc/install) installed and clone this repo. Change to the nebula directory.
+`cert.CreateCA`、`cert.IssueCertificate`、`cert.GenerateSigningKey` 和
+`cert.GenerateKeyAgreementKey` 提供 v1/v2、Curve25519 和 P256 的纯 Go 证书
+生成接口。原有 PEM、CA pool、签名验证及私钥加密解密 API 保持可用；FIPS
+140-only 模式下默认生成 P256，Curve25519 和 ChaChaPoly 会被明确拒绝。
 
-To build nebula for all platforms:
-`make all`
+## 与上游节点互通
 
-To build nebula for a specific platform (ex, Windows):
-`make bin-windows`
-
-See the [Makefile](Makefile) for more details on build targets
-
-## Curve P256 and FIPS 140-3 mode
-
-The default curve used for cryptographic handshakes and signatures is Curve25519. This is the recommended setting for most users. If your deployment has certain compliance requirements, you have the option of creating your CA using `nebula-cert ca -curve P256` to use NIST Curve P256. The CA will then sign certificates using ECDSA P256, and any hosts using these certificates will use P256 for ECDH handshakes.
-
-Nebula can be built to support the [FIPS 140-3](https://go.dev/doc/security/fips140) mode of Go by running either of the following make targets. (This sets GOFIPS140=v1.0.0, which must be done at compile time so that the correct AES-GCM can be used for FIPS 140-3 enforcement mode).
-
-```sh
-make fips140
-make fips140 test
-make release-fips140
-```
-
-Nebula can also be built using the [BoringCrypto GOEXPERIMENT](https://github.com/golang/go/blob/go1.20/src/crypto/internal/boring/README.md) by running either of the following make targets.
-
-```sh
-make bin-boringcrypto
-make release-boringcrypto
-```
-
-NOTE: boringcrypto support is deprecated and will be removed in the next release. Users should migrate to the native FIPS 140-3 mode described above.
-
-This is not the recommended default deployment, but may be useful based on your compliance requirements.
-
-## Credits
-
-Nebula was created at Slack Technologies, Inc by Nate Brown and Ryan Huber, with contributions from Oliver Fross, Alan Lam, Wade Simmons, and Lining Wang.
-
+与未修改的 Nebula 节点通信时，需要使用相同 CA、可协商的证书版本/curve/
+cipher，并通过 UDP `DatagramTransport` 提供双方可达的 underlay endpoint；地址
+发现可使用 lighthouse 或 `StaticHosts`。若上游节点作为 unsafe gateway，还必须
+在其证书中授权对应 `UnsafeNetworks`，且上游 firewall/路由允许这些流量。反向
+访问本库的 virtual address 时，上游需要把该前缀路由到本节点。协议兼容不表示
+保留上游的命令行、配置文件、系统网卡或防火墙行为。

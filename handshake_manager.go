@@ -15,13 +15,12 @@ import (
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/handshake"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/udp"
 )
 
 const (
-	DefaultHandshakeTryInterval   = time.Millisecond * 100
-	DefaultHandshakeRetries       = 10
-	DefaultHandshakeTriggerBuffer = 64
+	defaultHandshakeTryInterval   = time.Millisecond * 100
+	defaultHandshakeRetries       = 10
+	defaultHandshakeTriggerBuffer = 64
 
 	// maxCachedPackets is how many unsent packets we'll buffer per pending
 	// handshake before dropping further ones.
@@ -37,41 +36,40 @@ const (
 )
 
 var (
-	defaultHandshakeConfig = HandshakeConfig{
-		tryInterval:   DefaultHandshakeTryInterval,
-		retries:       DefaultHandshakeRetries,
-		triggerBuffer: DefaultHandshakeTriggerBuffer,
+	defaultHandshakeConfig = handshakeManagerConfig{
+		tryInterval:   defaultHandshakeTryInterval,
+		retries:       defaultHandshakeRetries,
+		triggerBuffer: defaultHandshakeTriggerBuffer,
 	}
 )
 
-type HandshakeConfig struct {
+type handshakeManagerConfig struct {
 	tryInterval   time.Duration
 	retries       int64
 	triggerBuffer int
 }
 
-type HandshakeManager struct {
+type handshakeManager struct {
 	// Mutex for interacting with the vpnIps and indexes maps.
-	// Lock order is hostmap, then this lock, then the lighthouse, then a RemoteList.
+	// Lock order is hostmap, then this lock, then the lighthouse, then a remoteList.
 	sync.RWMutex
 
-	vpnIps  map[netip.Addr]*HandshakeHostInfo
-	indexes map[uint32]*HandshakeHostInfo
+	vpnIps  map[netip.Addr]*handshakeHostInfo
+	indexes map[uint32]*handshakeHostInfo
 
-	mainHostMap            *HostMap
-	lightHouse             *LightHouse
-	outside                udp.Conn
-	config                 HandshakeConfig
-	OutboundHandshakeTimer *LockingTimerWheel[netip.Addr]
-	ecmpGateways           *ecmpGateways
-	f                      *Interface
+	mainHostMap            *hostMap
+	lightHouse             *lighthouse
+	outside                DatagramTransport
+	config                 handshakeManagerConfig
+	OutboundHandshakeTimer *lockingTimerWheel[netip.Addr]
+	f                      *packetEngine
 	l                      *slog.Logger
 
 	// can be used to trigger outbound handshake for the given vpnIp
 	trigger chan netip.Addr
 }
 
-type HandshakeHostInfo struct {
+type handshakeHostInfo struct {
 	sync.Mutex
 
 	startTime                 time.Time        // Time that we first started trying with this handshake
@@ -82,11 +80,11 @@ type HandshakeHostInfo struct {
 	lastRelays                []netip.Addr     // Relays we attempted to use during the previous attempt
 	packetStore               []*cachedPacket  // A set of packets to be transmitted once the handshake completes
 
-	hostinfo *HostInfo
+	hostinfo *hostInfo
 	machine  *handshake.Machine // The handshake state machine, set during stage 0 (initiator) or beginHandshake (responder multi-message)
 }
 
-func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback) {
+func (hh *handshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback) {
 	if len(hh.packetStore) < maxCachedPackets {
 		tempPacket := make([]byte, len(packet))
 		copy(tempPacket, packet)
@@ -109,102 +107,21 @@ func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, s
 	}
 }
 
-// ecmpGateways remembers whether each gateway of a multi-gateway route is up. A gateway is down once a handshake with
-// it times out or the connection manager finds its tunnel dead, and up again once a handshake with it completes.
-//
-// A packet whose flow hashes to a gateway without a tunnel waits for that gateway's handshake instead of going to
-// another gateway. Sending it elsewhere would split the flow: once the handshake completes, the rest of the flow goes
-// to the gateway it hashes to, which has never seen it and, for TCP to a backend, resets it. Only a down gateway is
-// passed over, and while it is, a flow that hashes to it goes to another gateway. Handshakes with it are retried as
-// those packets arrive, and the first one to complete marks it up.
-//
-// That leaves two cases where a flow is still split, because the hash alone decides where a flow goes:
-//   - A flow that started on another gateway while its own was down goes back to its own once a handshake with it
-//     completes, and is reset there.
-//   - That includes a flow started after a down gateway has recovered but before we know: its first packet goes to
-//     another gateway and starts the handshake that tells us, so the window is one handshake.
-//
-// Only the routing path adds entries, for gateways of multi-gateway routes, so this holds one entry per such gateway
-// however many other hosts we handshake with.
-type ecmpGateways struct {
-	sync.RWMutex
-	up map[netip.Addr]bool
-}
-
-func newECMPGateways() *ecmpGateways {
-	return &ecmpGateways{up: map[netip.Addr]bool{}}
-}
-
-// isUp reports whether gateway is up, and starts tracking gateway as up if it was not already.
-func (g *ecmpGateways) isUp(gateway netip.Addr) bool {
-	g.RLock()
-	up, ok := g.up[gateway]
-	g.RUnlock()
-
-	if !ok {
-		g.Lock()
-		if _, ok := g.up[gateway]; !ok {
-			g.up[gateway] = true
-		}
-		g.Unlock()
-		return true
-	}
-
-	return up
-}
-
-// markDown marks any tracked gateway in addrs down.
-func (g *ecmpGateways) markDown(addrs ...netip.Addr) {
-	g.Lock()
-	for _, addr := range addrs {
-		if _, ok := g.up[addr]; ok {
-			g.up[addr] = false
-		}
-	}
-	g.Unlock()
-}
-
-// markUp marks any tracked gateway in addrs, which now have a tunnel, up.
-func (g *ecmpGateways) markUp(addrs ...netip.Addr) {
-	g.RLock()
-	found := false
-	for _, addr := range addrs {
-		if up, ok := g.up[addr]; ok && !up {
-			found = true
-			break
-		}
-	}
-	g.RUnlock()
-
-	if !found {
-		return
-	}
-
-	g.Lock()
-	for _, addr := range addrs {
-		if _, ok := g.up[addr]; ok {
-			g.up[addr] = true
-		}
-	}
-	g.Unlock()
-}
-
-func NewHandshakeManager(l *slog.Logger, mainHostMap *HostMap, lightHouse *LightHouse, outside udp.Conn, config HandshakeConfig) *HandshakeManager {
-	return &HandshakeManager{
-		vpnIps:                 map[netip.Addr]*HandshakeHostInfo{},
-		indexes:                map[uint32]*HandshakeHostInfo{},
+func newHandshakeManager(l *slog.Logger, mainHostMap *hostMap, lightHouse *lighthouse, outside DatagramTransport, config handshakeManagerConfig) *handshakeManager {
+	return &handshakeManager{
+		vpnIps:                 map[netip.Addr]*handshakeHostInfo{},
+		indexes:                map[uint32]*handshakeHostInfo{},
 		mainHostMap:            mainHostMap,
 		lightHouse:             lightHouse,
 		outside:                outside,
 		config:                 config,
 		trigger:                make(chan netip.Addr, config.triggerBuffer),
-		OutboundHandshakeTimer: NewLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
-		ecmpGateways:           newECMPGateways(),
+		OutboundHandshakeTimer: newLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
 		l:                      l,
 	}
 }
 
-func (hm *HandshakeManager) Run(ctx context.Context) {
+func (hm *handshakeManager) Run(ctx context.Context) {
 	clockSource := time.NewTicker(hm.config.tryInterval)
 	defer clockSource.Stop()
 
@@ -220,7 +137,7 @@ func (hm *HandshakeManager) Run(ctx context.Context) {
 	}
 }
 
-func (hm *HandshakeManager) HandleIncoming(via ViaSender, packet []byte, h *header.H) {
+func (hm *handshakeManager) HandleIncoming(via packetSender, packet []byte, h *header.H) {
 	// Gate on known handshake subtypes. Unknown subtypes (or future ones we
 	// don't yet support) are dropped here rather than silently routed through
 	// the IX path. Add a case when introducing a new pattern.
@@ -231,14 +148,6 @@ func (hm *HandshakeManager) HandleIncoming(via ViaSender, packet []byte, h *head
 		hm.l.Debug("dropping handshake with unsupported subtype",
 			"from", via, "subtype", h.Subtype)
 		return
-	}
-
-	// First remote allow list check before we know the vpnIp
-	if !via.IsRelayed {
-		if !hm.lightHouse.GetRemoteAllowList().AllowUnknownVpnAddr(via.UdpAddr.Addr()) {
-			hm.l.Debug("lighthouse.remote_allow_list denied incoming handshake", "from", via)
-			return
-		}
 	}
 
 	// First message of a new handshake. The wire format requires RemoteIndex
@@ -265,7 +174,7 @@ func (hm *HandshakeManager) HandleIncoming(via ViaSender, packet []byte, h *head
 	}
 }
 
-func (hm *HandshakeManager) NextOutboundHandshakeTimerTick(now time.Time) {
+func (hm *handshakeManager) NextOutboundHandshakeTimerTick(now time.Time) {
 	hm.OutboundHandshakeTimer.Advance(now)
 	for {
 		vpnIp, has := hm.OutboundHandshakeTimer.Purge()
@@ -276,7 +185,7 @@ func (hm *HandshakeManager) NextOutboundHandshakeTimerTick(now time.Time) {
 	}
 }
 
-func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered bool) {
+func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered bool) {
 	hh := hm.queryVpnIp(vpnIp)
 	if hh == nil {
 		return
@@ -296,13 +205,12 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 		// (e.g., no certificate available). In that case there's no useful
 		// handshake metadata to log.
 		if hh.machine != nil {
-			fields = append(fields, "handshake", m{
+			fields = append(fields, "handshake", structuredMap{
 				"stage": uint64(hh.machine.MessageIndex()),
 				"style": header.SubTypeName(header.Handshake, hh.machine.Subtype()),
 			})
 		}
 		hh.hostinfo.logger(hm.l).Info("Handshake timed out", fields...)
-		hm.ecmpGateways.markDown(vpnIp)
 		hm.DeleteHostInfo(hostinfo)
 		return
 	}
@@ -322,11 +230,11 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 	// IX (the initiator only ever sends one packet, msg1) but wrong the
 	// moment a 3+ message pattern lands. The retry loop should resend the
 	// most recent outgoing message, not always stage 0. That implies
-	// HandshakeHostInfo tracking a single "currentOutbound" packet (bytes +
+	// handshakeHostInfo tracking a single "currentOutbound" packet (bytes +
 	// header metadata) that gets replaced as the handshake progresses,
 	// instead of indexing into HandshakePacket.
 	stage0 := hostinfo.HandshakePacket[handshakePacketStage0]
-	hsFields := m{
+	hsFields := structuredMap{
 		"stage": uint64(hh.machine.MessageIndex()),
 		"style": header.SubTypeName(header.Handshake, hh.machine.Subtype()),
 	}
@@ -402,7 +310,7 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 
 // GetOrHandshake will try to find a hostinfo with a fully formed tunnel or start a new handshake if one is not present
 // The 2nd argument will be true if the hostinfo is ready to transmit traffic
-func (hm *HandshakeManager) GetOrHandshake(vpnIp netip.Addr, cacheCb func(*HandshakeHostInfo)) (*HostInfo, bool) {
+func (hm *handshakeManager) GetOrHandshake(vpnIp netip.Addr, cacheCb func(*handshakeHostInfo)) (*hostInfo, bool) {
 	hm.mainHostMap.RLock()
 	h, ok := hm.mainHostMap.Hosts[vpnIp]
 	hm.mainHostMap.RUnlock()
@@ -419,7 +327,7 @@ func (hm *HandshakeManager) GetOrHandshake(vpnIp netip.Addr, cacheCb func(*Hands
 }
 
 // StartHandshake will ensure a handshake is currently being attempted for the provided vpn ip
-func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*HandshakeHostInfo)) *HostInfo {
+func (hm *handshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*handshakeHostInfo)) *hostInfo {
 	hm.Lock()
 
 	if hh, ok := hm.vpnIps[vpnAddr]; ok {
@@ -431,20 +339,20 @@ func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*Han
 		return hh.hostinfo
 	}
 
-	hostinfo := &HostInfo{
+	hostinfo := &hostInfo{
 		vpnAddrs:        []netip.Addr{vpnAddr},
 		HandshakePacket: make(map[uint8][]byte, 0),
 		// Attached here so a pending hostinfo never exists without one: SetRemote dereferences
 		// it, and create-tunnel -address can reach SetRemote before the handshake loop runs.
 		remotes: hm.lightHouse.QueryCache([]netip.Addr{vpnAddr}),
-		relayState: RelayState{
+		relayState: relayState{
 			relays:         nil,
-			relayForByAddr: map[netip.Addr]*Relay{},
-			relayForByIdx:  map[uint32]*Relay{},
+			relayForByAddr: map[netip.Addr]*relay{},
+			relayForByIdx:  map[uint32]*relay{},
 		},
 	}
 
-	hh := &HandshakeHostInfo{
+	hh := &handshakeHostInfo{
 		hostinfo:  hostinfo,
 		startTime: time.Now(),
 	}
@@ -458,10 +366,6 @@ func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*Han
 	// If this is a static host, we don't need to wait for the HostQueryReply
 	// We can trigger the handshake right now
 	_, doTrigger := hm.lightHouse.GetStaticHostList()[vpnAddr]
-	if !doTrigger {
-		// Add any calculated remotes, and trigger early handshake if one found
-		doTrigger = hm.lightHouse.addCalculatedRemotes(vpnAddr)
-	}
 
 	if doTrigger {
 		select {
@@ -472,29 +376,27 @@ func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*Han
 
 	hm.Unlock()
 	hm.lightHouse.QueryServer(vpnAddr)
-	// If this host came from a static_map hostname its addresses may have moved, retries will pick up anything new
-	hostinfo.remotes.ResolveHostnames()
 	return hostinfo
 }
 
 var (
-	ErrExistingHostInfo    = errors.New("existing hostinfo")
-	ErrAlreadySeen         = errors.New("already seen")
-	ErrLocalIndexCollision = errors.New("local index collision")
+	errExistingHostInfo    = errors.New("existing hostinfo")
+	errAlreadySeen         = errors.New("already seen")
+	errLocalIndexCollision = errors.New("local index collision")
 )
 
 // CheckAndComplete checks for any conflicts in the main and pending hostmap
 // before adding hostinfo to main. If err is nil, it was added. Otherwise err will be:
 //
-// ErrAlreadySeen if we already have an entry in the hostmap that has seen the
+// errAlreadySeen if we already have an entry in the hostmap that has seen the
 // exact same handshake packet
 //
-// ErrExistingHostInfo if we already have an entry in the hostmap for this
+// errExistingHostInfo if we already have an entry in the hostmap for this
 // VpnIp and the new handshake was older than the one we currently have
 //
-// ErrLocalIndexCollision if we already have an entry in the main or pending
+// errLocalIndexCollision if we already have an entry in the main or pending
 // hostmap for the hostinfo.localIndexId.
-func (hm *HandshakeManager) CheckAndComplete(hostinfo *HostInfo, handshakePacket uint8, f *Interface) (*HostInfo, error) {
+func (hm *handshakeManager) CheckAndComplete(hostinfo *hostInfo, handshakePacket uint8, f *packetEngine) (*hostInfo, error) {
 	hm.mainHostMap.Lock()
 	defer hm.mainHostMap.Unlock()
 	hm.Lock()
@@ -506,13 +408,13 @@ func (hm *HandshakeManager) CheckAndComplete(hostinfo *HostInfo, handshakePacket
 		// Is it just a delayed handshake packet? Check every hostinfo we hold for this address.
 		for _, testHostInfo := range hm.mainHostMap.unlockedGetHostList(hostinfo.vpnAddrs[0]) {
 			if bytes.Equal(hostinfo.HandshakePacket[handshakePacket], testHostInfo.HandshakePacket[handshakePacket]) {
-				return testHostInfo, ErrAlreadySeen
+				return testHostInfo, errAlreadySeen
 			}
 		}
 
 		// Is this a newer handshake?
-		if existingHostInfo.lastHandshakeTime >= hostinfo.lastHandshakeTime && !existingHostInfo.ConnectionState.initiator {
-			return existingHostInfo, ErrExistingHostInfo
+		if existingHostInfo.lastHandshakeTime >= hostinfo.lastHandshakeTime && !existingHostInfo.connectionState.initiator {
+			return existingHostInfo, errExistingHostInfo
 		}
 
 		existingHostInfo.logger(hm.l).Info("Taking new handshake")
@@ -521,13 +423,13 @@ func (hm *HandshakeManager) CheckAndComplete(hostinfo *HostInfo, handshakePacket
 	existingIndex, found := hm.mainHostMap.Indexes[hostinfo.localIndexId]
 	if found {
 		// We have a collision, but for a different hostinfo
-		return existingIndex, ErrLocalIndexCollision
+		return existingIndex, errLocalIndexCollision
 	}
 
 	existingPendingIndex, found := hm.indexes[hostinfo.localIndexId]
 	if found && existingPendingIndex.hostinfo != hostinfo {
 		// We have a collision, but for a different hostinfo
-		return existingPendingIndex.hostinfo, ErrLocalIndexCollision
+		return existingPendingIndex.hostinfo, errLocalIndexCollision
 	}
 
 	existingRemoteIndex, found := hm.mainHostMap.RemoteIndexes[hostinfo.remoteIndexId]
@@ -540,14 +442,13 @@ func (hm *HandshakeManager) CheckAndComplete(hostinfo *HostInfo, handshakePacket
 	}
 
 	hm.mainHostMap.unlockedAddHostInfo(hostinfo, f)
-	hm.ecmpGateways.markUp(hostinfo.vpnAddrs...)
 	return existingHostInfo, nil
 }
 
 // Complete is a simpler version of CheckAndComplete when we already know we
 // won't have a localIndexId collision because we already have an entry in the
 // pendingHostMap. An existing hostinfo is returned if there was one.
-func (hm *HandshakeManager) Complete(hostinfo *HostInfo, f *Interface) {
+func (hm *handshakeManager) Complete(hostinfo *hostInfo, f *packetEngine) {
 	hm.mainHostMap.Lock()
 	defer hm.mainHostMap.Unlock()
 	hm.Lock()
@@ -565,13 +466,12 @@ func (hm *HandshakeManager) Complete(hostinfo *HostInfo, f *Interface) {
 	// We need to remove from the pending hostmap first to avoid undoing work when after to the main hostmap.
 	hm.unlockedDeleteHostInfo(hostinfo)
 	hm.mainHostMap.unlockedAddHostInfo(hostinfo, f)
-	hm.ecmpGateways.markUp(hostinfo.vpnAddrs...)
 }
 
-// allocateIndex generates a unique localIndexId for this HostInfo
+// allocateIndex generates a unique localIndexId for this hostInfo
 // and adds it to the pendingHostMap. Will error if we are unable to generate
 // a unique localIndexId
-func (hm *HandshakeManager) allocateIndex(hh *HandshakeHostInfo) (uint32, error) {
+func (hm *handshakeManager) allocateIndex(hh *handshakeHostInfo) (uint32, error) {
 	hm.mainHostMap.RLock()
 	defer hm.mainHostMap.RUnlock()
 	hm.Lock()
@@ -596,13 +496,13 @@ func (hm *HandshakeManager) allocateIndex(hh *HandshakeHostInfo) (uint32, error)
 	return 0, errors.New("failed to generate unique localIndexId")
 }
 
-func (hm *HandshakeManager) DeleteHostInfo(hostinfo *HostInfo) {
+func (hm *handshakeManager) DeleteHostInfo(hostinfo *hostInfo) {
 	hm.Lock()
 	defer hm.Unlock()
 	hm.unlockedDeleteHostInfo(hostinfo)
 }
 
-func (hm *HandshakeManager) unlockedDeleteHostInfo(hostinfo *HostInfo) {
+func (hm *handshakeManager) unlockedDeleteHostInfo(hostinfo *hostInfo) {
 	for _, addr := range hostinfo.vpnAddrs {
 		if cur, ok := hm.vpnIps[addr]; ok && cur.hostinfo == hostinfo {
 			delete(hm.vpnIps, addr)
@@ -610,23 +510,23 @@ func (hm *HandshakeManager) unlockedDeleteHostInfo(hostinfo *HostInfo) {
 	}
 
 	if len(hm.vpnIps) == 0 {
-		hm.vpnIps = map[netip.Addr]*HandshakeHostInfo{}
+		hm.vpnIps = map[netip.Addr]*handshakeHostInfo{}
 	}
 
 	delete(hm.indexes, hostinfo.localIndexId)
 	if len(hm.indexes) == 0 {
-		hm.indexes = map[uint32]*HandshakeHostInfo{}
+		hm.indexes = map[uint32]*handshakeHostInfo{}
 	}
 
 	if hm.l.Enabled(context.Background(), slog.LevelDebug) {
 		hm.l.Debug("Pending hostmap hostInfo deleted",
-			"hostMap", m{"mapTotalSize": len(hm.vpnIps),
+			"hostMap", structuredMap{"mapTotalSize": len(hm.vpnIps),
 				"vpnAddrs": hostinfo.vpnAddrs, "indexNumber": hostinfo.localIndexId, "remoteIndexNumber": hostinfo.remoteIndexId},
 		)
 	}
 }
 
-func (hm *HandshakeManager) QueryVpnAddr(vpnIp netip.Addr) *HostInfo {
+func (hm *handshakeManager) QueryVpnAddr(vpnIp netip.Addr) *hostInfo {
 	hh := hm.queryVpnIp(vpnIp)
 	if hh != nil {
 		return hh.hostinfo
@@ -635,13 +535,13 @@ func (hm *HandshakeManager) QueryVpnAddr(vpnIp netip.Addr) *HostInfo {
 
 }
 
-func (hm *HandshakeManager) queryVpnIp(vpnIp netip.Addr) *HandshakeHostInfo {
+func (hm *handshakeManager) queryVpnIp(vpnIp netip.Addr) *handshakeHostInfo {
 	hm.RLock()
 	defer hm.RUnlock()
 	return hm.vpnIps[vpnIp]
 }
 
-func (hm *HandshakeManager) QueryIndex(index uint32) *HostInfo {
+func (hm *handshakeManager) QueryIndex(index uint32) *hostInfo {
 	hh := hm.queryIndex(index)
 	if hh != nil {
 		return hh.hostinfo
@@ -649,35 +549,15 @@ func (hm *HandshakeManager) QueryIndex(index uint32) *HostInfo {
 	return nil
 }
 
-func (hm *HandshakeManager) queryIndex(index uint32) *HandshakeHostInfo {
+func (hm *handshakeManager) queryIndex(index uint32) *handshakeHostInfo {
 	hm.RLock()
 	defer hm.RUnlock()
 	return hm.indexes[index]
 }
 
-func (hm *HandshakeManager) GetPreferredRanges() []netip.Prefix {
+func (hm *handshakeManager) GetPreferredRanges() []netip.Prefix {
 	return hm.mainHostMap.GetPreferredRanges()
 }
-
-func (hm *HandshakeManager) ForEachVpnAddr(f controlEach) {
-	hm.RLock()
-	defer hm.RUnlock()
-
-	for _, v := range hm.vpnIps {
-		f(v.hostinfo)
-	}
-}
-
-func (hm *HandshakeManager) ForEachIndex(f controlEach) {
-	hm.RLock()
-	defer hm.RUnlock()
-
-	for _, v := range hm.indexes {
-		f(v.hostinfo)
-	}
-}
-
-// Utility functions below
 
 func generateIndex(l *slog.Logger) (uint32, error) {
 	b := make([]byte, 4)
@@ -705,7 +585,7 @@ func hsTimeout(tries int64, interval time.Duration) time.Duration {
 }
 
 // buildStage0Packet creates the initial handshake packet for the initiator.
-func (hm *HandshakeManager) buildStage0Packet(hh *HandshakeHostInfo) bool {
+func (hm *handshakeManager) buildStage0Packet(hh *handshakeHostInfo) bool {
 	cs := hm.f.pki.getCertState()
 	v := cs.DefaultVersion()
 	if hh.initiatingVersionOverride != cert.VersionPre1 {
@@ -744,7 +624,7 @@ func (hm *HandshakeManager) buildStage0Packet(hh *HandshakeHostInfo) bool {
 		return false
 	}
 
-	// hostinfo.ConnectionState stays nil until the handshake completes in
+	// hostinfo.connectionState stays nil until the handshake completes in
 	// continueHandshake. Pre-completion control surfaces guard with nil
 	// checks; the data plane never observes a pending hostinfo.
 	hh.hostinfo.HandshakePacket[handshakePacketStage0] = msg
@@ -756,7 +636,7 @@ func (hm *HandshakeManager) buildStage0Packet(hh *HandshakeHostInfo) bool {
 // beginHandshake handles an incoming handshake packet that doesn't match any
 // existing pending handshake. It creates a new responder Machine and processes
 // the first message.
-func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *header.H) {
+func (hm *handshakeManager) beginHandshake(via packetSender, packet []byte, h *header.H) {
 	f := hm.f
 	cs := f.pki.getCertState()
 
@@ -817,17 +697,17 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 		return
 	}
 
-	hostinfo := &HostInfo{
-		ConnectionState:   connState,
+	hostinfo := &hostInfo{
+		connectionState:   connState,
 		localIndexId:      result.LocalIndex,
 		remoteIndexId:     result.RemoteIndex,
 		vpnAddrs:          vpnAddrs,
 		HandshakePacket:   make(map[uint8][]byte, 0),
 		lastHandshakeTime: result.HandshakeTime,
-		relayState: RelayState{
+		relayState: relayState{
 			relays:         nil,
-			relayForByAddr: map[netip.Addr]*Relay{},
-			relayForByIdx:  map[uint32]*Relay{},
+			relayForByAddr: map[netip.Addr]*relay{},
+			relayForByIdx:  map[uint32]*relay{},
 		},
 	}
 
@@ -844,7 +724,7 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 		"issuer", remoteCert.Certificate.Issuer(),
 		"initiatorIndex", result.RemoteIndex,
 		"responderIndex", result.LocalIndex,
-		"handshake", m{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
+		"handshake", structuredMap{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
 	)
 
 	// packet aliases the listener's incoming buffer, so this copy must stay.
@@ -878,7 +758,7 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 }
 
 // continueHandshake feeds an incoming packet to an existing pending handshake Machine.
-func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostInfo, packet []byte) {
+func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHostInfo, packet []byte) {
 	f := hm.f
 
 	hh.Lock()
@@ -897,13 +777,6 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 	}
 
 	hostinfo := hh.hostinfo
-	if !via.IsRelayed {
-		if !f.lightHouse.GetRemoteAllowList().AllowAll(hostinfo.vpnAddrs, via.UdpAddr.Addr()) {
-			f.l.Debug("lighthouse.remote_allow_list denied incoming handshake",
-				"vpnAddrs", hostinfo.vpnAddrs, "from", via)
-			return
-		}
-	}
 
 	machine := hh.machine
 	if machine == nil {
@@ -935,14 +808,14 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 		return
 	}
 
-	// Handshake complete; build the ConnectionState now that we have keys and a verified peer cert.
+	// Handshake complete; build the connectionState now that we have keys and a verified peer cert.
 	cs, err := newConnectionStateFromResult(result)
 	if err != nil {
 		f.l.Error("Discarding handshake with an invalid message index", "error", err, "vpnAddrs", hostinfo.vpnAddrs)
 		hm.DeleteHostInfo(hostinfo)
 		return
 	}
-	hostinfo.ConnectionState = cs
+	hostinfo.connectionState = cs
 
 	remoteCert := result.RemoteCert
 	if remoteCert == nil {
@@ -967,8 +840,8 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 	correctHostResponded := false
 	anyVpnAddrsInCommon := false
 	for i, network := range vpnNetworks {
-		// inside.go drops self-routed packets at the firewall stage, but we'd
-		// rather not let a self-handshake complete in the first place: it
+		// Packet identity checks drop self-routed traffic, but avoid letting a
+		// self-handshake complete in the first place: it
 		// wastes a hostmap slot, suppresses no log, and obscures routing
 		// misconfig. Explicit refusal here mirrors the responder-side check
 		// in validatePeerCert.
@@ -980,7 +853,7 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 				"certVersion", remoteCert.Certificate.Version(),
 				"fingerprint", remoteCert.Fingerprint,
 				"issuer", remoteCert.Certificate.Issuer(),
-				"handshake", m{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
+				"handshake", structuredMap{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
 			)
 			hm.DeleteHostInfo(hostinfo)
 			return
@@ -1003,11 +876,11 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 			"certVersion", remoteCert.Certificate.Version(),
 			"fingerprint", remoteCert.Fingerprint,
 			"issuer", remoteCert.Certificate.Issuer(),
-			"handshake", m{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
+			"handshake", structuredMap{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
 		)
 
 		hm.DeleteHostInfo(hostinfo)
-		hm.StartHandshake(hostinfo.vpnAddrs[0], func(newHH *HandshakeHostInfo) {
+		hm.StartHandshake(hostinfo.vpnAddrs[0], func(newHH *handshakeHostInfo) {
 			newHH.hostinfo.remotes.BlockRemote(via)
 			newHH.packetStore = hh.packetStore
 			hh.packetStore = []*cachedPacket{}
@@ -1033,7 +906,7 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 		"issuer", remoteCert.Certificate.Issuer(),
 		"initiatorIndex", result.LocalIndex,
 		"responderIndex", result.RemoteIndex,
-		"handshake", m{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
+		"handshake", structuredMap{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
 		"durationNs", duration,
 		"sentCachedPackets", len(hh.packetStore),
 	)
@@ -1050,9 +923,8 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 		nb := make([]byte, 12, 12)
 		out := make([]byte, mtu)
 		for _, cp := range hh.packetStore {
-			// TODO: use a SendBatch here. Each callback lands in
-			// sendEncrypted -> WriteTo: one syscall per cached packet,
-			// where one sendmmsg could flush the whole store.
+			// The injected transport remains responsible for any write
+			// aggregation it wants to provide.
 			cp.callback(cp.messageType, cp.messageSubType, hostinfo, cp.packet, nb, out)
 		}
 	}
@@ -1065,10 +937,10 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 	}
 }
 
-// validatePeerCert checks the peer certificate for self-connection and remote allow list.
+// validatePeerCert checks the peer certificate for self-connection.
 // Returns the VPN addrs, whether any of them fall within one of our own VPN
 // networks, and true if valid; false if rejected.
-func (hm *HandshakeManager) validatePeerCert(via ViaSender, remoteCert *cert.CachedCertificate) ([]netip.Addr, bool, bool) {
+func (hm *handshakeManager) validatePeerCert(via packetSender, remoteCert *cert.CachedCertificate) ([]netip.Addr, bool, bool) {
 	f := hm.f
 	vpnNetworks := remoteCert.Certificate.Networks()
 
@@ -1103,22 +975,14 @@ func (hm *HandshakeManager) validatePeerCert(via ViaSender, remoteCert *cert.Cac
 		}
 	}
 
-	if !via.IsRelayed {
-		if !f.lightHouse.GetRemoteAllowList().AllowAll(vpnAddrs, via.UdpAddr.Addr()) {
-			f.l.Debug("lighthouse.remote_allow_list denied incoming handshake",
-				"vpnAddrs", vpnAddrs, "from", via)
-			return nil, false, false
-		}
-	}
-
 	return vpnAddrs, anyVpnAddrsInCommon, true
 }
 
 // sendHandshakeResponse sends a handshake response via the appropriate transport.
 // cached is true when msg is a stored response being retransmitted because
-// the peer's stage-1 retransmit landed (the ErrAlreadySeen path); false on a
+// the peer's stage-1 retransmit landed (the errAlreadySeen path); false on a
 // fresh response.
-func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hostinfo *HostInfo, cached bool) {
+func (hm *handshakeManager) sendHandshakeResponse(via packetSender, msg []byte, hostinfo *hostInfo, cached bool) {
 	if msg == nil {
 		return
 	}
@@ -1130,12 +994,12 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 	// block if so.
 	logFields := []any{
 		"vpnAddrs", hostinfo.vpnAddrs,
-		"handshake", m{"stage": uint64(2), "style": header.SubTypeName(header.Handshake, header.HandshakeIXPSK0)},
+		"handshake", structuredMap{"stage": uint64(2), "style": header.SubTypeName(header.Handshake, header.HandshakeIXPSK0)},
 		"cached", cached,
 		"initiatorIndex", hostinfo.remoteIndexId,
 		"responderIndex", hostinfo.localIndexId,
 	}
-	if peerCert := hostinfo.ConnectionState.peerCert; peerCert != nil {
+	if peerCert := hostinfo.connectionState.peerCert; peerCert != nil {
 		logFields = append(logFields,
 			"certName", peerCert.Certificate.Name(),
 			"certVersion", peerCert.Certificate.Version(),
@@ -1159,24 +1023,24 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 		}
 		hostinfo.relayState.InsertRelayTo(via.relayHI.vpnAddrs[0])
 		// We received a valid handshake on this relay, so make sure the relay
-		// state reflects that, in case it had been marked Disestablished.
-		via.relayHI.relayState.UpdateRelayForByIdxState(via.relay.LocalIndex, Established)
-		f.SendVia(via.relayHI, via.relay, msg, make([]byte, 12), make([]byte, mtu), false, 0)
+		// state reflects that, in case it had been marked disestablished.
+		via.relayHI.relayState.UpdateRelayForByIdxState(via.relay.LocalIndex, relayEstablished)
+		f.SendVia(via.relayHI, via.relay, msg, make([]byte, 12), make([]byte, mtu), false)
 		f.l.Info("Handshake message sent", append(logFields, "relay", via.relayHI.vpnAddrs[0])...)
 	}
 }
 
 // handleCheckAndCompleteError handles errors from CheckAndComplete.
 // This only fires from the responder-side beginHandshake path, after the
-// peer cert has been validated and ConnectionState populated, so peerCert
+// peer cert has been validated and connectionState populated, so peerCert
 // is always non-nil for the cases that log it.
-func (hm *HandshakeManager) handleCheckAndCompleteError(err error, existing, hostinfo *HostInfo, via ViaSender) {
+func (hm *handshakeManager) handleCheckAndCompleteError(err error, existing, hostinfo *hostInfo, via packetSender) {
 	f := hm.f
-	peerCert := hostinfo.ConnectionState.peerCert
-	hsFields := m{"stage": uint64(1), "style": header.SubTypeName(header.Handshake, header.HandshakeIXPSK0)}
+	peerCert := hostinfo.connectionState.peerCert
+	hsFields := structuredMap{"stage": uint64(1), "style": header.SubTypeName(header.Handshake, header.HandshakeIXPSK0)}
 
 	switch err {
-	case ErrAlreadySeen:
+	case errAlreadySeen:
 		if existing.SetRemoteIfPreferred(f.hostMap, via) {
 			f.SendMessageToVpnAddr(header.Test, header.TestRequest, hostinfo.vpnAddrs[0], []byte(""), make([]byte, 12, 12), make([]byte, mtu))
 		}
@@ -1187,7 +1051,7 @@ func (hm *HandshakeManager) handleCheckAndCompleteError(err error, existing, hos
 			hm.sendHandshakeResponse(via, msg, existing, true)
 		}
 
-	case ErrExistingHostInfo:
+	case errExistingHostInfo:
 		f.l.Info("Handshake too old",
 			"vpnAddrs", hostinfo.vpnAddrs,
 			"from", via,
@@ -1203,8 +1067,8 @@ func (hm *HandshakeManager) handleCheckAndCompleteError(err error, existing, hos
 		)
 		f.SendMessageToVpnAddr(header.Test, header.TestRequest, hostinfo.vpnAddrs[0], []byte(""), make([]byte, 12, 12), make([]byte, mtu))
 
-	case ErrLocalIndexCollision:
-		f.l.Error("Failed to add HostInfo due to localIndex collision",
+	case errLocalIndexCollision:
+		f.l.Error("Failed to add hostInfo due to localIndex collision",
 			"vpnAddrs", hostinfo.vpnAddrs,
 			"from", via,
 			"certName", peerCert.Certificate.Name(),
@@ -1218,7 +1082,7 @@ func (hm *HandshakeManager) handleCheckAndCompleteError(err error, existing, hos
 		)
 
 	default:
-		f.l.Error("Failed to add HostInfo to HostMap",
+		f.l.Error("Failed to add hostInfo to hostMap",
 			"vpnAddrs", hostinfo.vpnAddrs,
 			"from", via,
 			"error", err,
@@ -1234,7 +1098,7 @@ func (hm *HandshakeManager) handleCheckAndCompleteError(err error, existing, hos
 }
 
 // certVerifier returns a CertVerifier that validates certs against the current CA pool.
-func (hm *HandshakeManager) certVerifier() handshake.CertVerifier {
+func (hm *handshakeManager) certVerifier() handshake.CertVerifier {
 	return func(c cert.Certificate) (*cert.CachedCertificate, error) {
 		return hm.f.pki.GetCAPool().VerifyCertificate(time.Now(), c)
 	}

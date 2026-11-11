@@ -9,26 +9,26 @@ import (
 
 const bitsPerWord = 64
 
-// Bits is a sliding-window anti-replay tracker. The window is stored as a
+// replayWindowBits is a sliding-window anti-replay tracker. The window is stored as a
 // circular bitmap packed into uint64 words (8x denser than a []bool), so a
 // length-N window costs N/8 bytes. length must be a power of two.
-type Bits struct {
+type replayWindowBits struct {
 	length     uint64
 	lengthMask uint64
 	current    uint64
 	bits       []uint64
 }
 
-func NewBits(length uint64) *Bits {
+func newReplayWindow(length uint64) *replayWindowBits {
 	if length == 0 || length&(length-1) != 0 {
-		panic(fmt.Sprintf("Bits length must be a power of two, got %d", length))
+		panic(fmt.Sprintf("replayWindowBits length must be a power of two, got %d", length))
 	}
 
 	nWords := length / bitsPerWord
 	if nWords == 0 {
 		nWords = 1
 	}
-	b := &Bits{
+	b := &replayWindowBits{
 		length:     length,
 		lengthMask: length - 1,
 		bits:       make([]uint64, nWords),
@@ -39,20 +39,20 @@ func NewBits(length uint64) *Bits {
 	return b
 }
 
-func (b *Bits) get(i uint64) bool {
+func (b *replayWindowBits) get(i uint64) bool {
 	pos := i & b.lengthMask
 	//bit-shifting by 6 because i is a bit index, not a u64 index, and we need to find the u64 without bit in it
 	return b.bits[pos>>6]&(uint64(1)<<(pos&63)) != 0
 }
 
-func (b *Bits) set(i uint64) {
+func (b *replayWindowBits) set(i uint64) {
 	pos := i & b.lengthMask
 	b.bits[pos>>6] |= uint64(1) << (pos & 63)
 }
 
 // clearRange clears count bits starting at circular position startPos.
 // count must be in [1, length].
-func (b *Bits) clearRange(startPos, count uint64) {
+func (b *replayWindowBits) clearRange(startPos, count uint64) {
 	if count >= b.length {
 		clear(b.bits)
 		return
@@ -91,7 +91,7 @@ func (b *Bits) clearRange(startPos, count uint64) {
 	}
 }
 
-func (b *Bits) strictlyWithinWindow(i uint64) bool {
+func (b *replayWindowBits) strictlyWithinWindow(i uint64) bool {
 	// Handle the case where the window hasn't slid yet. This avoids u64 underflow.
 	inWarmup := b.current < b.length
 	if i < b.length && inWarmup {
@@ -106,7 +106,7 @@ func (b *Bits) strictlyWithinWindow(i uint64) bool {
 }
 
 // Check returns true if i is within (or way out in front of) the window, and not a replay
-func (b *Bits) Check(l *slog.Logger, i uint64) bool {
+func (b *replayWindowBits) Check(l *slog.Logger, i uint64) bool {
 	// If i is the next number, return true.
 	if i > b.current {
 		return true
@@ -130,11 +130,11 @@ func (b *Bits) Check(l *slog.Logger, i uint64) bool {
 //     then mark i.
 //   - i  <= b.current: in-window check for duplicates; out-of-window otherwise.
 //
-// NewBits seeds bits[0]=1 so counter 0 looks "received" — Update never
+// newReplayWindow seeds bits[0]=1 so counter 0 looks "received" — Update never
 // clears that marker during warmup (clearRange skips position 0 when
 // startPos=1), and once b.current >= b.length the marker is no longer
 // consulted.
-func (b *Bits) Update(l *slog.Logger, i uint64) bool {
+func (b *replayWindowBits) Update(l *slog.Logger, i uint64) bool {
 	// Fast path: i is the next expected counter. Split out so the function
 	// stays small and avoids paying for the slow paths' slog argument-build
 	// stack frame on every call. The bit read/test/write is inlined to
@@ -152,7 +152,7 @@ func (b *Bits) Update(l *slog.Logger, i uint64) bool {
 }
 
 // updateSlow handles jumps, in-window backfill, dupes, and out-of-window.
-func (b *Bits) updateSlow(l *slog.Logger, i uint64) bool {
+func (b *replayWindowBits) updateSlow(l *slog.Logger, i uint64) bool {
 	// If i is a jump, adjust the window, update current, and return true.
 	if i > b.current {
 		end := min(i, b.current+b.length)

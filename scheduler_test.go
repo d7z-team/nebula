@@ -8,7 +8,7 @@ import (
 func TestScheduler_PooledReuse(t *testing.T) {
 	ctx := t.Context()
 
-	s := NewScheduler[int](16)
+	s := newScheduler[int](16)
 	delivered := make(chan int, 256)
 	go s.Run(ctx, func(item int) { delivered <- item })
 
@@ -30,11 +30,11 @@ func TestScheduler_PooledReuse(t *testing.T) {
 }
 
 // BenchmarkScheduler_Schedule reports allocations per Schedule call.
-// In steady state the Scheduler's sync.Pool means we should see zero allocs per op once the pool warms up.
+// In steady state the scheduler's sync.Pool means we should see zero allocs per op once the pool warms up.
 func BenchmarkScheduler_Schedule(b *testing.B) {
 	ctx := b.Context()
 
-	s := NewScheduler[int](b.N)
+	s := newScheduler[int](b.N)
 	go s.Run(ctx, func(int) {})
 
 	b.ReportAllocs()
@@ -45,7 +45,7 @@ func BenchmarkScheduler_Schedule(b *testing.B) {
 }
 
 // BenchmarkBareAfterFunc is the comparison baseline.
-// What we'd pay per Schedule if Punchy called time.AfterFunc directly without the pooled Scheduler.
+// What we'd pay per Schedule if punchManager called time.AfterFunc directly without the pooled scheduler.
 // Allocates a *time.Timer plus a closure each call.
 func BenchmarkBareAfterFunc(b *testing.B) {
 	ctx := b.Context()

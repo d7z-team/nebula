@@ -1,17 +1,10 @@
 package nebula
 
 import (
-	"context"
-	"errors"
-	"log/slog"
-	"net"
 	"net/netip"
 	"slices"
 	"sort"
-	"strconv"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // forEachFunc is used to benefit folks that want to do work inside the lock
@@ -20,18 +13,6 @@ type forEachFunc func(addr netip.AddrPort, preferred bool)
 // The checkFuncs here are to simplify bulk importing LH query response logic into a single function (reset slice and iterate)
 type checkFuncV4 func(vpnIp netip.Addr, to *V4AddrPort) bool
 type checkFuncV6 func(vpnIp netip.Addr, to *V6AddrPort) bool
-
-// CacheMap is a struct that better represents the lighthouse cache for humans
-// The string key is the owners vpnIp
-type CacheMap map[string]*Cache
-
-// Cache is the other part of CacheMap to better represent the lighthouse cache for humans
-// We don't reason about ipv4 vs ipv6 here
-type Cache struct {
-	Learned  []netip.AddrPort `json:"learned,omitempty"`
-	Reported []netip.AddrPort `json:"reported,omitempty"`
-	Relay    []netip.Addr     `json:"relay"`
-}
 
 // cache is an internal struct that splits v4 and v6 addresses inside the cache map
 type cache struct {
@@ -56,230 +37,9 @@ type cacheV6 struct {
 	reported []*V6AddrPort
 }
 
-type hostnamePort struct {
-	name string
-	port uint16
-	// addr is set when name is an ip literal, these never need a lookup
-	addr netip.Addr
-}
-
-type hostnamesResults struct {
-	hostnames     []hostnamePort
-	network       string
-	lookupTimeout time.Duration
-	cancelFn      func()
-	resolveNow    chan struct{}
-	l             *slog.Logger
-	ips           atomic.Pointer[map[netip.AddrPort]struct{}]
-	// known is the last known good addresses per hostname, kept so a reload can carry them forward
-	known atomic.Pointer[map[hostnamePort][]netip.AddrPort]
-}
-
-// NewHostnameResults starts resolving hostPorts. Any hostnames also in prev start with its last known good addresses.
-func NewHostnameResults(ctx context.Context, l *slog.Logger, d time.Duration, network string, timeout time.Duration, hostPorts []string, prev *hostnamesResults, onUpdate func()) (*hostnamesResults, error) {
-	r := &hostnamesResults{
-		hostnames:     make([]hostnamePort, len(hostPorts)),
-		network:       network,
-		lookupTimeout: timeout,
-		resolveNow:    make(chan struct{}, 1),
-		l:             l,
-	}
-
-	// Fastrack IP addresses to ensure they're immediately available for use.
-	// DNS lookups for hostnames that aren't hardcoded IP's will happen in a background goroutine.
-	performBackgroundLookup := false
-	ips := map[netip.AddrPort]struct{}{}
-	known := make([][]netip.AddrPort, len(hostPorts))
-	var prevKnown map[hostnamePort][]netip.AddrPort
-	if prev != nil && prev.network == network {
-		if p := prev.known.Load(); p != nil {
-			prevKnown = *p
-		}
-	}
-	for idx, hostPort := range hostPorts {
-
-		rIp, sPort, err := net.SplitHostPort(hostPort)
-		if err != nil {
-			return nil, err
-		}
-
-		iPort, err := strconv.Atoi(sPort)
-		if err != nil {
-			return nil, err
-		}
-
-		r.hostnames[idx] = hostnamePort{name: rIp, port: uint16(iPort)}
-		addr, err := netip.ParseAddr(rIp)
-		if err != nil {
-			// This address is a hostname, not an IP address
-			performBackgroundLookup = true
-			known[idx] = prevKnown[r.hostnames[idx]]
-			for _, a := range known[idx] {
-				ips[a] = struct{}{}
-			}
-			continue
-		}
-
-		// Save the IP address immediately
-		r.hostnames[idx].addr = addr
-		ips[netip.AddrPortFrom(addr, uint16(iPort))] = struct{}{}
-	}
-	r.ips.Store(&ips)
-	r.storeKnown(known)
-
-	// Time for the DNS lookup goroutine
-	if performBackgroundLookup {
-		newCtx, cancel := context.WithCancel(ctx)
-		r.cancelFn = cancel
-		ticker := time.NewTicker(d)
-		go func() {
-			defer ticker.Stop()
-			for {
-				r.resolve(newCtx, known)
-				r.storeKnown(known)
-				netipAddrs := map[netip.AddrPort]struct{}{}
-				for _, addrs := range known {
-					for _, a := range addrs {
-						netipAddrs[a] = struct{}{}
-					}
-				}
-				origSet := r.ips.Load()
-				different := false
-				for a := range *origSet {
-					if _, ok := netipAddrs[a]; !ok {
-						different = true
-						break
-					}
-				}
-				if !different {
-					for a := range netipAddrs {
-						if _, ok := (*origSet)[a]; !ok {
-							different = true
-							break
-						}
-					}
-				}
-				if different {
-					l.Info("DNS results changed for host list",
-						"origSet", origSet,
-						"newSet", netipAddrs,
-					)
-					r.ips.Store(&netipAddrs)
-					onUpdate()
-				}
-				select {
-				case <-newCtx.Done():
-					return
-				case <-ticker.C:
-				case <-r.resolveNow:
-				}
-			}
-		}()
-	}
-
-	return r, nil
-}
-
-// resolve looks up every hostname in parallel and folds the results into known
-func (hr *hostnamesResults) resolve(ctx context.Context, known [][]netip.AddrPort) {
-	var wg sync.WaitGroup
-	for i, hostPort := range hr.hostnames {
-		if hostPort.addr.IsValid() {
-			known[i] = []netip.AddrPort{netip.AddrPortFrom(hostPort.addr, hostPort.port)}
-			continue
-		}
-
-		wg.Go(func() {
-			timeoutCtx, timeoutCancel := context.WithTimeout(ctx, hr.lookupTimeout)
-			addrs, err := net.DefaultResolver.LookupNetIP(timeoutCtx, hr.network, hostPort.name)
-			timeoutCancel()
-			known[i] = applyLookup(known[i], hostPort.port, addrs, err)
-			// A canceled ctx means we are reloading or shutting down, not that DNS failed
-			if err != nil && ctx.Err() == nil {
-				hr.l.Error("DNS resolution failed for static_map host",
-					"hostname", hostPort.name,
-					"network", hr.network,
-					"error", err,
-					"usingAddrs", known[i],
-				)
-			}
-		})
-	}
-	wg.Wait()
-}
-
-// applyLookup returns the addresses to use for a hostname given the previous ones and a lookup result.
-// Only a not found answer clears them, a stale lighthouse address costs a handshake but an empty set costs everything.
-// darwin also reports not found while offline, that's harmless since nothing is reachable and the next handshake
-// triggers a fresh lookup once we're back.
-func applyLookup(prev []netip.AddrPort, port uint16, addrs []netip.Addr, err error) []netip.AddrPort {
-	if err != nil {
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-			return nil
-		}
-		return prev
-	}
-
-	out := make([]netip.AddrPort, 0, len(addrs))
-	for _, a := range addrs {
-		out = append(out, netip.AddrPortFrom(a.Unmap(), port))
-	}
-	return out
-}
-
-func (hr *hostnamesResults) storeKnown(known [][]netip.AddrPort) {
-	byName := make(map[hostnamePort][]netip.AddrPort, len(known))
-	for i, addrs := range known {
-		byName[hr.hostnames[i]] = addrs
-	}
-	hr.known.Store(&byName)
-}
-
-// literalAddrs returns the entries that were configured as ip addresses rather than hostnames
-func (hr *hostnamesResults) literalAddrs() []netip.AddrPort {
-	var out []netip.AddrPort
-	for _, hostPort := range hr.hostnames {
-		if hostPort.addr.IsValid() {
-			out = append(out, netip.AddrPortFrom(hostPort.addr, hostPort.port))
-		}
-	}
-	return out
-}
-
-// ResolveNow asks the background goroutine to look up the hostnames again without waiting for the next tick
-func (hr *hostnamesResults) ResolveNow() {
-	if hr == nil || hr.resolveNow == nil {
-		return
-	}
-	select {
-	case hr.resolveNow <- struct{}{}:
-	default:
-	}
-}
-
-func (hr *hostnamesResults) Cancel() {
-	if hr != nil && hr.cancelFn != nil {
-		hr.cancelFn()
-	}
-}
-
-func (hr *hostnamesResults) GetAddrs() []netip.AddrPort {
-	var retSlice []netip.AddrPort
-	if hr != nil {
-		p := hr.ips.Load()
-		if p != nil {
-			for k := range *p {
-				retSlice = append(retSlice, k)
-			}
-		}
-	}
-	return retSlice
-}
-
-// RemoteList is a unifying concept for lighthouse servers and clients as well as hostinfos.
+// remoteList is a unifying concept for lighthouse servers and clients as well as hostinfos.
 // It serves as a local cache of query replies, host update notifications, and locally learned addresses
-type RemoteList struct {
+type remoteList struct {
 	// Every interaction with internals requires a lock!
 	sync.RWMutex
 
@@ -297,15 +57,6 @@ type RemoteList struct {
 	// For learned addresses, this is the vpnIp that sent the packet
 	cache map[netip.Addr]*cache
 
-	hr *hostnamesResults
-
-	// shouldAdd is a nillable function that decides if x should be added to addrs.
-	shouldAdd func(vpnAddrs []netip.Addr, x netip.Addr) bool
-
-	// v4Only keeps IPv6 addresses out of addrs, because our socket cannot send to them. The cache still holds them,
-	// a lighthouse answers queries from it.
-	v4Only bool
-
 	// This is a list of remotes that we have tried to handshake with and have returned from the wrong vpn ip.
 	// They should not be tried again during a handshake
 	badRemotes []netip.AddrPort
@@ -314,69 +65,20 @@ type RemoteList struct {
 	shouldRebuild bool
 }
 
-// NewRemoteList creates a new empty RemoteList
-func NewRemoteList(vpnAddrs []netip.Addr, shouldAdd func([]netip.Addr, netip.Addr) bool) *RemoteList {
-	r := &RemoteList{
-		vpnAddrs:  make([]netip.Addr, len(vpnAddrs)),
-		addrs:     make([]netip.AddrPort, 0),
-		relays:    make([]netip.Addr, 0),
-		cache:     make(map[netip.Addr]*cache),
-		shouldAdd: shouldAdd,
+func newRemoteList(vpnAddrs []netip.Addr) *remoteList {
+	r := &remoteList{
+		vpnAddrs: make([]netip.Addr, len(vpnAddrs)),
+		addrs:    make([]netip.AddrPort, 0),
+		relays:   make([]netip.Addr, 0),
+		cache:    make(map[netip.Addr]*cache),
 	}
 	copy(r.vpnAddrs, vpnAddrs)
 	return r
 }
 
-func (r *RemoteList) unlockedSetHostnamesResults(hr *hostnamesResults) {
-	// Cancel any existing hostnamesResults DNS goroutine to release resources
-	r.hr.Cancel()
-	r.hr = hr
-}
-
-// ResetForOwner zeros the reported address slices for the given owner and marks the addrs list dirty.
-// Any pending hostname resolution will be canceled.
-func (r *RemoteList) ResetForOwner(ownerVpnAddr netip.Addr) {
-	r.Lock()
-	defer r.Unlock()
-	r.hr.Cancel()
-	if c, ok := r.cache[ownerVpnAddr]; ok {
-		if c.v4 != nil {
-			c.v4.reported = c.v4.reported[:0]
-		}
-		if c.v6 != nil {
-			c.v6.reported = c.v6.reported[:0]
-		}
-	}
-	r.shouldRebuild = true
-}
-
-// ResolveHostnames kicks a fresh DNS lookup of any static_map hostnames for this host
-func (r *RemoteList) ResolveHostnames() {
-	r.RLock()
-	defer r.RUnlock()
-	r.hr.ResolveNow()
-}
-
-// ClearHostnameResults cancels the in-flight DNS resolver goroutine (if any) and drops the resolved IP cache.
-func (r *RemoteList) ClearHostnameResults() {
-	r.Lock()
-	defer r.Unlock()
-	r.unlockedSetHostnamesResults(nil)
-	r.shouldRebuild = true
-}
-
-// Len locks and reports the size of the deduplicated address list
-// The deduplication work may need to occur here, so you must pass preferredRanges
-func (r *RemoteList) Len(preferredRanges []netip.Prefix) int {
-	r.Rebuild(preferredRanges)
-	r.RLock()
-	defer r.RUnlock()
-	return len(r.addrs)
-}
-
 // ForEach locks and will call the forEachFunc for every deduplicated address in the list
 // The deduplication work may need to occur here, so you must pass preferredRanges
-func (r *RemoteList) ForEach(preferredRanges []netip.Prefix, forEach forEachFunc) {
+func (r *remoteList) ForEach(preferredRanges []netip.Prefix, forEach forEachFunc) {
 	r.Rebuild(preferredRanges)
 	r.RLock()
 	for _, v := range r.addrs {
@@ -387,7 +89,7 @@ func (r *RemoteList) ForEach(preferredRanges []netip.Prefix, forEach forEachFunc
 
 // CopyAddrs locks and makes a deep copy of the deduplicated address list
 // The deduplication work may need to occur here, so you must pass preferredRanges
-func (r *RemoteList) CopyAddrs(preferredRanges []netip.Prefix) []netip.AddrPort {
+func (r *remoteList) CopyAddrs(preferredRanges []netip.Prefix) []netip.AddrPort {
 	if r == nil {
 		return nil
 	}
@@ -404,9 +106,9 @@ func (r *RemoteList) CopyAddrs(preferredRanges []netip.Prefix) []netip.AddrPort 
 }
 
 // LearnRemote locks and sets the learned slot for the owner vpn ip to the provided addr
-// Currently this is only needed when HostInfo.SetRemote is called as that should cover both handshaking and roaming.
+// Currently this is only needed when hostInfo.SetRemote is called as that should cover both handshaking and roaming.
 // It will mark the deduplicated address list as dirty, so do not call it unless new information is available
-func (r *RemoteList) LearnRemote(ownerVpnIp netip.Addr, remote netip.AddrPort) {
+func (r *remoteList) LearnRemote(ownerVpnIp netip.Addr, remote netip.AddrPort) {
 	r.Lock()
 	defer r.Unlock()
 	if remote.Addr().Is4() {
@@ -416,67 +118,8 @@ func (r *RemoteList) LearnRemote(ownerVpnIp netip.Addr, remote netip.AddrPort) {
 	}
 }
 
-// CopyCache locks and creates a more human friendly form of the internal address cache.
-// This may contain duplicates and blocked addresses
-func (r *RemoteList) CopyCache() *CacheMap {
-	r.RLock()
-	defer r.RUnlock()
-
-	cm := make(CacheMap)
-	getOrMake := func(vpnIp string) *Cache {
-		c := cm[vpnIp]
-		if c == nil {
-			c = &Cache{
-				Learned:  make([]netip.AddrPort, 0),
-				Reported: make([]netip.AddrPort, 0),
-				Relay:    make([]netip.Addr, 0),
-			}
-			cm[vpnIp] = c
-		}
-		return c
-	}
-
-	for owner, mc := range r.cache {
-		c := getOrMake(owner.String())
-
-		if mc.v4 != nil {
-			if mc.v4.learned != nil {
-				c.Learned = append(c.Learned, protoV4AddrPortToNetAddrPort(mc.v4.learned))
-			}
-
-			for _, a := range mc.v4.reported {
-				if a == nil {
-					continue
-				}
-				c.Reported = append(c.Reported, protoV4AddrPortToNetAddrPort(a))
-			}
-		}
-
-		if mc.v6 != nil {
-			if mc.v6.learned != nil {
-				c.Learned = append(c.Learned, protoV6AddrPortToNetAddrPort(mc.v6.learned))
-			}
-
-			for _, a := range mc.v6.reported {
-				if a == nil {
-					continue
-				}
-				c.Reported = append(c.Reported, protoV6AddrPortToNetAddrPort(a))
-			}
-		}
-
-		if mc.relay != nil {
-			for _, a := range mc.relay.relay {
-				c.Relay = append(c.Relay, a)
-			}
-		}
-	}
-
-	return &cm
-}
-
 // BlockRemote locks and records the address as bad, it will be excluded from the deduplicated address list
-func (r *RemoteList) BlockRemote(bad ViaSender) {
+func (r *remoteList) BlockRemote(bad packetSender) {
 	if bad.IsRelayed {
 		return
 	}
@@ -496,20 +139,8 @@ func (r *RemoteList) BlockRemote(bad ViaSender) {
 	r.shouldRebuild = true
 }
 
-// CopyBlockedRemotes locks and makes a deep copy of the blocked remotes list
-func (r *RemoteList) CopyBlockedRemotes() []netip.AddrPort {
-	r.RLock()
-	defer r.RUnlock()
-
-	c := make([]netip.AddrPort, len(r.badRemotes))
-	for i, v := range r.badRemotes {
-		c[i] = v
-	}
-	return c
-}
-
-// RefreshFromHandshake locks and updates the RemoteList to account for data learned upon a completed handshake
-func (r *RemoteList) RefreshFromHandshake(vpnAddrs []netip.Addr) {
+// RefreshFromHandshake locks and updates the remoteList to account for data learned upon a completed handshake
+func (r *remoteList) RefreshFromHandshake(vpnAddrs []netip.Addr) {
 	r.Lock()
 	r.badRemotes = nil
 	r.vpnAddrs = make([]netip.Addr, len(vpnAddrs))
@@ -517,16 +148,9 @@ func (r *RemoteList) RefreshFromHandshake(vpnAddrs []netip.Addr) {
 	r.Unlock()
 }
 
-// ResetBlockedRemotes locks and clears the blocked remotes list
-func (r *RemoteList) ResetBlockedRemotes() {
-	r.Lock()
-	r.badRemotes = nil
-	r.Unlock()
-}
-
 // Rebuild locks and generates the deduplicated address list only if there is work to be done
 // There is generally no reason to call this directly but it is safe to do so
-func (r *RemoteList) Rebuild(preferredRanges []netip.Prefix) {
+func (r *remoteList) Rebuild(preferredRanges []netip.Prefix) {
 	r.Lock()
 	defer r.Unlock()
 
@@ -536,25 +160,25 @@ func (r *RemoteList) Rebuild(preferredRanges []netip.Prefix) {
 		r.shouldRebuild = false
 	}
 
-	// Always re-sort, preferredRanges can change via HUP
+	// Always re-sort because callers may supply different preferences.
 	r.unlockedSort(preferredRanges)
 }
 
 // unlockedIsBad assumes you have the write lock and checks if the remote matches any entry in the blocked address list
-func (r *RemoteList) unlockedIsBad(remote netip.AddrPort) bool {
+func (r *remoteList) unlockedIsBad(remote netip.AddrPort) bool {
 	return slices.Contains(r.badRemotes, remote)
 }
 
 // unlockedSetLearnedV4 assumes you have the write lock and sets the current learned address for this owner and marks the
 // deduplicated address list as dirty
-func (r *RemoteList) unlockedSetLearnedV4(ownerVpnIp netip.Addr, to *V4AddrPort) {
+func (r *remoteList) unlockedSetLearnedV4(ownerVpnIp netip.Addr, to *V4AddrPort) {
 	r.shouldRebuild = true
 	r.unlockedGetOrMakeV4(ownerVpnIp).learned = to
 }
 
 // unlockedSetV4 assumes you have the write lock and resets the reported list of ips for this owner to the list provided
 // and marks the deduplicated address list as dirty
-func (r *RemoteList) unlockedSetV4(ownerVpnIp, vpnIp netip.Addr, to []*V4AddrPort, check checkFuncV4) {
+func (r *remoteList) unlockedSetV4(ownerVpnIp, vpnIp netip.Addr, to []*V4AddrPort, check checkFuncV4) {
 	r.shouldRebuild = true
 	c := r.unlockedGetOrMakeV4(ownerVpnIp)
 
@@ -566,14 +190,14 @@ func (r *RemoteList) unlockedSetV4(ownerVpnIp, vpnIp netip.Addr, to []*V4AddrPor
 	for _, v := range to {
 		if check(vpnIp, v) {
 			c.reported = append(c.reported, v)
-			if len(c.reported) == MaxRemotes {
+			if len(c.reported) == maxRemotes {
 				break
 			}
 		}
 	}
 }
 
-func (r *RemoteList) unlockedSetRelay(ownerVpnIp netip.Addr, to []netip.Addr) {
+func (r *remoteList) unlockedSetRelay(ownerVpnIp netip.Addr, to []netip.Addr) {
 	r.shouldRebuild = true
 	c := r.unlockedGetOrMakeRelay(ownerVpnIp)
 
@@ -581,32 +205,32 @@ func (r *RemoteList) unlockedSetRelay(ownerVpnIp netip.Addr, to []netip.Addr) {
 	c.relay = c.relay[:0]
 
 	// We can't take their array but we can take their pointers
-	c.relay = append(c.relay, to[:minInt(len(to), MaxRemotes)]...)
+	c.relay = append(c.relay, to[:minInt(len(to), maxRemotes)]...)
 }
 
 // unlockedPrependV4 assumes you have the write lock and prepends the address in the reported list for this owner
 // This is only useful for establishing static hosts
-func (r *RemoteList) unlockedPrependV4(ownerVpnIp netip.Addr, to *V4AddrPort) {
+func (r *remoteList) unlockedPrependV4(ownerVpnIp netip.Addr, to *V4AddrPort) {
 	r.shouldRebuild = true
 	c := r.unlockedGetOrMakeV4(ownerVpnIp)
 
 	// We are doing the easy append because this is rarely called
 	c.reported = append([]*V4AddrPort{to}, c.reported...)
-	if len(c.reported) > MaxRemotes {
-		c.reported = c.reported[:MaxRemotes]
+	if len(c.reported) > maxRemotes {
+		c.reported = c.reported[:maxRemotes]
 	}
 }
 
 // unlockedSetLearnedV6 assumes you have the write lock and sets the current learned address for this owner and marks the
 // deduplicated address list as dirty
-func (r *RemoteList) unlockedSetLearnedV6(ownerVpnIp netip.Addr, to *V6AddrPort) {
+func (r *remoteList) unlockedSetLearnedV6(ownerVpnIp netip.Addr, to *V6AddrPort) {
 	r.shouldRebuild = true
 	r.unlockedGetOrMakeV6(ownerVpnIp).learned = to
 }
 
 // unlockedSetV6 assumes you have the write lock and resets the reported list of ips for this owner to the list provided
 // and marks the deduplicated address list as dirty
-func (r *RemoteList) unlockedSetV6(ownerVpnIp, vpnIp netip.Addr, to []*V6AddrPort, check checkFuncV6) {
+func (r *remoteList) unlockedSetV6(ownerVpnIp, vpnIp netip.Addr, to []*V6AddrPort, check checkFuncV6) {
 	r.shouldRebuild = true
 	c := r.unlockedGetOrMakeV6(ownerVpnIp)
 
@@ -618,7 +242,7 @@ func (r *RemoteList) unlockedSetV6(ownerVpnIp, vpnIp netip.Addr, to []*V6AddrPor
 	for _, v := range to {
 		if check(vpnIp, v) {
 			c.reported = append(c.reported, v)
-			if len(c.reported) == MaxRemotes {
+			if len(c.reported) == maxRemotes {
 				break
 			}
 		}
@@ -627,18 +251,18 @@ func (r *RemoteList) unlockedSetV6(ownerVpnIp, vpnIp netip.Addr, to []*V6AddrPor
 
 // unlockedPrependV6 assumes you have the write lock and prepends the address in the reported list for this owner
 // This is only useful for establishing static hosts
-func (r *RemoteList) unlockedPrependV6(ownerVpnIp netip.Addr, to *V6AddrPort) {
+func (r *remoteList) unlockedPrependV6(ownerVpnIp netip.Addr, to *V6AddrPort) {
 	r.shouldRebuild = true
 	c := r.unlockedGetOrMakeV6(ownerVpnIp)
 
 	// We are doing the easy append because this is rarely called
 	c.reported = append([]*V6AddrPort{to}, c.reported...)
-	if len(c.reported) > MaxRemotes {
-		c.reported = c.reported[:MaxRemotes]
+	if len(c.reported) > maxRemotes {
+		c.reported = c.reported[:maxRemotes]
 	}
 }
 
-func (r *RemoteList) unlockedGetOrMakeRelay(ownerVpnIp netip.Addr) *cacheRelay {
+func (r *remoteList) unlockedGetOrMakeRelay(ownerVpnIp netip.Addr) *cacheRelay {
 	am := r.cache[ownerVpnIp]
 	if am == nil {
 		am = &cache{}
@@ -653,7 +277,7 @@ func (r *RemoteList) unlockedGetOrMakeRelay(ownerVpnIp netip.Addr) *cacheRelay {
 
 // unlockedGetOrMakeV4 assumes you have the write lock and builds the cache and owner entry. Only the v4 pointer is established.
 // The caller must dirty the learned address cache if required
-func (r *RemoteList) unlockedGetOrMakeV4(ownerVpnIp netip.Addr) *cacheV4 {
+func (r *remoteList) unlockedGetOrMakeV4(ownerVpnIp netip.Addr) *cacheV4 {
 	am := r.cache[ownerVpnIp]
 	if am == nil {
 		am = &cache{}
@@ -668,7 +292,7 @@ func (r *RemoteList) unlockedGetOrMakeV4(ownerVpnIp netip.Addr) *cacheV4 {
 
 // unlockedGetOrMakeV6 assumes you have the write lock and builds the cache and owner entry. Only the v6 pointer is established.
 // The caller must dirty the learned address cache if required
-func (r *RemoteList) unlockedGetOrMakeV6(ownerVpnIp netip.Addr) *cacheV6 {
+func (r *remoteList) unlockedGetOrMakeV6(ownerVpnIp netip.Addr) *cacheV6 {
 	am := r.cache[ownerVpnIp]
 	if am == nil {
 		am = &cache{}
@@ -683,7 +307,7 @@ func (r *RemoteList) unlockedGetOrMakeV6(ownerVpnIp netip.Addr) *cacheV6 {
 
 // unlockedCollect assumes you have the write lock and collects/transforms the cache into the deduped address list.
 // The result of this function can contain duplicates. unlockedSort handles cleaning it.
-func (r *RemoteList) unlockedCollect() {
+func (r *remoteList) unlockedCollect() {
 	addrs := r.addrs[:0]
 	relays := r.relays[:0]
 
@@ -707,7 +331,7 @@ func (r *RemoteList) unlockedCollect() {
 			}
 		}
 
-		if c.v6 != nil && !r.v4Only {
+		if c.v6 != nil {
 			if c.v6.learned != nil {
 				u := protoV6AddrPortToNetAddrPort(c.v6.learned)
 				if !r.unlockedIsBad(u) {
@@ -733,25 +357,13 @@ func (r *RemoteList) unlockedCollect() {
 		}
 	}
 
-	dnsAddrs := r.hr.GetAddrs()
-	for _, addr := range dnsAddrs {
-		if r.v4Only && !addr.Addr().Is4() {
-			continue
-		}
-		if r.shouldAdd == nil || r.shouldAdd(r.vpnAddrs, addr.Addr()) {
-			if !r.unlockedIsBad(addr) {
-				addrs = append(addrs, addr)
-			}
-		}
-	}
-
 	r.addrs = addrs
 	r.relays = relays
 
 }
 
 // unlockedSort assumes you have the write lock and performs the deduping and sorting of the address list
-func (r *RemoteList) unlockedSort(preferredRanges []netip.Prefix) {
+func (r *remoteList) unlockedSort(preferredRanges []netip.Prefix) {
 	// Use a map to deduplicate any relay addresses
 	dedupedRelays := map[netip.Addr]struct{}{}
 	for _, relay := range r.relays {

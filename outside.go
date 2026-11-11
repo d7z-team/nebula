@@ -2,31 +2,16 @@ package nebula
 
 import (
 	"context"
-	"encoding/binary"
-	"errors"
 	"log/slog"
 	"net/netip"
 	"time"
 
-	"golang.org/x/net/ipv6"
-
-	"github.com/slackhq/nebula/firewall"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
-	"github.com/slackhq/nebula/overlay/batch"
-	"golang.org/x/net/ipv4"
 )
 
-const (
-	minFwPacketLen = 4
-)
-
-var ErrOutOfWindow = errors.New("out of window packet")
-
-// readOutsidePackets processes one received underlay packet.
-// Message payloads are decrypted IN PLACE, so packet must stay untouched
-// by the caller until the TUN and relay batches for queue q have been flushed.
-func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxContext) {
+// readOutsidePackets processes one received underlay packet. Message payloads
+// are decrypted in place, so the caller must not reuse packet until it returns.
+func (f *packetEngine) readOutsidePackets(via packetSender, packet []byte, rxc *rxContext) {
 	h := rxc.h
 	err := h.Parse(packet)
 	if err != nil {
@@ -78,10 +63,10 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 		return
 	}
 
-	// Relay packets are special
+	// relay packets are special
 	isMessageRelay := (h.Type == header.Message && h.Subtype == header.MessageRelay)
 
-	var hostinfo *HostInfo
+	var hostinfo *hostInfo
 	if isMessageRelay {
 		hostinfo = f.hostMap.QueryRelayIndex(h.RemoteIndex)
 	} else {
@@ -90,14 +75,14 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 
 	// At this point we should have a valid existing tunnel, verify and send
 	// recvError if necessary
-	if hostinfo == nil || hostinfo.ConnectionState == nil {
+	if hostinfo == nil || hostinfo.connectionState == nil {
 		if !via.IsRelayed {
 			f.maybeSendRecvError(via.UdpAddr, h.RemoteIndex)
 		}
 		return
 	}
 
-	if len(packet) < header.Len+hostinfo.ConnectionState.dKey.Overhead() {
+	if len(packet) < header.Len+hostinfo.connectionState.dKey.Overhead() {
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
 			f.l.Debug("packet too small", "from", via, "length", len(packet))
 		}
@@ -106,8 +91,8 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 
 	// All remaining packets are encrypted
 	if isMessageRelay {
-		// Relay packets are special, this branch should always early-return
-		err = hostinfo.ConnectionState.VerifyRelay(f.l, h.MessageCounter, packet, rxc.nb)
+		// relay packets are special, this branch should always early-return
+		err = hostinfo.connectionState.VerifyRelay(f.l, h.MessageCounter, packet, rxc.nb)
 		if err != nil {
 			if f.l.Enabled(context.Background(), slog.LevelDebug) {
 				hostinfo.logger(f.l).Debug("Failed to verify relay packet", "error", err, "from", via, "header", h)
@@ -118,7 +103,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 		return
 	}
 
-	out, err := hostinfo.ConnectionState.Decrypt(f.l, h.MessageCounter, packet, rxc.nb)
+	out, err := hostinfo.connectionState.Decrypt(f.l, h.MessageCounter, packet, rxc.nb)
 	if err != nil {
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
 			hostinfo.logger(f.l).Debug("Failed to decrypt packet", "error", err, "from", via, "header", h)
@@ -128,7 +113,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 
 	// Roam before we respond
 	f.handleHostRoaming(hostinfo, via)
-	f.connectionManager.In(hostinfo)
+	f.connectionManager.recordInbound(hostinfo)
 
 	switch h.Type {
 	case header.Message:
@@ -156,7 +141,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 				}
 				return
 			}
-			f.send(header.Test, header.TestReply, hostinfo.ConnectionState, hostinfo, out, rxc.nb, rxc.scratch[:0])
+			f.send(header.Test, header.TestReply, hostinfo.connectionState, hostinfo, out, rxc.nb, rxc.scratch[:0])
 		default:
 			hostinfo.logger(f.l).Error("IsValidSubType was true, but unexpected test subtype seen", "from", via, "header", h)
 			return
@@ -174,37 +159,37 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 	}
 }
 
-func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, packet []byte, rxc *rxContext) {
+func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSender, packet []byte, rxc *rxContext) {
 	h := rxc.h
-	// Successfully validated the thing. Get rid of the Relay header and the AEAD tag
-	signedPayload := packet[header.Len : len(packet)-hostinfo.ConnectionState.dKey.Overhead()]
+	// Successfully validated the thing. Get rid of the relay header and the AEAD tag
+	signedPayload := packet[header.Len : len(packet)-hostinfo.connectionState.dKey.Overhead()]
 	// Pull the Roaming parts up here, and return in all call paths.
 	f.handleHostRoaming(hostinfo, via)
-	// Track usage of both the HostInfo and the Relay for the received & authenticated packet
-	f.connectionManager.In(hostinfo)
-	f.connectionManager.RelayUsed(h.RemoteIndex)
+	// Track usage of both the hostInfo and the relay for the received & authenticated packet
+	f.connectionManager.recordInbound(hostinfo)
+	f.connectionManager.recordRelayUse(h.RemoteIndex)
 
 	relay, ok := hostinfo.relayState.QueryRelayForByIdx(h.RemoteIndex)
 	if !ok {
-		// The only way this happens is if hostmap has an index to the correct HostInfo, but the HostInfo is missing
+		// The only way this happens is if hostmap has an index to the correct hostInfo, but the hostInfo is missing
 		// its internal mapping. This should never happen.
-		hostinfo.logger(f.l).Error("HostInfo missing remote relay index", "relayRemoteIndex", h.RemoteIndex)
+		hostinfo.logger(f.l).Error("hostInfo missing remote relay index", "relayRemoteIndex", h.RemoteIndex)
 		return
 	}
 
 	switch relay.Type {
-	case TerminalType:
+	case relayTypeTerminal:
 		// If I am the target of this relay, process the unwrapped packet
 		// From this recursive point, all these variables are 'burned'. We shouldn't rely on them again.
-		via = ViaSender{
+		via = packetSender{
 			UdpAddr:   via.UdpAddr,
 			relayHI:   hostinfo,
 			relay:     relay,
 			IsRelayed: true,
 		}
 		f.readOutsidePackets(via, signedPayload, rxc)
-	case ForwardingType:
-		// Find the target HostInfo relay object
+	case relayTypeForwarding:
+		// Find the target hostInfo relay object
 		targetHI, targetRelay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relay.PeerAddr)
 		if err != nil {
 			hostinfo.logger(f.l).Info("Failed to find target host info by ip",
@@ -215,23 +200,21 @@ func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, 
 			return
 		}
 
-		// If that relay is Established, forward the payload through it
-		if targetRelay.State == Established {
+		// If that relay is established, forward the payload through it.
+		if targetRelay.State == relayEstablished {
 			switch targetRelay.Type {
-			case ForwardingType:
+			case relayTypeForwarding:
 				// Forward this packet through the relay tunnel, rebuilding it in place.
 				// Encode overwrites the old outer header, and the new AEAD tag lands where the old one was
 				fwdBuf := packet[:0]
 				out, err := f.prepareSendVia(targetHI, targetRelay, signedPayload, rxc.nb, fwdBuf, true)
 				if err == nil {
-					// Borrows the receive buffer, the listener's flush callback drains it before the buffer is reused
-					rxc.relayBatch.Commit(out, targetHI.GetRemote())
-					if rxc.relayBatch.Len() >= batch.SendBatchCap {
-						f.flushSendBatch(rxc.relayBatch, rxc.q)
+					if err := f.outside.WriteTo(out, targetHI.GetRemote()); err != nil {
+						targetHI.logger(f.l).Debug("failed to forward relay datagram", "error", err)
 					}
 				}
-			case TerminalType:
-				hostinfo.logger(f.l).Error("Unexpected Relay Type of Terminal")
+			case relayTypeTerminal:
+				hostinfo.logger(f.l).Error("Unexpected relay Type of Terminal")
 				return
 			default:
 				if f.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -255,7 +238,7 @@ func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, 
 }
 
 // closeTunnel closes a tunnel locally, it does not send a closeTunnel packet to the remote
-func (f *Interface) closeTunnel(hostInfo *HostInfo) {
+func (f *packetEngine) closeTunnel(hostInfo *hostInfo) {
 	// Hold the hostmap lock across both the delete and the lighthouse eviction,
 	// to avoid a race with handshake completion.
 	f.hostMap.Lock()
@@ -269,24 +252,17 @@ func (f *Interface) closeTunnel(hostInfo *HostInfo) {
 }
 
 // sendCloseTunnel is a helper function to send a proper close tunnel packet to a remote
-func (f *Interface) sendCloseTunnel(h *HostInfo) {
-	f.send(header.CloseTunnel, 0, h.ConnectionState, h, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
+func (f *packetEngine) sendCloseTunnel(h *hostInfo) {
+	f.send(header.CloseTunnel, 0, h.connectionState, h, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
 }
 
-func (f *Interface) handleHostRoaming(hostinfo *HostInfo, via ViaSender) {
+func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
 	curRemote := hostinfo.GetRemote()
 	if !via.IsRelayed && curRemote != via.UdpAddr {
-		if !f.lightHouse.GetRemoteAllowList().AllowAll(hostinfo.vpnAddrs, via.UdpAddr.Addr()) {
-			if f.l.Enabled(context.Background(), slog.LevelDebug) {
-				hostinfo.logger(f.l).Debug("lighthouse.remote_allow_list denied roaming", "newAddr", via.UdpAddr)
-			}
-			return
-		}
-
-		if !hostinfo.lastRoam.IsZero() && via.UdpAddr == hostinfo.lastRoamRemote && time.Since(hostinfo.lastRoam) < RoamingSuppressSeconds*time.Second {
+		if !hostinfo.lastRoam.IsZero() && via.UdpAddr == hostinfo.lastRoamRemote && time.Since(hostinfo.lastRoam) < roamingSuppressDuration {
 			if f.l.Enabled(context.Background(), slog.LevelDebug) {
 				hostinfo.logger(f.l).Debug("Suppressing roam back to previous remote",
-					"suppressSeconds", RoamingSuppressSeconds,
+					"suppressDuration", roamingSuppressDuration,
 					"udpAddr", curRemote,
 					"newAddr", via.UdpAddr,
 				)
@@ -305,200 +281,30 @@ func (f *Interface) handleHostRoaming(hostinfo *HostInfo, via ViaSender) {
 
 }
 
-var (
-	ErrPacketTooShort          = errors.New("packet is too short")
-	ErrUnknownIPVersion        = errors.New("packet is an unknown ip version")
-	ErrIPv4InvalidHeaderLength = errors.New("invalid ipv4 header length")
-	ErrIPv4PacketTooShort      = errors.New("ipv4 packet is too short")
-	ErrIPv6PacketTooShort      = errors.New("ipv6 packet is too short")
-)
-
-// newPacket validates and parses the interesting bits for the firewall out of the ip and sub protocol headers
-func newPacket(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
-	// fp is reused across packets; reset the parse byproducts so an early-error return cannot
-	// leak the previous packet's offsets.
-	fp.IPHdrLen = 0
-	fp.FragAny = false
-	if len(data) < 1 {
-		return ErrPacketTooShort
-	}
-
-	version := int((data[0] >> 4) & 0x0f)
-	switch version {
-	case ipv4.Version:
-		return parseV4(data, incoming, fp)
-	case ipv6.Version:
-		return parseV6(data, incoming, fp)
-	}
-	return ErrUnknownIPVersion
-}
-
-func parseV6(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
-	dataLen := len(data)
-	if dataLen < ipv6.HeaderLen {
-		return ErrIPv6PacketTooShort
-	}
-
-	if incoming {
-		fp.RemoteAddr, _ = netip.AddrFromSlice(data[8:24])
-		fp.LocalAddr, _ = netip.AddrFromSlice(data[24:40])
-	} else {
-		fp.LocalAddr, _ = netip.AddrFromSlice(data[8:24])
-		fp.RemoteAddr, _ = netip.AddrFromSlice(data[24:40])
-	}
-
-	// Walk the extension header chain to the upper layer protocol. iputil.IPv6FindUpperProtocol is the single
-	// source of truth for which headers are extension headers, so this stays in lockstep with the reject path
-	// and cannot drift into misreading an unknown protocol (SCTP, GRE, etc.) as a forged transport.
-	proto, offset, isFragment, anyFragment, err := iputil.IPv6FindUpperProtocol(data)
-	if err != nil {
-		return err
-	}
-
-	fp.Protocol = proto
-	fp.Fragment = isFragment
-	fp.FragAny = anyFragment
-	fp.IPHdrLen = offset
-	if isFragment {
-		// Non-first fragments carry no transport header, so we have no ports to read
-		fp.RemotePort = 0
-		fp.LocalPort = 0
-		return nil
-	}
-
-	switch proto {
-	case iputil.IPProtocolICMPv6:
-		// An ICMPv6 message is at least type, code and checksum, 4 bytes. Only echo carries more than we read.
-		if dataLen < offset+4 {
-			return ErrIPv6PacketTooShort
-		}
-		fp.LocalPort = 0      //incoming vs outgoing doesn't matter for icmpv6
-		switch data[offset] { //icmp type
-		case iputil.ICMPv6TypeEchoRequest, iputil.ICMPv6TypeEchoReply:
-			if dataLen < offset+6 {
-				return ErrIPv6PacketTooShort
-			}
-			fp.RemotePort = binary.BigEndian.Uint16(data[offset+4 : offset+6]) //identifier
-		default:
-			fp.RemotePort = 0
-		}
-
-	case iputil.IPProtocolTCP, iputil.IPProtocolUDP:
-		if dataLen < offset+4 {
-			return ErrIPv6PacketTooShort
-		}
-		if incoming {
-			fp.RemotePort = binary.BigEndian.Uint16(data[offset : offset+2])
-			fp.LocalPort = binary.BigEndian.Uint16(data[offset+2 : offset+4])
-		} else {
-			fp.LocalPort = binary.BigEndian.Uint16(data[offset : offset+2])
-			fp.RemotePort = binary.BigEndian.Uint16(data[offset+2 : offset+4])
-		}
-
-	default:
-		// don't set ports for protocols Nebula doesn't inspect
-		fp.RemotePort = 0
-		fp.LocalPort = 0
-	}
-
-	return nil
-}
-
-func parseV4(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
-	// Do we at least have an ipv4 header worth of data?
-	if len(data) < ipv4.HeaderLen {
-		return ErrIPv4PacketTooShort
-	}
-
-	// Adjust our start position based on the advertised ip header length
-	ihl := int(data[0]&0x0f) << 2
-
-	// Well-formed ip header length?
-	if ihl < ipv4.HeaderLen {
-		return ErrIPv4InvalidHeaderLength
-	}
-
-	// Check if this is the second or further fragment of a fragmented packet.
-	flagsfrags := binary.BigEndian.Uint16(data[6:8])
-	fp.Fragment = (flagsfrags & 0x1FFF) != 0
-	// Any fragmentation at all (MF or offset): first fragments have readable ports for the
-	// firewall but must never be coalesced.
-	fp.FragAny = (flagsfrags & 0x3fff) != 0
-	fp.IPHdrLen = ihl
-
-	// Firewall handles protocol checks
-	fp.Protocol = data[9]
-
-	// Accounting for a variable header length, do we have enough data for our src/dst tuples?
-	minLen := ihl
-	if !fp.Fragment {
-		if fp.Protocol == iputil.IPProtocolICMP {
-			minLen += minFwPacketLen + 2
-		} else {
-			minLen += minFwPacketLen
-		}
-	}
-
-	if len(data) < minLen {
-		return ErrIPv4InvalidHeaderLength
-	}
-
-	if incoming { // Firewall packets are locally oriented
-		fp.RemoteAddr, _ = netip.AddrFromSlice(data[12:16])
-		fp.LocalAddr, _ = netip.AddrFromSlice(data[16:20])
-	} else {
-		fp.LocalAddr, _ = netip.AddrFromSlice(data[12:16])
-		fp.RemoteAddr, _ = netip.AddrFromSlice(data[16:20])
-	}
-
-	if fp.Fragment {
-		fp.RemotePort = 0
-		fp.LocalPort = 0
-	} else if fp.Protocol == iputil.IPProtocolICMP { //note that orientation doesn't matter on ICMP
-		fp.RemotePort = binary.BigEndian.Uint16(data[ihl+4 : ihl+6]) //identifier
-		fp.LocalPort = 0                                             //code would be uint16(data[ihl+1])
-	} else if incoming {
-		fp.RemotePort = binary.BigEndian.Uint16(data[ihl : ihl+2])  //src port
-		fp.LocalPort = binary.BigEndian.Uint16(data[ihl+2 : ihl+4]) //dst port
-	} else {
-		fp.LocalPort = binary.BigEndian.Uint16(data[ihl : ihl+2])    //src port
-		fp.RemotePort = binary.BigEndian.Uint16(data[ihl+2 : ihl+4]) //dst port
-	}
-
-	return nil
-}
-
-func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, messageCounter uint64, out []byte, rxc *rxContext) {
-	err := newPacket(out, true, rxc.fwPacket)
+func (f *packetEngine) handleOutsideMessagePacket(hostinfo *hostInfo, _ uint64, packet []byte, _ *rxContext) {
+	inner, err := parseInnerPacket(packet)
 	if err != nil {
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("Error while validating inbound packet", "error", err, "packet", out)
+			hostinfo.logger(f.l).Debug("dropping invalid inbound packet", "error", err)
 		}
 		return
 	}
-
-	dropReason := f.firewall.Drop(rxc.fwPacket.Packet, true, hostinfo, f.pki.GetCAPool(), rxc.ctCache.Get())
-	if dropReason != nil {
-		f.rejectOutside(out, hostinfo.ConnectionState, hostinfo, rxc.nb, rxc.scratch, rxc.q)
+	if err := f.routes.validateInbound(inner, hostinfo); err != nil {
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("dropping inbound packet", "fwPacket", rxc.fwPacket, "reason", dropReason)
+			hostinfo.logger(f.l).Debug("dropping unauthorized inbound packet", "error", err)
 		}
 		return
 	}
-
-	err = f.batchers[rxc.q].Commit(out, batch.SortKey{Epoch: hostinfo.ConnectionState.epoch, Counter: messageCounter}, rxc.fwPacket)
-	if err != nil {
-		f.l.Error("Failed to write to tun", "error", err)
+	if err := f.netstack.inject(packet); err != nil && f.l.Enabled(context.Background(), slog.LevelDebug) {
+		hostinfo.logger(f.l).Debug("failed to inject inbound packet into userspace stack", "error", err)
 	}
 }
 
-func (f *Interface) maybeSendRecvError(endpoint netip.AddrPort, index uint32) {
-	if f.sendRecvErrorConfig.ShouldRecvError(endpoint) {
-		f.sendRecvError(endpoint, index)
-	}
+func (f *packetEngine) maybeSendRecvError(endpoint netip.AddrPort, index uint32) {
+	f.sendRecvError(endpoint, index)
 }
 
-func (f *Interface) sendRecvError(endpoint netip.AddrPort, index uint32) {
+func (f *packetEngine) sendRecvError(endpoint netip.AddrPort, index uint32) {
 	b := header.Encode(make([]byte, header.Len), header.Version, header.RecvError, 0, index, 0)
 	_ = f.outside.WriteTo(b, endpoint)
 	if f.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -509,15 +315,7 @@ func (f *Interface) sendRecvError(endpoint netip.AddrPort, index uint32) {
 	}
 }
 
-func (f *Interface) handleRecvError(addr netip.AddrPort, h *header.H) {
-	if !f.acceptRecvErrorConfig.ShouldRecvError(addr) {
-		f.l.Debug("Recv error received, ignoring",
-			"index", h.RemoteIndex,
-			"udpAddr", addr,
-		)
-		return
-	}
-
+func (f *packetEngine) handleRecvError(addr netip.AddrPort, h *header.H) {
 	if f.l.Enabled(context.Background(), slog.LevelDebug) {
 		f.l.Debug("Recv error received",
 			"index", h.RemoteIndex,

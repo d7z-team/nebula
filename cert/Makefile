@@ -1,5 +1,6 @@
-GO111MODULE = on
-export GO111MODULE
+.PHONY: proto
+
+proto: cert_v1.pb.go
 
 cert_v1.pb.go: cert_v1.proto .FORCE
 	go build google.golang.org/protobuf/cmd/protoc-gen-go

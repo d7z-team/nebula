@@ -35,8 +35,7 @@ type Certificate interface {
 	// contained by an entry in this list.
 	UnsafeNetworks() []netip.Prefix
 
-	// Groups is a list of identities that can be used to write more general firewall rule
-	// definitions.
+	// Groups is a list of application-defined identity labels carried by the certificate.
 	// If IsCA is true then certificates signed by this CA can only use groups that are
 	// in this list.
 	Groups() []string

@@ -2,195 +2,89 @@ package nebula
 
 import (
 	"context"
-	"crypto/fips140"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"runtime"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/slackhq/nebula/util"
-
-	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/firewall"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/overlay"
-	"github.com/slackhq/nebula/overlay/batch"
-	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/ratelimit"
-	"github.com/slackhq/nebula/udp"
 )
 
 const mtu = 9001
 
-type InterfaceConfig struct {
-	HostMap            *HostMap
-	Outside            udp.Conn
-	Inside             overlay.Device
-	pki                *PKI
-	Cipher             string
-	Firewall           *Firewall
-	HandshakeManager   *HandshakeManager
-	lightHouse         *LightHouse
-	connectionManager  *connectionManager
-	DropLocalBroadcast bool
-	DropMulticast      bool
-	routines           int
-	version            string
-	relayManager       *relayManager
-	punchy             *Punchy
+type packetEngineConfig struct {
+	hostMap           *hostMap
+	Outside           DatagramTransport
+	Netstack          *userNetstack
+	Routes            *packetRouteTable
+	pki               *pkiState
+	handshakeManager  *handshakeManager
+	lightHouse        *lighthouse
+	connectionManager *connectionManager
+	relayManager      *relayManager
 
 	tryPromoteEvery uint32
 	reQueryEvery    uint32
 	reQueryWait     time.Duration
 
-	ConntrackCacheTimeout time.Duration
-
-	// CpuAffinity, when non-empty, names the CPUs each TUN reader goroutine
-	// should pin to. Queue i pins to CpuAffinity[i % len(CpuAffinity)] —
-	// shorter lists than `routines` cycle. Empty list keeps the default
-	// pin-to-(i % NumCPU) behavior. Only consulted when PinThreads is true.
-	CpuAffinity []int
-	// PinThreads controls whether each TUN reader OS thread is pinned to a
-	// single CPU (via tun.pin_threads, default true). Pinning keeps each
-	// goroutine's sendmmsg on one XPS-selected NIC TX ring so per-flow
-	// packets stay ordered on the wire.
-	PinThreads bool
-
 	l *slog.Logger
 }
 
-type Interface struct {
-	hostMap               *HostMap
-	outside               udp.Conn
-	inside                overlay.Device
-	pki                   *PKI
-	firewall              *Firewall
-	connectionManager     *connectionManager
-	handshakeManager      *HandshakeManager
-	createTime            time.Time
-	lightHouse            *LightHouse
-	myBroadcastAddrsTable *bart.Lite
-	myVpnAddrs            []netip.Addr // A list of addresses assigned to us via our certificate
-	myVpnAddrsTable       *bart.Lite
-	myVpnNetworks         []netip.Prefix // A list of networks assigned to us via our certificate
-	myVpnNetworksTable    *bart.Lite
-	dropLocalBroadcast    bool
-	dropMulticast         bool
-	routines              int
-	disconnectInvalid     atomic.Bool
-	closed                atomic.Bool
-	// cpuAffinity, when non-empty, names the CPUs each TUN reader goroutine
-	// should pin to. Queue i pins to cpuAffinity[i % len(cpuAffinity)].
-	// Empty falls back to the default pin-to-(allowed CPU) behavior.
-	// Only consulted when pinThreads is true.
-	cpuAffinity []int
-	// pinThreads controls whether listenIn pins each TUN reader OS thread to
-	// a CPU at all (tun.pin_threads, default true). When false, threads are
-	// left free to migrate as on stock nebula.
-	pinThreads   bool
-	relayManager *relayManager
-
-	tryPromoteEvery atomic.Uint32
-	reQueryEvery    atomic.Uint32
-	reQueryWait     atomic.Int64
-
-	sendRecvErrorConfig   recvErrorConfig
-	acceptRecvErrorConfig recvErrorConfig
-
-	// Bumped on every udp rebind, tunnels compare it to decide they need a punch from the far side
-	rebindEpoch atomic.Uint32
-	version     string
-
-	conntrackCacheTimeout time.Duration
-
-	ctx     context.Context
-	writers []udp.Conn
-	queues  []tio.Queue
-	// batchers is one per tun queue, wrapping queues[i]. readOutsidePackets
-	// commits plaintext into the batcher; the plaintext is decrypted
-	// in place inside the UDP receive buffers, so listenOut must call Flush
-	// at the end of each UDP recvmmsg batch, before those buffers are
-	// reused (every udp.Conn ListenOut guarantees that ordering).
-	batchers []*batch.MultiCoalescer
-	wg       sync.WaitGroup
-	// readers covers just the listenIn and listenOut goroutines, wg also holds the construction token Close releases
-	readers sync.WaitGroup
-
-	udpTxErrLimiter      *ratelimit.Limiter // udp direct transmit error log limiter
-	udpRelayTxErrLimiter *ratelimit.Limiter // udp relay transmit error log limiter
-	txOversizeLimiter    *ratelimit.Limiter // oversized outbound packet drop log limiter
-
-	// fatalErr holds the first unexpected reader error that caused shutdown.
-	// nil means "no fatal error" (yet)
-	fatalErr atomic.Pointer[error]
-	// triggerShutdown is a function that will be run exactly once, when onFatal swaps something non-nil into fatalErr
-	triggerShutdown func()
-
-	l *slog.Logger
+type packetEngine struct {
+	hostMap              *hostMap
+	outside              DatagramTransport
+	netstack             *userNetstack
+	routes               *packetRouteTable
+	pki                  *pkiState
+	connectionManager    *connectionManager
+	handshakeManager     *handshakeManager
+	lightHouse           *lighthouse
+	myVpnAddrs           []netip.Addr
+	myVpnAddrsTable      *bart.Lite
+	myVpnNetworks        []netip.Prefix
+	myVpnNetworksTable   *bart.Lite
+	closed               atomic.Bool
+	relayManager         *relayManager
+	tryPromoteEvery      uint32
+	reQueryEvery         uint32
+	reQueryWait          time.Duration
+	rebindEpoch          atomic.Uint32
+	ctx                  context.Context
+	wg                   sync.WaitGroup
+	udpTxErrLimiter      *ratelimit.Limiter
+	udpRelayTxErrLimiter *ratelimit.Limiter
+	txOversizeLimiter    *ratelimit.Limiter
+	fatalErr             atomic.Pointer[error]
+	triggerShutdown      func()
+	l                    *slog.Logger
 }
 
-type EncWriter interface {
-	SendVia(via *HostInfo, relay *Relay, ad, nb, out []byte, nocopy bool, q int)
+type encWriter interface {
+	SendVia(via *hostInfo, relay *relay, ad, nb, out []byte, nocopy bool)
 	SendMessageToVpnAddr(t header.MessageType, st header.MessageSubType, vpnAddr netip.Addr, p, nb, out []byte)
-	SendMessageToHostInfo(t header.MessageType, st header.MessageSubType, hostinfo *HostInfo, p, nb, out []byte)
+	SendMessageToHostInfo(t header.MessageType, st header.MessageSubType, hostinfo *hostInfo, p, nb, out []byte)
 	Handshake(vpnAddr netip.Addr)
-	GetHostInfo(vpnAddr netip.Addr) *HostInfo
-	GetCertState() *CertState
+	GetHostInfo(vpnAddr netip.Addr) *hostInfo
+	GetCertState() *certificateState
 }
 
-type recvErrorConfig uint8
-
-const (
-	recvErrorAlways recvErrorConfig = iota
-	recvErrorNever
-	recvErrorPrivate
-)
-
-func (s recvErrorConfig) ShouldRecvError(endpoint netip.AddrPort) bool {
-	switch s {
-	case recvErrorPrivate:
-		return endpoint.Addr().IsPrivate()
-	case recvErrorAlways:
-		return true
-	case recvErrorNever:
-		return false
-	default:
-		panic(fmt.Errorf("invalid recvErrorConfig value: %d", s))
-	}
-}
-
-func (s recvErrorConfig) String() string {
-	switch s {
-	case recvErrorAlways:
-		return "always"
-	case recvErrorNever:
-		return "never"
-	case recvErrorPrivate:
-		return "private"
-	default:
-		return fmt.Sprintf("invalid(%d)", s)
-	}
-}
-
-func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
+func newPacketEngine(ctx context.Context, c *packetEngineConfig) (*packetEngine, error) {
 	if c.Outside == nil {
-		return nil, errors.New("no outside connection")
+		return nil, errors.New("no datagram transport")
 	}
-	if c.Inside == nil {
-		return nil, errors.New("no inside interface (tun)")
+	if c.Netstack == nil {
+		return nil, errors.New("no userspace network stack")
+	}
+	if c.Routes == nil {
+		return nil, errors.New("no packet route table")
 	}
 	if c.pki == nil {
 		return nil, errors.New("no certificate state")
-	}
-	if c.Firewall == nil {
-		return nil, errors.New("no firewall rules")
 	}
 	if c.connectionManager == nil {
 		return nil, errors.New("no connection manager")
@@ -209,150 +103,62 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 		return nil, err
 	}
 
-	if c.routines <= 1 {
-		c.PinThreads = false //pinning is not useful unless there's more than one tun reader
-	}
-
 	cs := c.pki.getCertState()
-	ifce := &Interface{
-		ctx:                   ctx,
-		pki:                   c.pki,
-		hostMap:               c.HostMap,
-		outside:               c.Outside,
-		inside:                c.Inside,
-		firewall:              c.Firewall,
-		handshakeManager:      c.HandshakeManager,
-		createTime:            time.Now(),
-		lightHouse:            c.lightHouse,
-		dropLocalBroadcast:    c.DropLocalBroadcast,
-		dropMulticast:         c.DropMulticast,
-		routines:              c.routines,
-		version:               c.version,
-		writers:               make([]udp.Conn, c.routines),
-		batchers:              make([]*batch.MultiCoalescer, c.routines),
-		myVpnNetworks:         cs.myVpnNetworks,
-		myVpnNetworksTable:    cs.myVpnNetworksTable,
-		myVpnAddrs:            cs.myVpnAddrs,
-		myVpnAddrsTable:       cs.myVpnAddrsTable,
-		myBroadcastAddrsTable: cs.myVpnBroadcastAddrsTable,
-		relayManager:          c.relayManager,
-		connectionManager:     c.connectionManager,
-		conntrackCacheTimeout: c.ConntrackCacheTimeout,
-		cpuAffinity:           c.CpuAffinity,
-		pinThreads:            c.PinThreads,
-		udpTxErrLimiter:       udpTxErrLimiter,
-		udpRelayTxErrLimiter:  udpRelayTxErrLimiter,
-		txOversizeLimiter:     txOversizeLimiter,
-
-		l: c.l,
+	f := &packetEngine{
+		ctx:                  ctx,
+		pki:                  c.pki,
+		hostMap:              c.hostMap,
+		outside:              c.Outside,
+		netstack:             c.Netstack,
+		routes:               c.Routes,
+		handshakeManager:     c.handshakeManager,
+		lightHouse:           c.lightHouse,
+		myVpnNetworks:        cs.myVpnNetworks,
+		myVpnNetworksTable:   cs.myVpnNetworksTable,
+		myVpnAddrs:           cs.myVpnAddrs,
+		myVpnAddrsTable:      cs.myVpnAddrsTable,
+		relayManager:         c.relayManager,
+		connectionManager:    c.connectionManager,
+		udpTxErrLimiter:      udpTxErrLimiter,
+		udpRelayTxErrLimiter: udpRelayTxErrLimiter,
+		txOversizeLimiter:    txOversizeLimiter,
+		tryPromoteEvery:      c.tryPromoteEvery,
+		reQueryEvery:         c.reQueryEvery,
+		reQueryWait:          c.reQueryWait,
+		l:                    c.l,
 	}
-
-	ifce.tryPromoteEvery.Store(c.tryPromoteEvery)
-	ifce.reQueryEvery.Store(c.reQueryEvery)
-	ifce.reQueryWait.Store(int64(c.reQueryWait))
-
-	ifce.connectionManager.intf = ifce
-
-	// Held until Close so waiting on the interface blocks until the resources are actually released
-	ifce.wg.Add(1)
-
-	return ifce, nil
+	f.connectionManager.engine = f
+	f.wg.Add(1)
+	return f, nil
 }
 
-// activate creates the interface on the host. After the interface is created, any
-// other services that want to bind listeners to its IP may do so successfully. However,
-// the interface isn't going to process anything until run() is called.
-func (f *Interface) activate() error {
-	// actually turn on tun dev
-
+func (f *packetEngine) activate() error {
 	addr, err := f.outside.LocalAddr()
 	if err != nil {
-		f.l.Error("Failed to get udp listen address", "error", err)
+		return fmt.Errorf("get datagram transport address: %w", err)
 	}
-
-	f.l.Info("Nebula interface is active",
-		"interface", f.inside.Name(),
+	f.l.Info("Nebula node is active",
 		"networks", f.myVpnNetworks,
-		"build", f.version,
-		"udpAddr", addr,
-		"boringcrypto", boringEnabled(),
-		"fips140Version", fips140.Version(),
-		"fips140Enabled", fips140.Enabled(),
-		"fips140Enforced", fips140.Enforced(),
+		"transportAddr", addr,
 	)
-
-	if f.routines > 1 && !f.outside.SupportsMultipleReaders() {
-		f.routines = 1
-		f.l.Warn("multiple udp readers are not supported on this platform, falling back to a single routine")
-	}
-
-	// Prepare the tun queues. A device that can't open that many hands back
-	// fewer (a single queue on platforms without multiqueue support) and we
-	// size the reader routines to what we actually got.
-	queues, err := f.inside.Queues(f.routines)
-	if err != nil {
-		return err
-	}
-	if len(queues) < f.routines {
-		// TODO: this clamp is only safe because it is unreachable when the
-		// udp side has multiple readers (linux Queues opens exactly n or
-		// errors; every other platform already clamped routines to 1 above).
-		// If a platform ever returns fewer queues than routines with
-		// SO_REUSEPORT sockets already bound, the surplus sockets get no
-		// listenOut and the kernel blackholes every flow it hashes to them —
-		// fail loudly or close the extra sockets instead.
-		f.l.Warn("tun multiqueue is not supported on this platform, falling back to fewer routines",
-			"requested", f.routines, "opened", len(queues))
-		f.routines = len(queues)
-	}
-	f.queues = queues
-
-	for i := range f.queues {
-		f.batchers[i] = batch.NewMultiCoalescer(f.queues[i], f.l)
-	}
-
-	// On error the caller owns the cleanup, Control.Start cancels the service context
-	// before releasing our resources so a waiter never observes a live context
-	if err = f.inside.Activate(); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func (f *Interface) run() {
-	// Launch n queues to read packets from udp
-	for i := 0; i < f.routines; i++ {
-		f.readers.Add(1)
-		f.wg.Go(func() {
-			defer f.readers.Done()
-			f.listenOut(i)
-		})
-	}
-
-	// Launch n queues to read packets from tun dev
-	for i := 0; i < f.routines; i++ {
-		f.readers.Add(1)
-		f.wg.Go(func() {
-			defer f.readers.Done()
-			f.listenIn(f.queues[i], i)
-		})
-	}
-
+func (f *packetEngine) run() {
+	f.wg.Go(f.listenOut)
+	f.wg.Go(f.listenIn)
 }
 
-func (f *Interface) wait() error {
+func (f *packetEngine) wait() error {
 	f.wg.Wait()
-	if e := f.fatalErr.Load(); e != nil {
-		return *e
+	if err := f.fatalErr.Load(); err != nil {
+		return *err
 	}
 	return nil
 }
 
-// onFatal stores the first fatal reader error, and calls triggerShutdown if it was the first one
-func (f *Interface) onFatal(err error) {
-	swapped := f.fatalErr.CompareAndSwap(nil, &err)
-	if !swapped {
+func (f *packetEngine) onFatal(err error) {
+	if !f.fatalErr.CompareAndSwap(nil, &err) {
 		return
 	}
 	if f.triggerShutdown != nil {
@@ -361,355 +167,76 @@ func (f *Interface) onFatal(err error) {
 }
 
 type rxContext struct {
-	q       int
-	scratch []byte
-	// nb is a re-usable nonce buffer for decrypt calls to use
+	scratch      []byte
 	nb           []byte
 	h            *header.H
-	fwPacket     *firewall.ParsedPacket
-	hostmapCache map[uint32]*HostInfo
-	lhh          *LightHouseHandler
-	ctCache      *firewall.ConntrackCacheTicker
-	// relayBatch holds forwarded relay packets, which borrow their receive buffers until flushed
-	relayBatch *batch.SendBatch
+	hostmapCache map[uint32]*hostInfo
+	lhh          *lighthouseHandler
 }
 
-func newRxContext(f *Interface, q int) *rxContext {
+func newRxContext(f *packetEngine) *rxContext {
 	return &rxContext{
-		q:            q,
 		scratch:      make([]byte, mtu),
 		nb:           make([]byte, 12, 12),
 		h:            &header.H{},
-		fwPacket:     &firewall.ParsedPacket{},
-		hostmapCache: map[uint32]*HostInfo{},
+		hostmapCache: make(map[uint32]*hostInfo),
 		lhh:          f.lightHouse.NewRequestHandler(),
-		ctCache:      firewall.NewConntrackCacheTicker(f.ctx, f.l, f.conntrackCacheTimeout),
-		relayBatch:   batch.NewSendBatch(f.writers[q], batch.SendBatchCap, 0),
 	}
 }
 
-func (f *Interface) listenOut(i int) {
-	var li udp.Conn
-	if i > 0 {
-		li = f.writers[i]
-	} else {
-		li = f.outside
-	}
-
-	rxc := newRxContext(f, i)
-
-	listener := func(fromUdpAddr netip.AddrPort, payload []byte) {
-		f.readOutsidePackets(ViaSender{UdpAddr: fromUdpAddr}, payload, rxc)
-	}
-
-	flusher := func() {
-		f.flushSendBatch(rxc.relayBatch, i)
-		if err := f.batchers[i].Flush(); err != nil {
-			f.l.Error("Failed to flush tun coalescer", "error", err)
-		}
-		clear(rxc.hostmapCache)
-	}
-
-	err := li.ListenOut(listener, flusher)
-
-	// An error after teardown began is shutdown noise, the closed flag covers resources
-	// Close releases itself and the cancelled ctx covers ones torn down by their owners
-	// reacting to it, like the user device pipes
-	if err != nil && !f.closed.Load() && f.ctx.Err() == nil {
-		f.l.Error("Error while reading inbound packet, closing", "error", err)
-		f.onFatal(err)
-	}
-
-	f.l.Debug("underlay reader is done", "reader", i)
-}
-
-func (f *Interface) pinThisThread(i int) {
-	var cpu int
-	if n := len(f.cpuAffinity); n > 0 {
-		// Explicit tun.cpu_affinity list wins; parseCpuAffinity already
-		// validated the entries against the allowed CPU set.
-		cpu = f.cpuAffinity[i%n]
-	} else if allowed, err := util.AllowedCPUs(); err == nil && len(allowed) > 0 {
-		// Default: spread queues across the CPUs we're actually allowed to
-		// run on. Under a cpuset/taskset mask these aren't 0..NumCPU-1, so
-		// i % NumCPU would pick unrunnable IDs and every pin would fail.
-		cpu = allowed[i%len(allowed)]
-	} else {
-		cpu = i % runtime.NumCPU()
-	}
-	if err := util.PinThreadToCPU(cpu); err != nil {
-		f.l.Warn("failed to pin tun reader to CPU", "queue", i, "cpu", cpu, "error", err)
-	}
-}
-
-func (f *Interface) listenIn(queue tio.Queue, i int) {
-	// Pinning this thread (and goroutine) to a single CPU keeps every sendmmsg from this goroutine going through the
-	// same TX ring on the nic, so the wire sees per-flow order. Skip entirely when tun.pin_threads is false.
-	if f.pinThreads {
-		f.pinThisThread(i)
-	}
-
-	rejectBuf := make([]byte, mtu)
-	arenaSize := batch.SendBatchCap * (udp.MTU + 32)
-	sb := batch.NewSendBatch(f.writers[i], batch.SendBatchCap, arenaSize)
-	fwPacket := &firewall.ParsedPacket{}
-	nb := make([]byte, 12, 12)
-
-	conntrackCache := firewall.NewConntrackCacheTicker(f.ctx, f.l, f.conntrackCacheTimeout)
-
+func (f *packetEngine) listenOut() {
+	rxc := newRxContext(f)
+	packet := make([]byte, mtu+header.MaxOverhead)
 	for {
-		pkts, err := queue.Read()
+		n, from, err := f.outside.ReadFrom(packet)
 		if err != nil {
-			// Same shutdown noise handling as listenOut
 			if !f.closed.Load() && f.ctx.Err() == nil {
-				f.l.Error("Error while reading outbound packet, closing", "error", err, "reader", i)
+				f.l.Error("datagram transport reader failed", "error", err)
 				f.onFatal(err)
 			}
-			break
+			return
 		}
+		if n <= 0 || n > len(packet) {
+			continue
+		}
+		f.readOutsidePackets(packetSender{UdpAddr: from}, packet[:n], rxc)
+		clear(rxc.hostmapCache)
+	}
+}
 
-		for _, pkt := range pkts {
-			f.consumeInsidePacket(pkt, fwPacket, nb, sb, rejectBuf, i, conntrackCache.Get())
-			// Flush incrementally once a full sendmmsg batch has
-			// accumulated so the first packets of a deep read drain
-			// hit the wire while the rest are still being encrypted.
-			if sb.Len() >= batch.SendBatchCap {
-				f.flushSendBatch(sb, i)
+func (f *packetEngine) listenIn() {
+	nonce := make([]byte, 12, 12)
+	for {
+		view, err := f.netstack.readPacket(f.ctx)
+		if err != nil {
+			if !f.closed.Load() && f.ctx.Err() == nil {
+				f.l.Error("userspace network stack reader failed", "error", err)
+				f.onFatal(err)
 			}
+			return
 		}
-		f.flushSendBatch(sb, i)
-	}
-
-	f.l.Debug("overlay reader is done", "reader", i)
-}
-
-// flushSendBatch drains sb to the underlay. Specific destinations that could not be
-// delivered are logged by the backend.
-func (f *Interface) flushSendBatch(sb *batch.SendBatch, q int) {
-	_, err := sb.Flush()
-	if err != nil {
-		f.l.Error("Failed to write outgoing batch", "error", err, "writer", q)
+		f.consumeInsidePacket(view.AsSlice(), nonce)
+		view.Release()
 	}
 }
 
-func (f *Interface) RegisterConfigChangeCallbacks(c *config.C) {
-	c.RegisterReloadCallback(f.reloadFirewall)
-	for _, reload := range []func(*config.C){
-		f.reloadSendRecvError, f.reloadAcceptRecvError, f.reloadDisconnectInvalid, f.reloadMisc,
-	} {
-		c.RegisterReloadCallback(func(c *config.C, _ *config.Reload) { reload(c) })
-	}
-
-	for _, udpConn := range f.writers {
-		c.RegisterReloadCallback(udpConn.ReloadConfig)
-	}
+func (f *packetEngine) GetHostInfo(vpnAddr netip.Addr) *hostInfo {
+	return f.hostMap.QueryVpnAddr(vpnAddr)
 }
 
-func (f *Interface) reloadDisconnectInvalid(c *config.C) {
-	initial := c.InitialLoad()
-	if initial || c.HasChanged("pki.disconnect_invalid") {
-		f.disconnectInvalid.Store(c.GetBool("pki.disconnect_invalid", true))
-		if !initial {
-			f.l.Info("pki.disconnect_invalid changed", "value", f.disconnectInvalid.Load())
-		}
-	}
-}
-
-func (f *Interface) reloadFirewall(c *config.C, r *config.Reload) {
-	cs := f.pki.getCertState()
-	curCert := cs.getCertificate(cert.Version2)
-	if curCert == nil {
-		curCert = cs.getCertificate(cert.Version1)
-	}
-
-	// Compare with what the running firewall was built from, not the last config, so a firewall that failed to build
-	// is tried again. The cert is the one this reload brought, PKI registers its reload callback before this one
-	src := c.Render("firewall")
-	if src != "" && src == f.firewall.source && curCert != nil &&
-		slices.Equal(curCert.Networks(), f.firewall.assignedNetworks) &&
-		slices.Equal(curCert.UnsafeNetworks(), f.firewall.unsafeNetworks) {
-		f.l.Debug("No firewall config change detected")
-		return
-	}
-
-	fw, err := NewFirewallFromConfig(f.l, cs, c)
-	if err != nil {
-		f.l.Error("Error while creating firewall during reload", "error", err)
-		r.Failed()
-		return
-	}
-
-	oldFw := f.firewall
-	conntrack := oldFw.Conntrack
-	conntrack.Lock()
-	defer conntrack.Unlock()
-
-	fw.rulesVersion = oldFw.rulesVersion + 1
-	// If rulesVersion is back to zero, we have wrapped all the way around. Be
-	// safe and just reset conntrack in this case.
-	if fw.rulesVersion == 0 {
-		f.l.Warn("firewall rulesVersion has overflowed, resetting conntrack",
-			"firewallHashes", fw.GetRuleHashes(),
-			"oldFirewallHashes", oldFw.GetRuleHashes(),
-			"rulesVersion", fw.rulesVersion,
-		)
-	} else {
-		fw.Conntrack = conntrack
-	}
-
-	f.firewall = fw
-
-	oldFw.Destroy()
-	f.l.Info("New firewall has been installed",
-		"firewallHashes", fw.GetRuleHashes(),
-		"oldFirewallHashes", oldFw.GetRuleHashes(),
-		"rulesVersion", fw.rulesVersion,
-	)
-}
-
-func (f *Interface) reloadSendRecvError(c *config.C) {
-	if c.InitialLoad() || c.HasChanged("listen.send_recv_error") {
-		stringValue := c.GetString("listen.send_recv_error", "always")
-
-		switch stringValue {
-		case "always":
-			f.sendRecvErrorConfig = recvErrorAlways
-		case "never":
-			f.sendRecvErrorConfig = recvErrorNever
-		case "private":
-			f.sendRecvErrorConfig = recvErrorPrivate
-		default:
-			if c.GetBool("listen.send_recv_error", true) {
-				f.sendRecvErrorConfig = recvErrorAlways
-			} else {
-				f.sendRecvErrorConfig = recvErrorNever
-			}
-		}
-
-		f.l.Info("Loaded send_recv_error config", "sendRecvError", f.sendRecvErrorConfig.String())
-	}
-}
-
-func (f *Interface) reloadAcceptRecvError(c *config.C) {
-	if c.InitialLoad() || c.HasChanged("listen.accept_recv_error") {
-		stringValue := c.GetString("listen.accept_recv_error", "always")
-
-		switch stringValue {
-		case "always":
-			f.acceptRecvErrorConfig = recvErrorAlways
-		case "never":
-			f.acceptRecvErrorConfig = recvErrorNever
-		case "private":
-			f.acceptRecvErrorConfig = recvErrorPrivate
-		default:
-			if c.GetBool("listen.accept_recv_error", true) {
-				f.acceptRecvErrorConfig = recvErrorAlways
-			} else {
-				f.acceptRecvErrorConfig = recvErrorNever
-			}
-		}
-
-		f.l.Info("Loaded accept_recv_error config", "acceptRecvError", f.acceptRecvErrorConfig.String())
-	}
-}
-
-func (f *Interface) reloadMisc(c *config.C) {
-	if c.HasChanged("counters.try_promote") {
-		n := c.GetUint32("counters.try_promote", defaultPromoteEvery)
-		f.tryPromoteEvery.Store(n)
-		f.l.Info("counters.try_promote has changed")
-	}
-
-	if c.HasChanged("counters.requery_every_packets") {
-		n := c.GetUint32("counters.requery_every_packets", defaultReQueryEvery)
-		f.reQueryEvery.Store(n)
-		f.l.Info("counters.requery_every_packets has changed")
-	}
-
-	if c.HasChanged("timers.requery_wait_duration") {
-		n := c.GetDuration("timers.requery_wait_duration", defaultReQueryWait)
-		f.reQueryWait.Store(int64(n))
-		f.l.Info("timers.requery_wait_duration has changed")
-	}
-}
-
-func (f *Interface) GetHostInfo(vpnIp netip.Addr) *HostInfo {
-	return f.hostMap.QueryVpnAddr(vpnIp)
-}
-
-func (f *Interface) GetCertState() *CertState {
+func (f *packetEngine) GetCertState() *certificateState {
 	return f.pki.getCertState()
 }
 
-// shutdowner is a udp.Conn or overlay.Device whose readers can be woken without releasing their fds
-type shutdowner interface {
-	Shutdown() error
-}
-
-// readerShutdownTimeout bounds how long Close waits on woken readers before releasing their fds anyway
-const readerShutdownTimeout = 5 * time.Second
-
-// Close releases the interface's resources: the udp sockets and the tun device.
-// It is idempotent and safe to call at any point in the lifecycle, including on an interface that never activated,
-// calls after the first return nil without doing anything.
-func (f *Interface) Close() error {
+func (f *packetEngine) Close() error {
 	if !f.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-
 	var errs []error
-	closeUdp := func(i int, u udp.Conn) {
-		if err := u.Close(); err != nil {
-			f.l.Error("Error while closing udp socket", "error", err, "writer", i)
-			errs = append(errs, err)
-		}
+	if err := f.outside.Close(); err != nil {
+		errs = append(errs, err)
 	}
-	closeTun := func() {
-		if err := f.inside.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	// Wake every reader before releasing any fd, one that loops back into a syscall on a reused fd number never wakes.
-	// Anything without Shutdown is closed right away, as before.
-	var deferred []func()
-	for i, u := range f.writers {
-		if s, ok := u.(shutdowner); ok {
-			if err := s.Shutdown(); err != nil {
-				f.l.Error("Error while shutting down udp socket", "error", err, "writer", i)
-				errs = append(errs, err)
-			}
-			deferred = append(deferred, func() { closeUdp(i, u) })
-		} else {
-			closeUdp(i, u)
-		}
-	}
-	if s, ok := f.inside.(shutdowner); ok {
-		if err := s.Shutdown(); err != nil {
-			errs = append(errs, err)
-		}
-		deferred = append(deferred, closeTun)
-	} else {
-		closeTun()
-	}
-
-	if len(deferred) > 0 {
-		readersDone := make(chan struct{})
-		go func() {
-			f.readers.Wait()
-			close(readersDone)
-		}()
-		select {
-		case <-readersDone:
-		case <-time.After(readerShutdownTimeout):
-			f.l.Warn("Readers did not stop, closing their fds anyway", "timeout", readerShutdownTimeout)
-		}
-		for _, closeFn := range deferred {
-			closeFn()
-		}
-	}
-
-	// Release the construction token so waiters know the resources are gone
+	f.netstack.destroy()
 	f.wg.Done()
 	return errors.Join(errs...)
 }

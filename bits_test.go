@@ -9,7 +9,7 @@ import (
 
 // snapshot returns the bitmap as a []bool of length b.length, for readable
 // test assertions against the now-packed []uint64 storage.
-func (b *Bits) snapshot() []bool {
+func (b *replayWindowBits) snapshot() []bool {
 	out := make([]bool, b.length)
 	for i := uint64(0); i < b.length; i++ {
 		out[i] = b.get(i)
@@ -18,17 +18,17 @@ func (b *Bits) snapshot() []bool {
 }
 
 func TestBitsRequiresPowerOfTwo(t *testing.T) {
-	assert.Panics(t, func() { NewBits(10) })
-	assert.Panics(t, func() { NewBits(0) })
-	assert.NotPanics(t, func() { NewBits(1) })
-	assert.NotPanics(t, func() { NewBits(16) })
-	assert.NotPanics(t, func() { NewBits(1024) })
-	assert.NotPanics(t, func() { NewBits(16384) })
+	assert.Panics(t, func() { newReplayWindow(10) })
+	assert.Panics(t, func() { newReplayWindow(0) })
+	assert.NotPanics(t, func() { newReplayWindow(1) })
+	assert.NotPanics(t, func() { newReplayWindow(16) })
+	assert.NotPanics(t, func() { newReplayWindow(1024) })
+	assert.NotPanics(t, func() { newReplayWindow(16384) })
 }
 
 func TestBits(t *testing.T) {
 	l := test.NewLogger()
-	b := NewBits(16)
+	b := newReplayWindow(16)
 	assert.EqualValues(t, 16, b.length)
 
 	// This is initialized to zero - receive one. This should work.
@@ -73,13 +73,13 @@ func TestBits(t *testing.T) {
 
 	// Make sure we handle wrapping around once to the same slot. With
 	// length=16, packets 1 and 17 share slot 1.
-	b = NewBits(16)
+	b = newReplayWindow(16)
 	assert.True(t, b.Update(l, 1))
 	assert.True(t, b.Update(l, 17))
 	assert.Equal(t, []bool{false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false}, b.snapshot())
 
 	// Walk through a few windows in order
-	b = NewBits(16)
+	b = newReplayWindow(16)
 	for i := uint64(1); i <= 100; i++ {
 		assert.True(t, b.Check(l, i), "Error while checking %v", i)
 		assert.True(t, b.Update(l, i), "Error while updating %v", i)
@@ -95,7 +95,7 @@ func TestBits(t *testing.T) {
 // Once current >= length the regimes flip cleanly.
 func TestBitsCheckAcrossWarmupBoundary(t *testing.T) {
 	l := test.NewLogger()
-	b := NewBits(16)
+	b := newReplayWindow(16)
 
 	// Warmup: current=0. Check(0) must read the marker (set) and return false.
 	assert.False(t, b.Check(l, 0), "marker slot should look already-received")
@@ -125,7 +125,7 @@ func TestBitsCheckAcrossWarmupBoundary(t *testing.T) {
 // correctly across warmup and beyond.
 func TestBitsMarkerInvariant(t *testing.T) {
 	l := test.NewLogger()
-	b := NewBits(8)
+	b := newReplayWindow(8)
 
 	// Counter 0 is the seeded marker; Check sees it as already received.
 	assert.False(t, b.Check(l, 0))
@@ -151,7 +151,7 @@ func TestBitsMarkerInvariant(t *testing.T) {
 // i == current+1.
 func BenchmarkBitsUpdateInOrder(b *testing.B) {
 	l := test.NewLogger()
-	z := NewBits(16384)
+	z := newReplayWindow(16384)
 	for n := 0; n < b.N; n++ {
 		z.Update(l, uint64(n)+1)
 	}
@@ -162,7 +162,7 @@ func BenchmarkBitsUpdateInOrder(b *testing.B) {
 // in-window backfill branch).
 func BenchmarkBitsUpdateReorder(b *testing.B) {
 	l := test.NewLogger()
-	z := NewBits(16384)
+	z := newReplayWindow(16384)
 	for n := 0; n < b.N; n++ {
 		base := uint64(n) * 2
 		z.Update(l, base+2)
@@ -173,7 +173,7 @@ func BenchmarkBitsUpdateReorder(b *testing.B) {
 // BenchmarkBitsUpdateLargeJumps stresses the clearRange word-level path.
 func BenchmarkBitsUpdateLargeJumps(b *testing.B) {
 	l := test.NewLogger()
-	z := NewBits(16384)
+	z := newReplayWindow(16384)
 	for n := 0; n < b.N; n++ {
 		z.Update(l, uint64(n+1)*1000)
 	}

@@ -5,14 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"encoding/pem"
 	"io"
 	"net/netip"
 	"time"
 
 	"github.com/slackhq/nebula/cert"
-	"golang.org/x/crypto/cryptobyte"
-	"golang.org/x/crypto/cryptobyte/asn1"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/ed25519"
 )
@@ -173,47 +170,6 @@ func P256Keypair() ([]byte, []byte) {
 	return pubkey.Bytes(), privkey.Bytes()
 }
 
-// DummyCert is a minimal cert.Certificate implementation for testing error paths.
-type DummyCert struct {
-	Version_        cert.Version
-	Curve_          cert.Curve
-	Groups_         []string
-	IsCA_           bool
-	Issuer_         string
-	Name_           string
-	Networks_       []netip.Prefix
-	NotAfter_       time.Time
-	NotBefore_      time.Time
-	PublicKey_      []byte
-	Signature_      []byte
-	UnsafeNetworks_ []netip.Prefix
-}
-
-func (d *DummyCert) Version() cert.Version                         { return d.Version_ }
-func (d *DummyCert) Curve() cert.Curve                             { return d.Curve_ }
-func (d *DummyCert) Groups() []string                              { return d.Groups_ }
-func (d *DummyCert) IsCA() bool                                    { return d.IsCA_ }
-func (d *DummyCert) Issuer() string                                { return d.Issuer_ }
-func (d *DummyCert) Name() string                                  { return d.Name_ }
-func (d *DummyCert) Networks() []netip.Prefix                      { return d.Networks_ }
-func (d *DummyCert) NotAfter() time.Time                           { return d.NotAfter_ }
-func (d *DummyCert) NotBefore() time.Time                          { return d.NotBefore_ }
-func (d *DummyCert) PublicKey() []byte                             { return d.PublicKey_ }
-func (d *DummyCert) Signature() []byte                             { return d.Signature_ }
-func (d *DummyCert) UnsafeNetworks() []netip.Prefix                { return d.UnsafeNetworks_ }
-func (d *DummyCert) Fingerprint() (string, error)                  { return "", nil }
-func (d *DummyCert) CheckSignature(key []byte) bool                { return false }
-func (d *DummyCert) MarshalForHandshakes() ([]byte, error)         { return nil, nil }
-func (d *DummyCert) MarshalPEM() ([]byte, error)                   { return nil, nil }
-func (d *DummyCert) MarshalJSON() ([]byte, error)                  { return nil, nil }
-func (d *DummyCert) Marshal() ([]byte, error)                      { return nil, nil }
-func (d *DummyCert) String() string                                { return "dummy" }
-func (d *DummyCert) Copy() cert.Certificate                        { return d }
-func (d *DummyCert) VerifyPrivateKey(c cert.Curve, k []byte) error { return nil }
-func (d *DummyCert) Expired(time.Time) bool                        { return false }
-func (d *DummyCert) MarshalPublicKeyPEM() []byte                   { return nil }
-func (d *DummyCert) PublicKeyPEM() []byte                          { return nil }
-
 // NewTestCAPool creates a CAPool from the given CA certificates, panicking on error.
 func NewTestCAPool(cas ...cert.Certificate) *cert.CAPool {
 	pool := cert.NewCAPool()
@@ -223,33 +179,4 @@ func NewTestCAPool(cas ...cert.Certificate) *cert.CAPool {
 		}
 	}
 	return pool
-}
-
-// WithCurve re-encodes a curve25519 v2 certificate PEM as one carrying curve, the way a certificate for a curve a newer
-// nebula added would look. Its signature no longer verifies.
-func WithCurve(certPEM []byte, curve cert.Curve) []byte {
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		panic("not a PEM block")
-	}
-
-	in := cryptobyte.String(block.Bytes)
-	var body, details, publicKey, signature cryptobyte.String
-	if !in.ReadASN1(&body, asn1.SEQUENCE) ||
-		!body.ReadASN1Element(&details, asn1.Tag(0).Constructed().ContextSpecific()) ||
-		!body.ReadASN1Element(&publicKey, asn1.Tag(2).ContextSpecific()) ||
-		!body.ReadASN1Element(&signature, asn1.Tag(3).ContextSpecific()) {
-		panic("not a curve25519 v2 certificate")
-	}
-
-	var b cryptobyte.Builder
-	b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-		b.AddBytes(details)
-		b.AddASN1(asn1.Tag(1).ContextSpecific(), func(b *cryptobyte.Builder) {
-			b.AddUint8(uint8(curve))
-		})
-		b.AddBytes(publicKey)
-		b.AddBytes(signature)
-	})
-	return pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: b.BytesOrPanic()})
 }
