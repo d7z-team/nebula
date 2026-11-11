@@ -148,6 +148,10 @@ func (f *packetEngine) SendVia(via *hostInfo, relay *relay, authenticatedData, n
 }
 
 func (f *packetEngine) sendEncrypted(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, payload, nonce, out []byte) {
+	f.sendEncryptedWithRoute(t, st, ci, hostinfo, remote, nil, nil, payload, nonce, out)
+}
+
+func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, relayHostInfo *hostInfo, relayRoute *relay, payload, nonce, out []byte) {
 	if ci == nil || ci.eKey == nil {
 		return
 	}
@@ -204,6 +208,10 @@ func (f *packetEngine) sendEncrypted(t header.MessageType, st header.MessageSubT
 				hostinfo.logger(l).Error("failed to write outgoing datagram", "error", err, "remote", remote)
 			}
 		}
+		return
+	}
+	if relayHostInfo != nil && relayRoute != nil {
+		f.SendVia(relayHostInfo, relayRoute, out, nonce, fullOut[:header.Len+len(out)], true)
 		return
 	}
 

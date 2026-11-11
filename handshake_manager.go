@@ -49,6 +49,11 @@ type handshakeManagerConfig struct {
 	triggerBuffer int
 }
 
+type outboundHandshakeTimerItem struct {
+	vpnAddr    netip.Addr
+	generation *handshakeHostInfo
+}
+
 type handshakeManager struct {
 	// Mutex for interacting with the vpnIps and indexes maps.
 	// Lock order is hostmap, then this lock, then the lighthouse, then a remoteList.
@@ -61,7 +66,7 @@ type handshakeManager struct {
 	lightHouse             *lighthouse
 	outside                DatagramTransport
 	config                 handshakeManagerConfig
-	OutboundHandshakeTimer *lockingTimerWheel[netip.Addr]
+	OutboundHandshakeTimer *lockingTimerWheel[outboundHandshakeTimerItem]
 	f                      *packetEngine
 	l                      *slog.Logger
 
@@ -116,7 +121,7 @@ func newHandshakeManager(l *slog.Logger, mainHostMap *hostMap, lightHouse *light
 		outside:                outside,
 		config:                 config,
 		trigger:                make(chan netip.Addr, config.triggerBuffer),
-		OutboundHandshakeTimer: newLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
+		OutboundHandshakeTimer: newLockingTimerWheel[outboundHandshakeTimerItem](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
 		l:                      l,
 	}
 }
@@ -130,7 +135,7 @@ func (hm *handshakeManager) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case vpnIP := <-hm.trigger:
-			hm.handleOutbound(vpnIP, true)
+			hm.handleOutbound(vpnIP, nil, true)
 		case now := <-clockSource.C:
 			hm.NextOutboundHandshakeTimerTick(now)
 		}
@@ -177,20 +182,38 @@ func (hm *handshakeManager) HandleIncoming(via packetSender, packet []byte, h *h
 func (hm *handshakeManager) NextOutboundHandshakeTimerTick(now time.Time) {
 	hm.OutboundHandshakeTimer.Advance(now)
 	for {
-		vpnIp, has := hm.OutboundHandshakeTimer.Purge()
+		item, has := hm.OutboundHandshakeTimer.Purge()
 		if !has {
 			break
 		}
-		hm.handleOutbound(vpnIp, false)
+		hm.handleOutbound(item.vpnAddr, item.generation, false)
 	}
 }
 
-func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered bool) {
-	hh := hm.queryVpnIp(vpnIp)
-	if hh == nil {
-		return
+func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, generation *handshakeHostInfo, lighthouseTriggered bool) {
+	var hh *handshakeHostInfo
+	for {
+		if generation == nil {
+			hh = hm.queryVpnIp(vpnIp)
+		} else {
+			hh = generation
+		}
+		if hh == nil {
+			return
+		}
+
+		hh.Lock()
+		hm.RLock()
+		current := hm.vpnIps[vpnIp]
+		hm.RUnlock()
+		if current == hh {
+			break
+		}
+		hh.Unlock()
+		if generation != nil {
+			return
+		}
 	}
-	hh.Lock()
 	defer hh.Unlock()
 
 	hostinfo := hh.hostinfo
@@ -221,7 +244,7 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 	// Check if we have a handshake packet to transmit yet
 	if !hh.ready {
 		if !hm.buildStage0Packet(hh) {
-			hm.OutboundHandshakeTimer.Add(vpnIp, hm.config.tryInterval*time.Duration(hh.counter))
+			hm.OutboundHandshakeTimer.Add(outboundHandshakeTimerItem{vpnAddr: vpnIp, generation: hh}, hm.config.tryInterval*time.Duration(hh.counter))
 			return
 		}
 	}
@@ -304,7 +327,7 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 
 	// If a lighthouse triggered this attempt then we are still in the timer wheel and do not need to re-add
 	if !lighthouseTriggered {
-		hm.OutboundHandshakeTimer.Add(vpnIp, hm.config.tryInterval*time.Duration(hh.counter))
+		hm.OutboundHandshakeTimer.Add(outboundHandshakeTimerItem{vpnAddr: vpnIp, generation: hh}, hm.config.tryInterval*time.Duration(hh.counter))
 	}
 }
 
@@ -357,7 +380,7 @@ func (hm *handshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*han
 		startTime: time.Now(),
 	}
 	hm.vpnIps[vpnAddr] = hh
-	hm.OutboundHandshakeTimer.Add(vpnAddr, hm.config.tryInterval)
+	hm.OutboundHandshakeTimer.Add(outboundHandshakeTimerItem{vpnAddr: vpnAddr, generation: hh}, hm.config.tryInterval)
 
 	if cacheCb != nil {
 		cacheCb(hh)

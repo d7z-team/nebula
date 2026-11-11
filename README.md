@@ -65,6 +65,29 @@ transport 发生 fatal read error 时，`Wait` 返回原始错误。实现了
 `RebindableTransport` 的传输可通过 `Node.Rebind` 切换底层网络并触发
 lighthouse update 和 punch。
 
+## 进程内管理 API
+
+公共管理能力是 `Node` 上的 typed Go API：`Snapshot` 和 `Err` 查询节点生命周期、
+地址、证书、transport 与 fatal error；`Peers` 和 `Peer` 查询握手中或已建立的
+peer；`Discovery` 和 `PeerDiscovery` 查询 lighthouse、advertised endpoint、relay
+及 peer discovery 状态。所有查询结果都是与内部状态脱离的深拷贝，可由调用方安全
+保留或修改；节点关闭后查询返回关闭前最后观测到的状态，不表示连接仍然可用。
+
+`ConnectPeer` 主动建立并等待 peer tunnel；`DisconnectPeer` 和 `DisconnectAll`
+取消握手并关闭选定 tunnel；`RefreshPeer` 主动发起 lighthouse 查询；
+`AdvertiseNow` 重新读取动态 endpoint 并发送 lighthouse update；`Rebind` 切换支持
+rebind 的 transport 后重新广播 endpoint。这些会改变状态或产生网络流量的方法要求
+节点已通过 `Start` 运行，并支持相应的 `context.Context` 取消语义。
+
+本节点是 lighthouse、目标就是 lighthouse，或没有配置 lighthouse 时，相应的
+`RefreshPeer`/`AdvertiseNow` 是成功的 no-op。`EndpointProvider` 调用会被串行化，
+必须遵守传入的 context，且不能同步回调同一节点的 `AdvertiseNow` 或 `Rebind`。
+provider 返回错误时，已配置的固定 endpoint 仍会发送，之后该错误返回给调用方。
+
+管理能力仅供宿主在同一进程内调用，不提供 ctl、HTTP Info API、metrics 或字符串
+命令注册表。identity、CA、virtual/unsafe route 和协议参数不支持运行时替换；需要
+变更时应关闭旧 `Node` 并用新 `Options` 创建节点。
+
 ## TCP、UDP 和 HTTP
 
 `Dial` 和 `DialContext` 支持 `tcp`/`tcp4`/`tcp6` 与

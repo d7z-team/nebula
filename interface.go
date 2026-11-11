@@ -132,16 +132,16 @@ func newPacketEngine(ctx context.Context, c *packetEngineConfig) (*packetEngine,
 	return f, nil
 }
 
-func (f *packetEngine) activate() error {
+func (f *packetEngine) activate() (netip.AddrPort, error) {
 	addr, err := f.outside.LocalAddr()
 	if err != nil {
-		return fmt.Errorf("get datagram transport address: %w", err)
+		return netip.AddrPort{}, fmt.Errorf("get datagram transport address: %w", err)
 	}
 	f.l.Info("Nebula node is active",
 		"networks", f.myVpnNetworks,
 		"transportAddr", addr,
 	)
-	return nil
+	return addr, nil
 }
 
 func (f *packetEngine) run() {

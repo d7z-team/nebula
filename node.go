@@ -20,6 +20,9 @@ var (
 	ErrNodeNotStarted = errors.New("nebula node is not started")
 )
 
+// EndpointProvider supplies the node's current externally reachable transport
+// endpoints. Calls are serialized. A provider must honor ctx and must not
+// synchronously call AdvertiseNow or Rebind on the same Node.
 type EndpointProvider func(context.Context) ([]netip.AddrPort, error)
 
 type HandshakeOptions struct {
@@ -90,18 +93,20 @@ const (
 // Node is an embedded Nebula endpoint backed by a userspace TCP/IP stack.
 // New takes ownership of Options.Transport when it succeeds.
 type Node struct {
-	mu          sync.Mutex
-	workers     sync.WaitGroup
-	state       nodeState
-	ctx         context.Context
-	cancel      context.CancelFunc
-	transport   DatagramTransport
-	netstack    *userNetstack
-	engine      *packetEngine
-	handshake   *handshakeManager
-	connections *connectionManager
-	punchy      *punchManager
-	lighthouse  *lighthouse
+	mu            sync.Mutex
+	workers       sync.WaitGroup
+	state         nodeState
+	ctx           context.Context
+	cancel        context.CancelFunc
+	transport     DatagramTransport
+	netstack      *userNetstack
+	engine        *packetEngine
+	handshake     *handshakeManager
+	connections   *connectionManager
+	punchy        *punchManager
+	lighthouse    *lighthouse
+	virtualAddrs  []netip.Addr
+	transportAddr netip.AddrPort
 }
 
 func New(parent context.Context, options Options) (*Node, error) {
@@ -217,10 +222,12 @@ func New(parent context.Context, options Options) (*Node, error) {
 	}
 	handshake.f = engine
 	lighthouse.ifce = engine
+	transportAddr, _ := options.Transport.LocalAddr()
 	n := &Node{
 		ctx: ctx, cancel: cancel, transport: options.Transport, netstack: netstack,
 		engine: engine, handshake: handshake, connections: connections,
-		punchy: punchy, lighthouse: lighthouse,
+		punchy: punchy, lighthouse: lighthouse, virtualAddrs: cloneAddresses(options.VirtualAddresses),
+		transportAddr: unmapAddrPort(transportAddr),
 	}
 	engine.triggerShutdown = func() { _ = n.Close() }
 	return n, nil
@@ -235,12 +242,14 @@ func (n *Node) Start() error {
 	case nodeClosed:
 		return ErrNodeClosed
 	}
-	if err := n.engine.activate(); err != nil {
+	transportAddr, err := n.engine.activate()
+	if err != nil {
 		n.state = nodeClosed
 		n.cancel()
 		_ = n.engine.Close()
 		return err
 	}
+	n.transportAddr = unmapAddrPort(transportAddr)
 	n.state = nodeStarted
 	n.punchy.configure(n.ctx, n.engine, n.engine.hostMap, n.lighthouse)
 	n.workers.Go(func() { n.handshake.Run(n.ctx) })
@@ -339,6 +348,11 @@ func (n *Node) Rebind() error {
 	if err := rebindable.Rebind(); err != nil {
 		return err
 	}
+	if addr, err := n.transport.LocalAddr(); err == nil {
+		n.mu.Lock()
+		n.transportAddr = unmapAddrPort(addr)
+		n.mu.Unlock()
+	}
 	n.engine.rebindEpoch.Add(1)
 	n.lighthouse.SendUpdate()
 	return nil
@@ -352,6 +366,9 @@ func (n *Node) requireStarted() error {
 	}
 	if n.state != nodeStarted {
 		return ErrNodeNotStarted
+	}
+	if n.ctx.Err() != nil {
+		return ErrNodeClosed
 	}
 	return nil
 }

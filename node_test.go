@@ -620,6 +620,7 @@ func TestNodeFatalTransportAndRebind(t *testing.T) {
 	fatalErr := errors.New("injected transport failure")
 	transport.failures <- fatalErr
 	require.ErrorIs(t, node.Wait(), fatalErr)
+	require.ErrorIs(t, node.Err(), fatalErr)
 	require.ErrorIs(t, node.Context().Err(), context.Canceled)
 	require.NoError(t, node.Close())
 }

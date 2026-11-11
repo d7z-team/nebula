@@ -54,6 +54,7 @@ type lighthouse struct {
 
 	updateTrigger chan struct{}
 	queryChan     chan netip.Addr
+	updateGate    chan struct{}
 
 	l *slog.Logger
 }
@@ -84,8 +85,10 @@ func newLightHouse(ctx context.Context, l *slog.Logger, cs *certificateState, p 
 		endpointProvider:   cfg.endpointProvider,
 		updateTrigger:      make(chan struct{}, 1),
 		queryChan:          make(chan netip.Addr, cfg.queryBuffer),
+		updateGate:         make(chan struct{}, 1),
 		l:                  l,
 	}
+	h.updateGate <- struct{}{}
 	h.lighthouses = cfg.lighthouses
 	h.advertiseAddrs = cfg.advertiseAddrs
 	h.relaysForMe = cfg.relays
@@ -161,6 +164,7 @@ func (lh *lighthouse) Query(vpnAddr netip.Addr) *remoteList {
 // QueryServer is asynchronous and non-blocking, no reply should be expected.
 // If the query channel is full, the query is dropped.
 func (lh *lighthouse) QueryServer(vpnAddr netip.Addr) {
+	vpnAddr = vpnAddr.Unmap()
 	// Don't put lighthouse addrs in the query channel because we can't query lighthouses about lighthouses
 	if lh.amLighthouse || lh.IsLighthouseAddr(vpnAddr) {
 		return
@@ -169,6 +173,31 @@ func (lh *lighthouse) QueryServer(vpnAddr netip.Addr) {
 	select {
 	case lh.queryChan <- vpnAddr:
 	default:
+	}
+}
+
+// queryServerContext queues a query without the best-effort dropping used by
+// the data path. It returns once the query is queued; it does not wait for a
+// lighthouse response.
+func (lh *lighthouse) queryServerContext(ctx context.Context, vpnAddr netip.Addr) error {
+	vpnAddr = vpnAddr.Unmap()
+	if lh.amLighthouse || lh.IsLighthouseAddr(vpnAddr) || len(lh.GetLighthouses()) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lh.ctx.Err() != nil {
+		return ErrNodeClosed
+	}
+
+	select {
+	case lh.queryChan <- vpnAddr:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-lh.ctx.Done():
+		return ErrNodeClosed
 	}
 }
 
@@ -438,33 +467,85 @@ func (lh *lighthouse) TriggerUpdate() {
 }
 
 func (lh *lighthouse) SendUpdate() {
+	if err := lh.sendUpdateContext(lh.ctx); err != nil && lh.ctx.Err() == nil {
+		lh.l.Warn("lighthouse update failed", "error", err)
+	}
+}
+
+func (lh *lighthouse) sendUpdateContext(ctx context.Context) error {
+	if lh.amLighthouse || len(lh.GetLighthouses()) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lh.ctx.Err() != nil {
+		return ErrNodeClosed
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-lh.ctx.Done():
+		return ErrNodeClosed
+	case <-lh.updateGate:
+	}
+	defer func() { lh.updateGate <- struct{}{} }()
+
 	var v4 []*V4AddrPort
 	var v6 []*V6AddrPort
+	var providerErr error
 
 	for _, e := range lh.GetAdvertiseAddrs() {
-		if e.Addr().Is4() {
-			v4 = append(v4, netAddrToProtoV4AddrPort(e.Addr(), e.Port()))
+		if !e.IsValid() {
+			continue
+		}
+		addr := e.Addr().Unmap()
+		if addr.Is4() {
+			v4 = append(v4, netAddrToProtoV4AddrPort(addr, e.Port()))
 		} else {
-			v6 = append(v6, netAddrToProtoV6AddrPort(e.Addr(), e.Port()))
+			v6 = append(v6, netAddrToProtoV6AddrPort(addr, e.Port()))
 		}
 	}
 
 	if lh.endpointProvider != nil {
-		endpoints, err := lh.endpointProvider(lh.ctx)
+		providerCtx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(lh.ctx, cancel)
+		endpoints, err := lh.endpointProvider(providerCtx)
+		stop()
+		cancel()
 		if err != nil {
-			lh.l.Warn("endpoint provider failed", "error", err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if lh.ctx.Err() != nil {
+				return ErrNodeClosed
+			}
+			providerErr = fmt.Errorf("get advertised endpoints: %w", err)
 		} else {
 			for _, endpoint := range endpoints {
-				if !endpoint.IsValid() || lh.myVpnNetworksTable.Contains(endpoint.Addr()) {
+				if !endpoint.IsValid() {
 					continue
 				}
-				if endpoint.Addr().Is4() {
-					v4 = append(v4, netAddrToProtoV4AddrPort(endpoint.Addr(), endpoint.Port()))
+				addr := endpoint.Addr().Unmap()
+				if lh.myVpnNetworksTable.Contains(addr) {
+					continue
+				}
+				if addr.Is4() {
+					v4 = append(v4, netAddrToProtoV4AddrPort(addr, endpoint.Port()))
 				} else {
-					v6 = append(v6, netAddrToProtoV6AddrPort(endpoint.Addr(), endpoint.Port()))
+					v6 = append(v6, netAddrToProtoV6AddrPort(addr, endpoint.Port()))
 				}
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lh.ctx.Err() != nil {
+		return ErrNodeClosed
 	}
 
 	nb := make([]byte, 12, 12)
@@ -475,6 +556,12 @@ func (lh *lighthouse) SendUpdate() {
 	lighthouses := lh.GetLighthouses()
 
 	for _, lhVpnAddr := range lighthouses {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if lh.ctx.Err() != nil {
+			return ErrNodeClosed
+		}
 		var v cert.Version
 		hi := lh.ifce.GetHostInfo(lhVpnAddr)
 		if hi != nil {
@@ -558,6 +645,13 @@ func (lh *lighthouse) SendUpdate() {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lh.ctx.Err() != nil {
+		return ErrNodeClosed
+	}
+	return providerErr
 }
 
 type lighthouseHandler struct {

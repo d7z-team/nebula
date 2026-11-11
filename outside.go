@@ -237,23 +237,35 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 	}
 }
 
-// closeTunnel closes a tunnel locally, it does not send a closeTunnel packet to the remote
-func (f *packetEngine) closeTunnel(hostInfo *hostInfo) {
+// closeTunnel closes a tunnel locally, it does not send a closeTunnel packet to the remote.
+// It reports false when another goroutine already removed this exact tunnel.
+func (f *packetEngine) closeTunnel(hostInfo *hostInfo) bool {
 	// Hold the hostmap lock across both the delete and the lighthouse eviction,
 	// to avoid a race with handshake completion.
 	f.hostMap.Lock()
 	defer f.hostMap.Unlock()
+	if f.hostMap.Indexes[hostInfo.localIndexId] != hostInfo {
+		return false
+	}
 	if !f.hostMap.unlockedDeleteHostInfo(hostInfo) {
-		return
+		return true
 	}
 
 	// We no longer have any tunnels with this vpn addr, clear learned lighthouse state to lower memory usage
 	f.lightHouse.DeleteVpnAddrs(hostInfo.vpnAddrs)
+	return true
 }
 
 // sendCloseTunnel is a helper function to send a proper close tunnel packet to a remote
 func (f *packetEngine) sendCloseTunnel(h *hostInfo) {
 	f.send(header.CloseTunnel, 0, h.connectionState, h, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
+}
+
+// sendCloseTunnelWithRoute uses a route captured before local tunnel removal.
+// Removal may disestablish the relay maps, but the immutable relay value and
+// hostInfo remain safe for this final best-effort protocol notification.
+func (f *packetEngine) sendCloseTunnelWithRoute(h *hostInfo, remote netip.AddrPort, relayHostInfo *hostInfo, relayRoute *relay) {
+	f.sendEncryptedWithRoute(header.CloseTunnel, 0, h.connectionState, h, remote, relayHostInfo, relayRoute, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
 }
 
 func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
