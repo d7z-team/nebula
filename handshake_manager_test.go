@@ -8,7 +8,6 @@ import (
 
 	"github.com/flynn/noise"
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	ct "github.com/slackhq/nebula/cert_test"
 	"github.com/slackhq/nebula/handshake"
@@ -277,7 +276,6 @@ func TestBlocklistedHandshakeLogLevelAndCounter(t *testing.T) {
 	pki.cs.Store(&CertState{initiatingVersion: cert.Version2, v2Credential: responderCredential})
 	pki.caPool.Store(pool)
 	hm := NewHandshakeManager(logger, nil, nil, nil, defaultHandshakeConfig)
-	hm.metricRejectedBlocklisted = metrics.NewCounter()
 	hm.f = &Interface{pki: pki, l: logger}
 	via := ViaSender{UdpAddr: netip.MustParseAddrPort("198.51.100.7:4242")}
 
@@ -285,13 +283,11 @@ func TestBlocklistedHandshakeLogLevelAndCounter(t *testing.T) {
 	entry := findEntry(t, handler.entries, "Failed to process handshake packet")
 	assert.Equal(t, slog.LevelDebug, entry.Level)
 	require.ErrorIs(t, entry.Attrs["error"].(error), cert.ErrBlockListed)
-	assert.Equal(t, int64(1), hm.metricRejectedBlocklisted.Count())
 
 	handler.entries = nil
 	hm.beginHandshake(via, nil, nil)
 	entry = findEntry(t, handler.entries, "Failed to process handshake packet")
 	assert.Equal(t, slog.LevelError, entry.Level)
-	assert.Equal(t, int64(1), hm.metricRejectedBlocklisted.Count())
 
 	// The initiator sees the same rejection in continueHandshake, after a
 	// responder has accepted its first packet and sent a valid reply.
@@ -311,7 +307,6 @@ func TestBlocklistedHandshakeLogLevelAndCounter(t *testing.T) {
 	pool.BlocklistFingerprint(responderFingerprint)
 
 	initiatingHM := NewHandshakeManager(logger, nil, nil, nil, defaultHandshakeConfig)
-	initiatingHM.metricRejectedBlocklisted = metrics.NewCounter()
 	initiatingHM.f = &Interface{l: logger}
 	hh := &HandshakeHostInfo{
 		machine:  initiator,
@@ -320,7 +315,6 @@ func TestBlocklistedHandshakeLogLevelAndCounter(t *testing.T) {
 	initiatingHM.indexes[1] = hh
 	via.IsRelayed = true // skip the remote allow list before certificate validation
 	initiatingHM.continueHandshake(via, hh, response)
-	assert.Equal(t, int64(1), initiatingHM.metricRejectedBlocklisted.Count())
 }
 
 // Test_PendingHandshakeHasRemotes covers create-tunnel -address: a pending hostinfo must already

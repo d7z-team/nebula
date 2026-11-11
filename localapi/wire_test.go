@@ -144,8 +144,7 @@ func TestWireRecoversOnPlainReloadAfterBadBind(t *testing.T) {
 }
 
 // TestWireControlCanBeDisabled: local_api.control.enabled false serves no socket, and
-// the key follows reloads both ways. With the control socket off, its path is free for
-// the info API to use.
+// the key follows reloads both ways.
 func TestWireControlCanBeDisabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -159,8 +158,6 @@ func TestWireControlCanBeDisabled(t *testing.T) {
 	require.NoError(t, c.LoadString(section(false)))
 	srv := WireControl(ctx, test.NewLogger(), c, basicRegistry())
 	t.Cleanup(srv.Stop)
-	info := WireInfo(ctx, test.NewLogger(), c, stubInfoHandler())
-	t.Cleanup(info.Stop)
 	assert.Empty(t, srv.Path())
 	_, err := os.Lstat(path)
 	assert.True(t, os.IsNotExist(err), "no socket is bound")
@@ -176,48 +173,4 @@ func TestWireControlCanBeDisabled(t *testing.T) {
 	_, err = os.Lstat(path)
 	assert.True(t, os.IsNotExist(err), "the socket is removed")
 
-	require.NoError(t, c.ReloadConfigString(section(false)+fmt.Sprintf("  info:\n    enabled: true\n    socket: %s\n", path)).Err)
-	assert.Equal(t, path, info.Path(), "a disabled control socket does not hold its path")
-}
-
-// TestWireRefusesOnePathForBothAPIs: a config that gives the control socket and the info
-// API one path is refused by both sides, from the configured paths, so it is caught
-// however the binds would have ordered themselves. Moving one off the path on a reload
-// brings both up.
-func TestWireRefusesOnePathForBothAPIs(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	section := func(ctl, info string) string {
-		return fmt.Sprintf("local_api:\n  control:\n    socket: %s\n  info:\n    enabled: true\n    socket: %s\n", ctl, info)
-	}
-	shared := testSocket(t)
-	c := config.NewC(test.NewLogger())
-	require.NoError(t, c.LoadString(section(shared, shared)))
-
-	ctl := WireControl(ctx, test.NewLogger(), c, basicRegistry())
-	t.Cleanup(ctl.Stop)
-	info := WireInfo(ctx, test.NewLogger(), c, stubInfoHandler())
-	t.Cleanup(info.Stop)
-	assert.Empty(t, ctl.Path(), "the control socket does not take the info API's path")
-	assert.Empty(t, info.Path(), "the info API does not take the control socket's path")
-
-	// The same node spelled differently is the same node.
-	doubled := filepath.Join(filepath.Dir(shared), "") + "//" + filepath.Base(shared)
-	require.NoError(t, c.ReloadConfigString(section(shared, doubled)).Err)
-	assert.Empty(t, ctl.Path())
-	assert.Empty(t, info.Path())
-	_, err := os.Stat(shared)
-	assert.True(t, os.IsNotExist(err), "neither side bound the shared path")
-
-	// A reload that moves the control socket onto the info API's path is refused the same
-	// way, and the control socket keeps the one it has.
-	other := testSocket(t)
-	require.NoError(t, c.ReloadConfigString(section(other, shared)).Err)
-	require.Equal(t, other, ctl.Path())
-	require.Equal(t, shared, info.Path())
-
-	require.NoError(t, c.ReloadConfigString(section(shared, shared)).Err)
-	assert.Equal(t, other, ctl.Path(), "a move onto the info API's path keeps the current socket")
-	assert.Equal(t, shared, info.Path())
 }

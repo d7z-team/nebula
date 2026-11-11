@@ -471,7 +471,7 @@ func TestSamePathIsExactOnceCleaned(t *testing.T) {
 
 // TestAccessChangedCountsTheMode: both the mode and the group are the socket node's.
 func TestAccessChangedCountsTheMode(t *testing.T) {
-	g := Group{name: "nebula", id: "1234"}
+	g := accessGroup{name: "nebula", id: "1234"}
 	assert.True(t, accessChanged(Access{mode: 0660, group: g}, Access{mode: 0666, group: g}))
 	assert.True(t, accessChanged(Access{mode: 0660, group: g}, Access{mode: 0660}))
 	assert.False(t, accessChanged(Access{mode: 0660, group: g}, Access{mode: 0660, group: g}))

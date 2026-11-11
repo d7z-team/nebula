@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"strings"
 	"time"
@@ -87,18 +86,6 @@ func listenRefused(path string, admin bool, err error) error {
 // case insensitive, so the comparison is too.
 func isProtectedPath(path string) bool {
 	return len(path) > len(protectedPrefix) && strings.EqualFold(path[:len(protectedPrefix)], protectedPrefix)
-}
-
-// warnUnprotectedName warns that a pipe name outside protectedPrefix is one any local
-// account could have created first and be answering on. A program reading the info API
-// opens the pipe by name and has no owner check of its own; the daemon refuses to serve
-// a held name and logs it, but the program cannot tell.
-func warnUnprotectedName(l *slog.Logger, path string) {
-	if isProtectedPath(path) {
-		return
-	}
-	l.Warn("Local info API is served on a pipe name any local account could create first and answer in the daemon's place; name it under the protected prefix",
-		"path", path, "prefix", protectedPrefix)
 }
 
 // isAdministrator says whether this process holds Administrators as an enabled group,

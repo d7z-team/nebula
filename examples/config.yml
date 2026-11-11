@@ -208,12 +208,8 @@ punchy:
 # This setting is reloadable.
 #preferred_ranges: ["172.16.0.0/24"]
 
-# Local APIs allow accessing running nebula state.
+# The local control API allows accessing running nebula state.
 #local_api:
-  # There are two types of sockets available: a control socket intended for use on the
-  # local machine, primarily for debugging, and an info socket intended to make
-  # nebula's internal state available to other consumers.
-  #
   # The control socket is made available by default, and can be accessed via
   # `nebula ctl <command>`. It defaults to /var/run/nebula/ctl.sock on Linux, macOS and
   # the BSDs; on Windows it is a named pipe under \\.\pipe\ProtectedPrefix\Administrators.
@@ -229,40 +225,6 @@ punchy:
     # added takes effect after a restart, and one removed or changed stops the socket
     # until nebula is restarted.
     #group: nebula
-
-  # The info socket is not made available by default. If you enable it, it makes some
-  # internal state available over HTTP.
-  #
-  # The currently supported HTTP requests are:
-  #   GET /v1/identity                            this node's identity
-  #   GET /v1/identity/<vpn addr>[:port]          the host owning the address; the port
-  #                                               is ignored. 404 when no tunnel is
-  #                                               up or the address is outside this
-  #                                               node's networks.
-  #   GET /v1/identity/<vpn addr>[:port]/pem      that host's certificate, PEM encoded,
-  #                                               as {"pem": ...}; GET /v1/identity/pem
-  #                                               is this node's.
-  #   Add ?pretty to any of them to indent the JSON.
-  #
-  # NB: unless a connection arrived on the nebula interface, there's no guarantee
-  # that the identity returned belongs to the sender. An address in an overlay network
-  # this node does not hold is never answered, since nebula cannot make that guarantee
-  # for it, even with a tunnel to its holder up.
-  #
-  #info:
-    #enabled: false
-    # The absolute path to listen on, or a full pipe name on Windows. Name a pipe under
-    # \\.\pipe\ProtectedPrefix\Administrators\.
-    #socket: /var/run/nebula/info.sock
-    # A group (or account/group/SID on Windows) that should be allowed to access the
-    # socket. On Windows a group cannot be changed while the socket is served: a group
-    # added takes effect after a restart, and one removed or changed stops the socket
-    # until nebula is restarted.
-    #group: nebula-info
-    # Octal mode for the socket, as a quoted string. Defaults to "0600" unless a
-    # group is set, in which case it defaults to "0660". On Windows a pipe has no
-    # mode and this is ignored.
-    #socket_mode: "0660"
 
 # EXPERIMENTAL: relay support for networks that can't establish direct connections.
 relay:
@@ -416,34 +378,6 @@ logging:
   #disable_timestamp: true
   # Timestamps use RFC3339Nano ("2006-01-02T15:04:05.999999999Z07:00") and are not configurable.
 
-# The stats section is reloadable. A HUP may change the backend, toggle stats
-# on or off, switch the listen/host address, or pick up new DNS for the
-# configured graphite host.
-#stats:
-  #type: graphite
-  #prefix: nebula
-  #protocol: tcp
-  #host: 127.0.0.1:9999
-  #interval: 10s
-
-  #type: prometheus
-  #listen: 127.0.0.1:8080
-  #path: /metrics
-  #namespace: prometheusns
-  #subsystem: nebula
-  #interval: 10s
-
-  # enables counter metrics for meta packets
-  #   e.g.: `messages.tx.handshake`
-  # NOTE: `message.{tx,rx}.recv_error` is always emitted
-  # Not reloadable.
-  #message_metrics: false
-
-  # enables detailed counter metrics for lighthouse packets
-  #   e.g.: `lighthouse.rx.HostQuery`
-  # Not reloadable.
-  #lighthouse_metrics: false
-
 # Handshake Manager Settings
 #handshakes:
   # Handshakes are sent to all known addresses at each interval with a linear backoff,
@@ -453,7 +387,7 @@ logging:
   #try_interval: 100ms
   #retries: 20
 
-  # query_buffer is the size of the buffer channel for querying lighthouses, drops are recorded in the lighthouse.query.dropped metric.
+  # query_buffer is the size of the buffer channel for querying lighthouses.
   # Not reloadable.
   #query_buffer: 1024
 

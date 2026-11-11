@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/config"
 	"golang.org/x/sys/unix"
 )
@@ -100,31 +99,10 @@ func (u *StdConn) prepareGRO() {
 	err := unix.SetsockoptInt(u.sysFd, unix.IPPROTO_UDP, unix.UDP_GRO, 1)
 	if err != nil {
 		u.l.Info("udp: GRO disabled", "reason", "kernel rejected probe", "error", err)
-		recordCapability("udp.gro.enabled", false)
 		return
 	}
 	u.groSupported = true
 	u.l.Info("udp: GRO enabled")
-	recordCapability("udp.gro.enabled", true)
-}
-
-// recordCapability registers (or updates) a boolean gauge for one of the
-// kernel-feature probes. Gauges go to 1 when the feature is enabled, 0 when
-// it is not — dashboards can show degraded state on partially-supported
-// kernels at a glance. Calling repeatedly with the same name updates the
-// existing gauge rather than registering a duplicate.
-//
-// Caveat: the gauge is process-global while the capability state it reports
-// is per-socket. With multiple listen routines the last probe wins, and a
-// runtime downgrade on one socket (e.g. the GSO EIO disable) flips the gauge
-// for all of them. Treat it as "at least one socket looks like this."
-func recordCapability(name string, enabled bool) {
-	g := metrics.GetOrRegisterGauge(name, nil)
-	if enabled {
-		g.Update(1)
-	} else {
-		g.Update(0)
-	}
 }
 
 func (u *StdConn) SupportsMultipleReaders() bool {
@@ -465,15 +443,6 @@ func (u *StdConn) ReloadConfig(c *config.C, r *config.Reload) {
 	}
 }
 
-func (u *StdConn) getMemInfo(meminfo *[unix.SK_MEMINFO_VARS]uint32) error {
-	var vallen uint32 = 4 * unix.SK_MEMINFO_VARS
-	_, _, err := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(u.sysFd), uintptr(unix.SOL_SOCKET), uintptr(unix.SO_MEMINFO), uintptr(unsafe.Pointer(meminfo)), uintptr(unsafe.Pointer(&vallen)), 0)
-	if err != 0 {
-		return err
-	}
-	return nil
-}
-
 // Shutdown wakes the reader without releasing the fd, Close only once it has exited
 func (u *StdConn) Shutdown() error {
 	u.closed.Store(true)
@@ -485,36 +454,4 @@ func (u *StdConn) Shutdown() error {
 func (u *StdConn) Close() error {
 	_ = u.Shutdown()
 	return unix.Close(u.sysFd)
-}
-
-func NewUDPStatsEmitter(udpConns []Conn) func() {
-	// Check if our kernel supports SO_MEMINFO before registering the gauges
-	var udpGauges [][unix.SK_MEMINFO_VARS]metrics.Gauge
-	var meminfo [unix.SK_MEMINFO_VARS]uint32
-	if err := udpConns[0].(*StdConn).getMemInfo(&meminfo); err == nil {
-		udpGauges = make([][unix.SK_MEMINFO_VARS]metrics.Gauge, len(udpConns))
-		for i := range udpConns {
-			udpGauges[i] = [unix.SK_MEMINFO_VARS]metrics.Gauge{
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.rmem_alloc", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.rcvbuf", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.wmem_alloc", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.sndbuf", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.fwd_alloc", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.wmem_queued", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.optmem", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.backlog", i), nil),
-				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.drops", i), nil),
-			}
-		}
-	}
-
-	return func() {
-		for i, gauges := range udpGauges {
-			if err := udpConns[i].(*StdConn).getMemInfo(&meminfo); err == nil {
-				for j := range unix.SK_MEMINFO_VARS {
-					gauges[j].Update(int64(meminfo[j]))
-				}
-			}
-		}
-	}
 }

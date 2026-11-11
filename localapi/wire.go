@@ -4,42 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net/http"
 
 	"github.com/slackhq/nebula/commands"
 	"github.com/slackhq/nebula/config"
 )
-
-// Endpoints holds all local endpoints.
-type Endpoints struct {
-	Control *Server
-	Info    *InfoServer
-}
-
-// Stop closes both endpoints and removes their sockets.
-func (e *Endpoints) Stop() {
-	e.Info.Stop()
-	e.Control.Stop()
-}
-
-// Wire brings up the local APIs for a running nebula: WireControl with reg and WireInfo
-// with info, which are what the two sockets each need. The daemon entry points want
-// both, so this is one call and one Stop for them; an embedder that wants one socket
-// alone calls that one's function.
-//
-// Every entry point that runs nebula as a daemon calls this, so the endpoints behave the
-// same whether nebula was started from a shell or by a service manager. It deliberately
-// does not live in nebula.Main: the control socket is on by default, so an embedder
-// inside an app sandbox would have to know to turn off a socket it cannot use. Wiring it
-// at the daemon entry points means embedders get the command registry and no listener.
-//
-// Call it after Control.Start, so the listeners only exist once the interface is up.
-func Wire(ctx context.Context, l *slog.Logger, c *config.C, reg *commands.Registry, info http.Handler) *Endpoints {
-	return &Endpoints{
-		Control: WireControl(ctx, l, c, reg),
-		Info:    WireInfo(ctx, l, c, info),
-	}
-}
 
 // WireControl brings up the control socket, serving reg, and keeps it following the
 // config across reloads: pointed at the configured path, or down when the config turns
@@ -51,37 +19,6 @@ func Wire(ctx context.Context, l *slog.Logger, c *config.C, reg *commands.Regist
 // daemon's place, and that is logged as an error.
 func WireControl(ctx context.Context, l *slog.Logger, c *config.C, reg *commands.Registry) *Server {
 	return wireControl(ctx, l.With("subsystem", "localapi"), c, reg)
-}
-
-// WireInfo brings up the info API when the config asks for one, serving h, the daemon's
-// handler for it (Control.InfoHandler), and keeps it following the config across
-// reloads: enabling it, disabling it, moving its socket and changing its mode.
-func WireInfo(ctx context.Context, l *slog.Logger, c *config.C, h http.Handler) *InfoServer {
-	return wireInfo(ctx, l.With("subsystem", "localapi"), c, h)
-}
-
-// sharedSocketPath reports the path the config gives to both the control socket and the
-// info API, when it gives them one path. The two speak different protocols, so neither
-// binds it: each side says so and leaves it, and the operator fixes the config. The
-// configured paths are compared, not the ones being served, so the case is caught on
-// whichever side reconciles first, when the other side's bind has failed, and when a
-// reload moves one socket onto the other's path.
-func sharedSocketPath(c *config.C) (string, bool) {
-	if !ControlEnabled(c) {
-		return "", false
-	}
-
-	ctl, err := SocketPathFromConfig(c)
-	if err != nil {
-		return "", false
-	}
-
-	info, err := infoConfigFrom(c)
-	if err != nil || !info.Enabled || !samePath(info.Path, ctl) {
-		return "", false
-	}
-
-	return ctl, true
 }
 
 // wireControl brings up the control socket and keeps it pointed at the configured path.
@@ -124,12 +61,6 @@ func controlReconciler(ctx context.Context, l *slog.Logger, c *config.C, srv *Se
 		acc, err := controlAccessFrom(c)
 		if err != nil {
 			warnUnusable(l, "local control socket", srv.Path(), err)
-			return
-		}
-
-		if p, shared := sharedSocketPath(c); shared {
-			l.Warn("Local control socket is configured on the info API's socket path and will not bind it",
-				"path", p, "current", srv.Path(), "fix", "set "+InfoSocketKey+" to another path")
 			return
 		}
 
@@ -192,54 +123,6 @@ func reportRebind(l *slog.Logger, what, old, want string, err error, now string)
 	default:
 		level("Could not bind the "+what+" at the requested path", "error", err, "requested", want, "serving", now)
 	}
-}
-
-// wireInfo brings up the info API when the config asks for one and follows the config
-// across reloads: enabling it, disabling it, moving its socket and changing its mode.
-//
-// Every reload is reconciled, as the control socket's is; see controlReconciler. A
-// section that does not parse keeps whatever is running: the operator is told, and the
-// programs relying on the endpoint are not cut off by a typo.
-func wireInfo(ctx context.Context, l *slog.Logger, c *config.C, h http.Handler) *InfoServer {
-	srv := NewInfoServer(l, h)
-
-	reconcile := func(c *config.C) {
-		cfg, err := infoConfigFrom(c)
-		if err != nil {
-			warnUnusable(l, "local info API", srv.Path(), err)
-			return
-		}
-
-		if !cfg.Enabled {
-			if srv.Path() != "" {
-				srv.Stop()
-				l.Info("Stopped the local info API, it is disabled in the reloaded config")
-			}
-			return
-		}
-
-		// The two endpoints speak different protocols; one socket cannot be both. Caught
-		// here, from the configured paths, because listen's own answer, that the socket is
-		// in use by another nebula, would send the operator looking for a second process.
-		if p, shared := sharedSocketPath(c); shared {
-			if cur := srv.Path(); cur != "" {
-				l.Warn("Ignoring the local info API's new socket path, it is also the control socket's; keeping the current endpoint",
-					"path", p, "current", cur, "fix", "set "+InfoSocketKey+" to another path")
-			} else {
-				l.Warn("Local info API is not available, its socket path is also the control socket's", "path", p, "fix", "set "+InfoSocketKey+" to another path")
-			}
-			return
-		}
-
-		old := srv.Path()
-		err = srv.Rebind(ctx, cfg.Path, cfg.Access)
-		reportRebind(l, "local info API", old, cfg.Path, err, srv.Path())
-	}
-
-	// Registered before the first attempt, as the control socket's is; see wireControl.
-	onReload(l, c, "local info API", reconcile)
-	reconcile(c)
-	return srv
 }
 
 // errEndpointHeld is returned by listen when the endpoint's name is already held by

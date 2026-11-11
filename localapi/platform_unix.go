@@ -5,7 +5,6 @@ package localapi
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/user"
@@ -50,8 +49,7 @@ var currentUID = func() uint32 { return uint32(os.Geteuid()) }
 // looser than and which are set after bind: connect(2) needs write permission on the
 // socket file on every unix we build for. The control socket is 0600 and adds the peer
 // check the server applies on accept, unless a group shares it, in which case it is
-// 0660 with that group and the kernel's check is the whole of it; the info socket is
-// whatever the operator configured, since opening it to others is its purpose.
+// 0660 with that group and the kernel's check is the whole of it.
 //
 // The directory is not part of that, and is never chmoded: a directory a service manager made for us is served from at whatever mode it
 // came with (systemd's RuntimeDirectoryMode= is 0755 by default), and one an operator
@@ -138,8 +136,8 @@ func listen(path string, acc Access) (net.Listener, error) {
 // vouched for the directory at bind, but that was then: a directory loosened since, or a
 // reload that moves the socket, is a chance for whoever can write it to replace the node
 // with a link, or a hard link to a file of their choosing, and have a root daemon set the
-// configured mode, 0660 or 0666 for an info socket, on that file. A link, another type
-// of file, or somebody else's socket is reported and left as it is. applyAccess, per
+// configured mode on that file. A link, another type of file, or somebody else's socket
+// is reported and left as it is. applyAccess, per
 // platform, is what makes the look and the change land on the same node.
 func checkOwnSocket(path string, fi os.FileInfo) error {
 	if !isSocket(fi) {
@@ -322,10 +320,6 @@ func pathTooLong(path string) bool { return len(path) > maxSocketPath }
 // create, as the tun device is root's to open; a daemon run as anyone else names a path
 // of its own with CtlSocketKey.
 const DefaultSocketPath = "/var/run/" + DirName + "/ctl.sock"
-
-// warnUnprotectedName is for windows pipe names; a unix socket's directory is checked
-// instead.
-func warnUnprotectedName(*slog.Logger, string) {}
 
 // samePath reports whether two configured socket paths name one node: cleaned, so a
 // doubled separator or a trailing one does not hide the match, and otherwise exact,

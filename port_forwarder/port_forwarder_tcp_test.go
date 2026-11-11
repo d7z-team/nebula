@@ -5,7 +5,6 @@ import (
 	"net"
 	"testing"
 
-	"github.com/slackhq/nebula/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -101,7 +100,7 @@ func tcpListenerNAccept(t *testing.T, listener *net.TCPListener, n int) <-chan n
 }
 
 func TestTcpInOut2Clients(t *testing.T) {
-	server, sl, client, cl := service.CreateTwoConnectedServices(t, 4247)
+	server, sl, client, cl := createTwoConnectedServices(t, 4247)
 
 	server_pf, err := createPortForwarderFromConfigString(t, sl, server, `
 port_forwarding:
@@ -169,7 +168,7 @@ port_forwarding:
 }
 
 func TestTcpInOut1ClientConfigReload(t *testing.T) {
-	server, sl, client, cl := service.CreateTwoConnectedServices(t, 4246)
+	server, sl, client, cl := createTwoConnectedServices(t, 4246)
 
 	server_pf, err := createPortForwarderFromConfigString(t, sl, server, `
 port_forwarding:
@@ -264,7 +263,7 @@ port_forwarding:
 }
 
 func TestTcpInOut1ClientConfigReload_inverseCloseOrder(t *testing.T) {
-	server, sl, client, cl := service.CreateTwoConnectedServices(t, 4245)
+	server, sl, client, cl := createTwoConnectedServices(t, 4245)
 
 	server_pf, err := createPortForwarderFromConfigString(t, sl, server, `
 port_forwarding:

@@ -17,24 +17,13 @@ import (
 // Only built in this package, to maintain control of validity.
 type Access struct {
 	mode  os.FileMode
-	group Group
+	group accessGroup
 }
 
-// Socket mode on unix, useless on windows.
-func (a Access) Mode() os.FileMode { return a.mode }
-
-// Group that shares API access; Group{} if there isn't one.
-func (a Access) Group() Group { return a.group }
-
-type Group struct {
+type accessGroup struct {
 	name string
 	id   string
 }
-
-func (g Group) Name() string { return g.name }
-
-// gid on unix, SID on windows.
-func (g Group) ID() string { return g.id }
 
 const (
 	// ownerOnlyMode is a socket's mode when no group shares it: the account nebula runs
@@ -70,20 +59,20 @@ func (a Access) String() string {
 	return fmt.Sprintf("%s group %s (%s)", modeString(a.mode), a.group.name, a.group.id)
 }
 
-// groupFromConfig reads the group a key names, the zero Group when it names none. The
+// groupFromConfig reads the group a key names, the zero value when it names none. The
 // name is resolved here, when the config is read, so a group that does not exist is a
 // config error reported with the key rather than a bind that fails later.
-func groupFromConfig(c interface{ GetString(string, string) string }, key string) (Group, error) {
+func groupFromConfig(c interface{ GetString(string, string) string }, key string) (accessGroup, error) {
 	name := c.GetString(key, "")
 	if name == "" {
-		return Group{}, nil
+		return accessGroup{}, nil
 	}
 
 	id, err := lookupGroupID(name)
 	if err != nil {
-		return Group{}, fmt.Errorf("%s: %w", key, err)
+		return accessGroup{}, fmt.Errorf("%s: %w", key, err)
 	}
-	return Group{name: name, id: id}, nil
+	return accessGroup{name: name, id: id}, nil
 }
 
 func modeString(m os.FileMode) string {

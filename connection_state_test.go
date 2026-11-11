@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/flynn/noise"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	ct "github.com/slackhq/nebula/cert_test"
 	"github.com/slackhq/nebula/handshake"
@@ -107,33 +106,31 @@ func TestConnectionState_NextMessageCounter(t *testing.T) {
 	assert.Equal(t, RejectAfterMessages, cs.messageCounter.Load())
 }
 
-// TestSendNoMetricsDropsExhausted drives the send path to the exhausted drop; metric and out flag prove it.
-func TestSendNoMetricsDropsExhausted(t *testing.T) {
+// TestSendEncryptedDropsExhausted drives the send path to the exhausted drop.
+func TestSendEncryptedDropsExhausted(t *testing.T) {
 	initR, _ := runTestHandshake(t)
 	ci, err := newConnectionStateFromResult(initR)
 	require.NoError(t, err)
 	ci.messageCounter.Store(RejectAfterMessages - 1)
 
-	f := &Interface{l: test.NewLogger(), messageMetrics: &MessageMetrics{txExhausted: metrics.NewCounter()}}
+	f := &Interface{l: test.NewLogger()}
 	hostinfo := &HostInfo{vpnAddrs: []netip.Addr{netip.MustParseAddr("10.0.0.1")}, ConnectionState: ci}
 
-	f.sendNoMetrics(header.Message, 0, ci, hostinfo, netip.AddrPort{}, []byte{}, make([]byte, 12), make([]byte, mtu), 0)
+	f.sendEncrypted(header.Message, 0, ci, hostinfo, netip.AddrPort{}, []byte{}, make([]byte, 12), make([]byte, mtu), 0)
 
-	// The crossing send is refused: it records an exhaustion drop and never reaches connectionManager.Out.
-	assert.Equal(t, int64(1), f.messageMetrics.txExhausted.Count())
+	// The crossing send is refused and never reaches connectionManager.Out.
 	assert.False(t, hostinfo.sentSinceCheck())
 }
 
-// TestSendNoMetricsCloseTunnelKeepsRebindEpoch pins that a closing tunnel does not consume a rebind, a later
+// TestSendEncryptedCloseTunnelKeepsRebindEpoch pins that a closing tunnel does not consume a rebind, a later
 // packet on a re-established tunnel still needs that edge to trigger the far-side punch.
-func TestSendNoMetricsCloseTunnelKeepsRebindEpoch(t *testing.T) {
+func TestSendEncryptedCloseTunnelKeepsRebindEpoch(t *testing.T) {
 	initR, _ := runTestHandshake(t)
 	ci, err := newConnectionStateFromResult(initR)
 	require.NoError(t, err)
 
 	f := &Interface{
 		l:                 test.NewLogger(),
-		messageMetrics:    &MessageMetrics{txExhausted: metrics.NewCounter()},
 		writers:           []udp.Conn{udp.NoopConn{}},
 		connectionManager: &connectionManager{},
 	}
@@ -144,7 +141,7 @@ func TestSendNoMetricsCloseTunnelKeepsRebindEpoch(t *testing.T) {
 	f.rebindEpoch.Add(1)
 
 	remote := netip.MustParseAddrPort("10.0.0.2:4242")
-	f.sendNoMetrics(header.CloseTunnel, 0, ci, hostinfo, remote, []byte{}, make([]byte, 12), make([]byte, mtu), 0)
+	f.sendEncrypted(header.CloseTunnel, 0, ci, hostinfo, remote, []byte{}, make([]byte, 12), make([]byte, mtu), 0)
 
 	// markOut at the new epoch still reports the move, so the edge was preserved.
 	assert.True(t, hostinfo.markOut(1), "a CloseTunnel send must not consume the rebind epoch")
@@ -219,10 +216,9 @@ func TestSendNoMetricsViaRelay(t *testing.T) {
 			hm.Hosts[relayAddr] = relayHI
 			conn := &capturingConn{}
 			f := &Interface{
-				l:              l,
-				hostMap:        hm,
-				messageMetrics: &MessageMetrics{txExhausted: metrics.NewCounter()},
-				writers:        []udp.Conn{conn},
+				l:       l,
+				hostMap: hm,
+				writers: []udp.Conn{conn},
 			}
 			f.connectionManager = &connectionManager{intf: f, relayUsed: map[uint32]struct{}{}, relayUsedLock: &sync.RWMutex{}}
 
@@ -231,7 +227,7 @@ func TestSendNoMetricsViaRelay(t *testing.T) {
 				payload[i] = byte(i)
 			}
 			counter := ci.messageCounter.Load()
-			f.sendNoMetrics(header.Message, 0, ci, hostinfo, netip.AddrPort{}, payload, make([]byte, 12), make([]byte, mtu), 0)
+			f.sendEncrypted(header.Message, 0, ci, hostinfo, netip.AddrPort{}, payload, make([]byte, 12), make([]byte, mtu), 0)
 
 			if !tt.sent {
 				assert.Empty(t, conn.writes)

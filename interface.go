@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/util"
 
 	"github.com/slackhq/nebula/cert"
@@ -43,7 +42,6 @@ type InterfaceConfig struct {
 	DropLocalBroadcast bool
 	DropMulticast      bool
 	routines           int
-	MessageMetrics     *MessageMetrics
 	version            string
 	relayManager       *relayManager
 	punchy             *Punchy
@@ -134,11 +132,6 @@ type Interface struct {
 	fatalErr atomic.Pointer[error]
 	// triggerShutdown is a function that will be run exactly once, when onFatal swaps something non-nil into fatalErr
 	triggerShutdown func()
-
-	metricHandshakes    metrics.Histogram
-	messageMetrics      *MessageMetrics
-	cachedPacketMetrics *cachedPacketMetrics
-	metricTxDropped     metrics.Counter
 
 	l *slog.Logger
 }
@@ -251,14 +244,6 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 		udpRelayTxErrLimiter:  udpRelayTxErrLimiter,
 		txOversizeLimiter:     txOversizeLimiter,
 
-		metricHandshakes: metrics.GetOrRegisterHistogram("handshakes", nil, metrics.NewExpDecaySample(1028, 0.015)),
-		metricTxDropped:  metrics.GetOrRegisterCounter("udp.tx.dropped", nil),
-		messageMetrics:   c.MessageMetrics,
-		cachedPacketMetrics: &cachedPacketMetrics{
-			sent:    metrics.GetOrRegisterCounter("hostinfo.cached_packets.sent", nil),
-			dropped: metrics.GetOrRegisterCounter("hostinfo.cached_packets.dropped", nil),
-		},
-
 		l: c.l,
 	}
 
@@ -321,8 +306,6 @@ func (f *Interface) activate() error {
 		f.routines = len(queues)
 	}
 	f.queues = queues
-
-	metrics.GetOrRegisterGauge("routines", nil).Update(int64(f.routines))
 
 	for i := range f.queues {
 		f.batchers[i] = batch.NewMultiCoalescer(f.queues[i], f.l)
@@ -500,17 +483,12 @@ func (f *Interface) listenIn(queue tio.Queue, i int) {
 	f.l.Debug("overlay reader is done", "reader", i)
 }
 
-// flushSendBatch drains sb to the underlay and accounts for anything it could not deliver. A shortfall means
-// specific destinations were undeliverable (a stale remote, a reject rule), which the backend logs per peer at
-// debug; here it is only a counter, so one unreachable peer cannot spam a log line per batch.
+// flushSendBatch drains sb to the underlay. Specific destinations that could not be
+// delivered are logged by the backend.
 func (f *Interface) flushSendBatch(sb *batch.SendBatch, q int) {
-	queued := sb.Len()
-	written, err := sb.Flush()
+	_, err := sb.Flush()
 	if err != nil {
 		f.l.Error("Failed to write outgoing batch", "error", err, "writer", q)
-	}
-	if dropped := queued - written; dropped > 0 {
-		f.metricTxDropped.Inc(int64(dropped))
 	}
 }
 
@@ -652,33 +630,6 @@ func (f *Interface) reloadMisc(c *config.C) {
 		n := c.GetDuration("timers.requery_wait_duration", defaultReQueryWait)
 		f.reQueryWait.Store(int64(n))
 		f.l.Info("timers.requery_wait_duration has changed")
-	}
-}
-
-// statsEmitter updates the interface's gauges, the stats server runs it on its capture loop.
-func (f *Interface) statsEmitter() func() {
-	udpStats := udp.NewUDPStatsEmitter(f.writers)
-
-	certExpirationGauge := metrics.GetOrRegisterGauge("certificate.ttl_seconds", nil)
-	certInitiatingVersion := metrics.GetOrRegisterGauge("certificate.initiating_version", nil)
-	certMaxVersion := metrics.GetOrRegisterGauge("certificate.max_version", nil)
-
-	return func() {
-		f.firewall.EmitStats()
-		f.handshakeManager.EmitStats()
-		udpStats()
-
-		certState := f.pki.getCertState()
-		defaultCrt := certState.GetDefaultCertificate()
-		certExpirationGauge.Update(int64(defaultCrt.NotAfter().Sub(time.Now()) / time.Second))
-		certInitiatingVersion.Update(int64(defaultCrt.Version()))
-
-		// Report the max certificate version we are capable of using
-		if certState.v2Cert != nil {
-			certMaxVersion.Update(int64(certState.v2Cert.Version()))
-		} else {
-			certMaxVersion.Update(int64(certState.v1Cert.Version()))
-		}
 	}
 }
 

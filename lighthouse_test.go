@@ -814,8 +814,8 @@ func (w *heldEncWriter) GetHostInfo(netip.Addr) *HostInfo {
 	return nil
 }
 
-// QueryServer never waits on the query worker, since the packet readers call it and nothing drains the channel at
-// shutdown; a query that finds the channel full is dropped and counted. The worker is held on its first query so the
+// QueryServer never waits on the query worker, since the packet readers call it and
+// nothing drains the channel at shutdown. The worker is held on its first query so the
 // channel fills.
 func TestLighthouse_QueryServerDoesNotBlock(t *testing.T) {
 	l := test.NewLogger()
@@ -837,7 +837,6 @@ func TestLighthouse_QueryServerDoesNotBlock(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the query worker never took the first query")
 	}
-	dropped := lh.queryDropped.Count()
 	done := make(chan struct{})
 	go func() {
 		lh.QueryServer(netip.MustParseAddr("10.128.0.11"))
@@ -849,7 +848,6 @@ func TestLighthouse_QueryServerDoesNotBlock(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("QueryServer blocked on a full query channel")
 	}
-	assert.EqualValues(t, 1, lh.queryDropped.Count()-dropped)
 }
 
 // hostmapEncWriter answers GetHostInfo from a real hostmap, the way Interface does.

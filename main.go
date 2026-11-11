@@ -210,18 +210,10 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		return nil, util.ContextualizeIfNeeded("Failed to initialize lighthouse handler", err)
 	}
 
-	var messageMetrics *MessageMetrics
-	if c.GetBool("stats.message_metrics", false) {
-		messageMetrics = newMessageMetrics()
-	} else {
-		messageMetrics = newMessageMetricsOnlyRecvError()
-	}
-
 	handshakeConfig := HandshakeConfig{
-		tryInterval:    c.GetDuration("handshakes.try_interval", DefaultHandshakeTryInterval),
-		retries:        int64(c.GetInt("handshakes.retries", DefaultHandshakeRetries)),
-		triggerBuffer:  c.GetInt("handshakes.trigger_buffer", DefaultHandshakeTriggerBuffer),
-		messageMetrics: messageMetrics,
+		tryInterval:   c.GetDuration("handshakes.try_interval", DefaultHandshakeTryInterval),
+		retries:       int64(c.GetInt("handshakes.retries", DefaultHandshakeRetries)),
+		triggerBuffer: c.GetInt("handshakes.trigger_buffer", DefaultHandshakeTriggerBuffer),
 	}
 
 	handshakeManager := NewHandshakeManager(l, hostMap, lightHouse, udpConns[0], handshakeConfig)
@@ -273,7 +265,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		DropLocalBroadcast:    c.GetBool("tun.drop_local_broadcast", false),
 		DropMulticast:         c.GetBool("tun.drop_multicast", false),
 		routines:              routines,
-		MessageMetrics:        messageMetrics,
 		version:               buildVersion,
 		relayManager:          NewRelayManager(ctx, l, hostMap, c),
 		punchy:                punchy,
@@ -284,7 +275,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 	}
 
 	var ifce *Interface
-	var emitStats func()
 	if !configTest {
 		ifce, err = NewInterface(ctx, ifConfig)
 		if err != nil {
@@ -299,7 +289,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
 			r.RestartRequiredIfChanged(
 				"routines", "tun.routines", "listen.routines", "firewall.conntrack.routine_cache_timeout",
-				"listen.port", "listen.host", "stats.message_metrics",
+				"listen.port", "listen.host",
 				"handshakes.try_interval", "handshakes.retries", "handshakes.trigger_buffer",
 				"tun.drop_local_broadcast", "tun.drop_multicast",
 			)
@@ -313,14 +303,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		go handshakeManager.Run(ctx)
 
 		punchy.Start(ctx, ifce, hostMap, lightHouse)
-
-		// On the stats server's loop, so the gauges follow the interval it accepted
-		emitStats = ifce.statsEmitter()
-	}
-
-	stats, err := newStatsServerFromConfig(ctx, l, c, buildVersion, configTest, emitStats)
-	if err != nil {
-		return nil, util.ContextualizeIfNeeded("Failed to start stats emitter", err)
 	}
 
 	if configTest {
@@ -338,7 +320,6 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		l:                      l,
 		ctx:                    ctx,
 		cancel:                 cancel,
-		statsStart:             stats.Start,
 		lighthouseStart:        lightHouse.StartUpdateWorker,
 		networkChangeStart:     networkChanges.Start,
 		connectionManagerStart: connManager.Start,

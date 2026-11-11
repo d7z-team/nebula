@@ -31,9 +31,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 	err := h.Parse(packet)
 	if err != nil {
 		// Hole punch packets are 0 or 1 byte big, so lets ignore printing those errors
-		// TODO: record metrics for rx holepunch/punchy packets?
 		if len(packet) > 1 {
-			f.messageMetrics.RxInvalid(1)
 			if f.l.Enabled(context.Background(), slog.LevelDebug) {
 				f.l.Debug("Error while parsing inbound packet",
 					"from", via,
@@ -46,7 +44,6 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 	}
 
 	if h.Version != header.Version {
-		f.messageMetrics.RxInvalid(1)
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
 			f.l.Debug("Unexpected header version received", "from", via)
 		}
@@ -55,7 +52,6 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 
 	// Check before processing to see if this is a expected type/subtype
 	if !h.IsValidSubType() {
-		f.messageMetrics.RxInvalid(1)
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
 			f.l.Debug("Unexpected packet received", "from", via)
 		}
@@ -64,17 +60,11 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 
 	if !via.IsRelayed {
 		if f.myVpnNetworksTable.Contains(via.UdpAddr.Addr()) {
-			f.messageMetrics.RxInvalid(1)
 			if f.l.Enabled(context.Background(), slog.LevelDebug) {
 				f.l.Debug("Refusing to process double encrypted packet", "from", via)
 			}
 			return
 		}
-	}
-
-	// don't keep Rx metrics for message type, since you can see those in the tun metrics
-	if h.Type != header.Message {
-		f.messageMetrics.Rx(h.Type, h.Subtype, 1)
 	}
 
 	// Unencrypted packets
@@ -108,7 +98,6 @@ func (f *Interface) readOutsidePackets(via ViaSender, packet []byte, rxc *rxCont
 	}
 
 	if len(packet) < header.Len+hostinfo.ConnectionState.dKey.Overhead() {
-		f.messageMetrics.RxInvalid(1)
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
 			f.l.Debug("packet too small", "from", via, "length", len(packet))
 		}
@@ -510,8 +499,6 @@ func (f *Interface) maybeSendRecvError(endpoint netip.AddrPort, index uint32) {
 }
 
 func (f *Interface) sendRecvError(endpoint netip.AddrPort, index uint32) {
-	f.messageMetrics.Tx(header.RecvError, 0, 1)
-
 	b := header.Encode(make([]byte, header.Len), header.Version, header.RecvError, 0, index, 0)
 	_ = f.outside.WriteTo(b, endpoint)
 	if f.l.Enabled(context.Background(), slog.LevelDebug) {

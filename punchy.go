@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/udp"
@@ -41,10 +40,8 @@ type Punchy struct {
 	respondDelay    atomic.Int64
 	punchEverything atomic.Bool
 
-	sched             *Scheduler[holepunchJob]
-	punchConn         udp.Conn
-	metricHolepunchTx metrics.Counter
-	metricPunchyTx    metrics.Counter
+	sched     *Scheduler[holepunchJob]
+	punchConn udp.Conn
 
 	ctx  context.Context
 	ifce EncWriter
@@ -56,21 +53,13 @@ type Punchy struct {
 
 func NewPunchyFromConfig(l *slog.Logger, c *config.C, punchConn udp.Conn) *Punchy {
 	p := &Punchy{
-		l:              l,
-		punchConn:      punchConn,
-		sched:          NewScheduler[holepunchJob](holepunchQueueSize),
-		metricPunchyTx: metrics.GetOrRegisterCounter("messages.tx.punchy", nil),
-	}
-
-	if c.GetBool("stats.lighthouse_metrics", false) {
-		p.metricHolepunchTx = metrics.GetOrRegisterCounter("messages.tx.holepunch", nil)
-	} else {
-		p.metricHolepunchTx = metrics.NilCounter{}
+		l:         l,
+		punchConn: punchConn,
+		sched:     NewScheduler[holepunchJob](holepunchQueueSize),
 	}
 
 	p.reload(c, true)
-	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
-		r.RestartRequiredIfChanged("stats.lighthouse_metrics")
+	c.RegisterReloadCallback(func(c *config.C, _ *config.Reload) {
 		p.reload(c, false)
 	})
 
@@ -178,7 +167,6 @@ func (p *Punchy) SendPunch(hostinfo *HostInfo) {
 	if p.punchEverything.Load() {
 		p.sendPunchToAllRemotes(hostinfo)
 	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
-		p.metricPunchyTx.Inc(1)
 		p.punchConn.WriteTo(punchPacket, hr)
 	}
 }
@@ -202,7 +190,6 @@ func (p *Punchy) SendPunchToAll(hostinfo *HostInfo) {
 
 func (p *Punchy) sendPunchToAllRemotes(hostinfo *HostInfo) {
 	hostinfo.remotes.ForEach(p.hm.GetPreferredRanges(), func(addr netip.AddrPort, preferred bool) {
-		p.metricPunchyTx.Inc(1)
 		p.punchConn.WriteTo(punchPacket, addr)
 	})
 }
@@ -224,7 +211,6 @@ func (p *Punchy) Start(ctx context.Context, ifce EncWriter, hm *HostMap, lh ligh
 			if p.l.Enabled(context.Background(), slog.LevelDebug) {
 				p.l.Debug("Punching", "target", job.target, "vpnAddr", job.vpnAddr)
 			}
-			p.metricHolepunchTx.Inc(1)
 			p.punchConn.WriteTo(empty, job.target)
 		case job.vpnAddr.IsValid():
 			// A nebula test packet to the host trying to contact us.

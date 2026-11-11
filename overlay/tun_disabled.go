@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"
@@ -18,10 +17,7 @@ type disabledTun struct {
 	read        chan []byte
 	vpnNetworks []netip.Prefix
 
-	// Track these metrics since we don't have the tun device to do it for us
-	tx metrics.Counter
-	rx metrics.Counter
-	l  *slog.Logger
+	l *slog.Logger
 }
 
 // Read hands the next queued packet to a reader, copying it into b. Reads
@@ -33,7 +29,6 @@ func (t *disabledTun) Read(b []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	t.tx.Inc(1)
 	if t.l.Enabled(context.Background(), slog.LevelDebug) {
 		t.l.Debug("Write payload", "raw", prettyPacket(r))
 	}
@@ -41,22 +36,12 @@ func (t *disabledTun) Read(b []byte) (int, error) {
 	return copy(b, r), nil
 }
 
-func newDisabledTun(vpnNetworks []netip.Prefix, queueLen int, metricsEnabled bool, l *slog.Logger) *disabledTun {
-	tun := &disabledTun{
+func newDisabledTun(vpnNetworks []netip.Prefix, queueLen int, l *slog.Logger) *disabledTun {
+	return &disabledTun{
 		vpnNetworks: vpnNetworks,
 		read:        make(chan []byte, queueLen),
 		l:           l,
 	}
-
-	if metricsEnabled {
-		tun.tx = metrics.GetOrRegisterCounter("messages.tx.message", nil)
-		tun.rx = metrics.GetOrRegisterCounter("messages.rx.message", nil)
-	} else {
-		tun.tx = &metrics.NilCounter{}
-		tun.rx = &metrics.NilCounter{}
-	}
-
-	return tun
 }
 
 func (*disabledTun) Activate() error {
@@ -93,8 +78,6 @@ func (t *disabledTun) handleICMPEchoRequest(b []byte) bool {
 }
 
 func (t *disabledTun) Write(b []byte) (int, error) {
-	t.rx.Inc(1)
-
 	// Check for ICMP Echo Request before spending time doing the full parsing
 	if t.handleICMPEchoRequest(b) {
 		if t.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -109,8 +92,8 @@ func (t *disabledTun) Write(b []byte) (int, error) {
 func (t *disabledTun) Queues(n int) ([]tio.Queue, error) {
 	out := make([]tio.Queue, n)
 	for i := range out {
-		// NoClose: the shared channel and metrics are owned by the
-		// disabledTun; Close on the device tears them down once for everybody.
+		// NoClose: the shared channel is owned by disabledTun; Close on the
+		// device tears it down once for everybody.
 		out[i] = tio.NewSingleQueueNoClose(t, defaultBatchBufSize)
 	}
 	return out, nil

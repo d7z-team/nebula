@@ -51,7 +51,6 @@ type Control struct {
 	commands               *commands.Registry
 	ctx                    context.Context
 	cancel                 context.CancelFunc
-	statsStart             func()
 	lighthouseStart        func()
 	networkChangeStart     func(rebind func())
 	connectionManagerStart func(context.Context)
@@ -96,9 +95,6 @@ func (c *Control) Start() error {
 	}
 
 	// Call all the delayed funcs that waited patiently for the interface to be created.
-	if c.statsStart != nil {
-		go c.statsStart()
-	}
 	if c.networkChangeStart != nil {
 		go c.networkChangeStart(c.RebindUDPServer)
 	}

@@ -84,7 +84,7 @@ func (f *Interface) consumeInsidePacket(pkt tio.Packet, fwPacket *firewall.Parse
 		// bytes underneath. cachePacket explicitly copies its argument (handshake_manager.go cachePacket),
 		// so retaining segments past the loop is safe.
 		err := tio.SegmentSuperpacket(pkt, func(seg []byte) error {
-			hh.cachePacket(f.l, header.Message, 0, seg, f.sendMessageNow, f.cachedPacketMetrics)
+			hh.cachePacket(f.l, header.Message, 0, seg, f.sendMessageNow)
 			return nil
 		})
 		if err != nil && f.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -185,7 +185,7 @@ func (f *Interface) sendInsideMessage(hostinfo *HostInfo, pkt tio.Packet, nb []b
 			relayHostInfo, relay, err = f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
 			if err != nil {
 				hostinfo.relayState.DeleteRelay(relayIP)
-				hostinfo.logger(f.l).Info("sendNoMetrics failed to find HostInfo",
+				hostinfo.logger(f.l).Info("sendEncrypted failed to find HostInfo",
 					"relay", relayIP,
 					"error", err,
 				)
@@ -279,7 +279,7 @@ func (f *Interface) rejectOutside(packet []byte, ci *ConnectionState, hostinfo *
 		return
 	}
 
-	f.sendNoMetrics(header.Message, 0, ci, hostinfo, netip.AddrPort{}, out, nb, encryptBuf, q)
+	f.sendEncrypted(header.Message, 0, ci, hostinfo, netip.AddrPort{}, out, nb, encryptBuf, q)
 }
 
 // Handshake will attempt to initiate a tunnel with the provided vpn address. This is a no-op if the tunnel is already established or being established
@@ -392,14 +392,14 @@ func (f *Interface) sendMessageNow(t header.MessageType, st header.MessageSubTyp
 		return
 	}
 
-	f.sendNoMetrics(header.Message, st, hostinfo.ConnectionState, hostinfo, netip.AddrPort{}, p, nb, out, 0)
+	f.sendEncrypted(header.Message, st, hostinfo.ConnectionState, hostinfo, netip.AddrPort{}, p, nb, out, 0)
 }
 
 // SendMessageToVpnAddr handles real addr:port lookup and sends to the current best known address for vpnAddr.
 // This function ignores myVpnNetworksTable, and will always attempt to treat the address as a vpnAddr
 func (f *Interface) SendMessageToVpnAddr(t header.MessageType, st header.MessageSubType, vpnAddr netip.Addr, p, nb, out []byte) {
 	hostInfo, ready := f.handshakeManager.GetOrHandshake(vpnAddr, func(hh *HandshakeHostInfo) {
-		hh.cachePacket(f.l, t, st, p, f.SendMessageToHostInfo, f.cachedPacketMetrics)
+		hh.cachePacket(f.l, t, st, p, f.SendMessageToHostInfo)
 	})
 
 	if hostInfo == nil {
@@ -423,18 +423,15 @@ func (f *Interface) SendMessageToHostInfo(t header.MessageType, st header.Messag
 }
 
 func (f *Interface) send(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, p, nb, out []byte) {
-	f.messageMetrics.Tx(t, st, 1)
-	f.sendNoMetrics(t, st, ci, hostinfo, netip.AddrPort{}, p, nb, out, 0)
+	f.sendEncrypted(t, st, ci, hostinfo, netip.AddrPort{}, p, nb, out, 0)
 }
 
 func (f *Interface) sendTo(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, p, nb, out []byte) {
-	f.messageMetrics.Tx(t, st, 1)
-	f.sendNoMetrics(t, st, ci, hostinfo, remote, p, nb, out, 0)
+	f.sendEncrypted(t, st, ci, hostinfo, remote, p, nb, out, 0)
 }
 
 // dropExhausted records an exhaustion drop and logs once, on the crossing send, for a spent tunnel.
 func (f *Interface) dropExhausted(hostinfo *HostInfo, c uint64, msg string) {
-	f.messageMetrics.TxExhausted(1)
 	if c == RejectAfterMessages {
 		hostinfo.logger(f.l).Error(msg)
 	}
@@ -524,7 +521,7 @@ func (f *Interface) SendVia(via *HostInfo, relay *Relay, ad, nb, out []byte, noc
 	}
 }
 
-func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, p, nb, out []byte, q int) {
+func (f *Interface) sendEncrypted(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, p, nb, out []byte, q int) {
 	if ci.eKey == nil {
 		return
 	}
@@ -618,7 +615,7 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 			relayHostInfo, relay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
 			if err != nil {
 				hostinfo.relayState.DeleteRelay(relayIP)
-				hostinfo.logger(f.l).Info("sendNoMetrics failed to find HostInfo",
+				hostinfo.logger(f.l).Info("sendEncrypted failed to find HostInfo",
 					"relay", relayIP,
 					"error", err,
 				)

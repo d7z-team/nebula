@@ -210,31 +210,6 @@ func TestIdentityPem(t *testing.T) {
 	assert.Equal(t, "No active tunnel for vpn addr: 10.0.0.9", r.Reason)
 }
 
-// TestLookupIdentityKinds: the one lookup both surfaces use tells the asking being wrong
-// from the thing asked about not being there, which is what the info API's status codes
-// are made of.
-func TestLookupIdentityKinds(t *testing.T) {
-	f, _ := identityFixture(t)
-
-	for addr, want := range map[string]lookupFailure{
-		"not-an-address": lookupBadAddress,
-		"":               lookupBadAddress,
-		"10.0.0.9":       lookupNoTunnel,
-		"10.0.0.3":       lookupNoTunnel,
-		"9.9.9.9":        lookupNoTunnel,
-	} {
-		_, _, err := lookupIdentity(f, addr, true)
-		var le *lookupError
-		require.ErrorAs(t, err, &le, addr)
-		assert.Equal(t, want, le.kind, addr)
-	}
-
-	_, _, err := lookupIdentity(&Interface{pki: &PKI{}}, "", false)
-	var le *lookupError
-	require.ErrorAs(t, err, &le)
-	assert.Equal(t, lookupNoCertificate, le.kind)
-}
-
 // TestOwnCertificatePrefersV2: with both versions loaded, the v2 certificate is the one
 // myVpnAddrsTable is built from and may carry addresses the v1 does not, so it is the one
 // an identity lookup of our own address, or of none, reports, whichever version handshakes

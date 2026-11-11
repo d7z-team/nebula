@@ -18,7 +18,7 @@ type program struct {
 	configPath *string
 	build      string
 	control    *nebula.Control
-	local      *localapi.Endpoints
+	local      *localapi.Server
 }
 
 func (p *program) Start(s service.Service) error {
@@ -52,8 +52,8 @@ func (p *program) Start(s service.Service) error {
 		return err
 	}
 
-	// Now that we're started, stand up the local APIs.
-	p.local = localapi.Wire(p.control.Context(), l, c, p.control.Commands(), p.control.InfoHandler())
+	// Now that we're started, stand up the local control API.
+	p.local = localapi.WireControl(p.control.Context(), l, c, p.control.Commands())
 
 	// Nebula can stop itself on a fatal packet reader error, make sure to log it if it happens.
 	go func() {

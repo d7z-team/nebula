@@ -232,13 +232,3 @@ func TestPunchy_LogFormat_ReloadRespondDelay(t *testing.T) {
 	assert.Equal(t, slog.LevelInfo, entry.Level)
 	assert.Equal(t, map[string]any{"respond_delay": 15 * time.Second}, entry.Attrs)
 }
-
-func TestPunchyReloadRestartRequired(t *testing.T) {
-	c := config.NewC(test.NewLogger())
-	require.NoError(t, c.LoadString("stats:\n  lighthouse_metrics: false\n"))
-	NewPunchyFromConfig(test.NewLogger(), c, nil)
-
-	res := c.ReloadConfigString("stats:\n  lighthouse_metrics: true\n")
-	require.NoError(t, res.Err)
-	assert.True(t, res.RestartRequired)
-}

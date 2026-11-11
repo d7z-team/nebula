@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
@@ -311,11 +310,6 @@ type cachedPacket struct {
 
 type packetCallback func(t header.MessageType, st header.MessageSubType, h *HostInfo, p, nb, out []byte)
 
-type cachedPacketMetrics struct {
-	sent    metrics.Counter
-	dropped metrics.Counter
-}
-
 func NewHostMapFromConfig(l *slog.Logger, c *config.C) *HostMap {
 	hm := newHostMap(l)
 
@@ -369,21 +363,6 @@ func (hm *HostMap) reload(c *config.C, initial bool, r *config.Reload) {
 			)
 		}
 	}
-}
-
-// EmitStats reports host, index, and relay counts to the stats collection system
-func (hm *HostMap) EmitStats() {
-	hm.RLock()
-	hostLen := len(hm.Hosts)
-	indexLen := len(hm.Indexes)
-	remoteIndexLen := len(hm.RemoteIndexes)
-	relaysLen := len(hm.Relays)
-	hm.RUnlock()
-
-	metrics.GetOrRegisterGauge("hostmap.main.hosts", nil).Update(int64(hostLen))
-	metrics.GetOrRegisterGauge("hostmap.main.indexes", nil).Update(int64(indexLen))
-	metrics.GetOrRegisterGauge("hostmap.main.remoteIndexes", nil).Update(int64(remoteIndexLen))
-	metrics.GetOrRegisterGauge("hostmap.main.relayIndexes", nil).Update(int64(relaysLen))
 }
 
 // unlockedSetHostsForAddr stores the per-address hostinfo list (list[0] is the primary). An empty

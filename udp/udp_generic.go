@@ -90,11 +90,6 @@ func (u *GenericConn) ReloadConfig(c *config.C, r *config.Reload) {
 
 }
 
-func NewUDPStatsEmitter(udpConns []Conn) func() {
-	// No UDP stats for non-linux
-	return func() {}
-}
-
 type rawMessage struct {
 	Len uint32
 }

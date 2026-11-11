@@ -59,37 +59,37 @@ func TestOwnerAccepted(t *testing.T) {
 func TestCheckSocketPathRefusesASpellingTheKernelWouldRewrite(t *testing.T) {
 	for _, ok := range []string{
 		DefaultSocketPath,
-		`\\.\pipe\nebula-info`,
-		`\\.\pipe\ProtectedPrefix\Administrators\nebula-info`,
+		`\\.\pipe\nebula-ctl`,
+		`\\.\pipe\ProtectedPrefix\Administrators\nebula-ctl`,
 		`\\.\pipe\with.dots\and..more`,
 	} {
-		assert.NoError(t, checkSocketPath(InfoSocketKey, ok), ok)
+		assert.NoError(t, checkSocketPath(CtlSocketKey, ok), ok)
 	}
 	for _, bad := range []string{
-		`\\.\pipe\ProtectedPrefix\Administrators\..\..\nebula-info`,
-		`\\.\pipe\ProtectedPrefix/Administrators/nebula-info`,
-		`\\.\pipe\.\nebula-info`,
-		`\\.\pipe\\nebula-info`,
-		`\\.\pipe\nebula-info\`,
+		`\\.\pipe\ProtectedPrefix\Administrators\..\..\nebula-ctl`,
+		`\\.\pipe\ProtectedPrefix/Administrators/nebula-ctl`,
+		`\\.\pipe\.\nebula-ctl`,
+		`\\.\pipe\\nebula-ctl`,
+		`\\.\pipe\nebula-ctl\`,
 		`\\.\pipe\`,
-		`/var/run/nebula/info.sock`,
+		`/var/run/nebula/ctl.sock`,
 	} {
-		err := checkSocketPath(InfoSocketKey, bad)
+		err := checkSocketPath(CtlSocketKey, bad)
 		require.Error(t, err, bad)
-		assert.Contains(t, err.Error(), InfoSocketKey, bad)
+		assert.Contains(t, err.Error(), CtlSocketKey, bad)
 	}
 }
 
 // TestSamePathIgnoresCase: pipe names are case-insensitive to the kernel, so a reload
 // that only respells one is not a move.
 func TestSamePathIgnoresCase(t *testing.T) {
-	assert.True(t, samePath(`\\.\pipe\Nebula-Info`, `\\.\pipe\nebula-info`))
-	assert.False(t, samePath(`\\.\pipe\nebula-info`, `\\.\pipe\nebula-ctl`))
+	assert.True(t, samePath(`\\.\pipe\Nebula-Ctl`, `\\.\pipe\nebula-ctl`))
+	assert.False(t, samePath(`\\.\pipe\nebula-ctl`, `\\.\pipe\other`))
 }
 
 // TestAccessChangedIgnoresTheMode: only the group is in a pipe's security descriptor.
 func TestAccessChangedIgnoresTheMode(t *testing.T) {
-	g := Group{name: "Users", id: "S-1-5-32-545"}
+	g := accessGroup{name: "Users", id: "S-1-5-32-545"}
 	assert.False(t, accessChanged(Access{mode: 0660, group: g}, Access{mode: 0666, group: g}))
 	assert.True(t, accessChanged(Access{mode: 0660, group: g}, Access{mode: 0660}))
 	assert.True(t, accessChanged(Access{mode: 0600}, Access{mode: 0600, group: g}))

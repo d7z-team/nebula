@@ -139,7 +139,6 @@ func (w *batchWriter) prepareGSO() {
 
 	if err := unix.SetsockoptInt(w.fd, unix.IPPROTO_UDP, unix.UDP_SEGMENT, 0); err != nil {
 		w.l.Info("udp: GSO disabled", "reason", "rawconn control failed", "error", err)
-		recordCapability("udp.gso.enabled", false)
 		return
 	}
 
@@ -152,7 +151,6 @@ func (w *batchWriter) prepareGSO() {
 
 	w.gsoSupported = true
 	w.l.Info("udp: GSO enabled", "maxGSOSegments", w.maxGSOSegments)
-	recordCapability("udp.gso.enabled", true)
 }
 
 // gsoMaxSegments returns the most segments one UDP_SEGMENT send may carry:
@@ -295,7 +293,6 @@ func (w *batchWriter) WriteBatch(bufs [][]byte, addrs []netip.AddrPort) (int, er
 			if w.gsoSupported && w.entryPkts[done] >= 2 && errors.Is(serr, unix.EIO) {
 				w.gsoSupported = false
 				w.l.Warn("udp: kernel rejected GSO send, disabling GSO", "error", serr)
-				recordCapability("udp.gso.enabled", false)
 				i = w.entryEnd[done] - w.entryPkts[done]
 				break
 			}

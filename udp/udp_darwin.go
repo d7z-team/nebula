@@ -179,11 +179,6 @@ func (u *StdConn) ReloadConfig(c *config.C, r *config.Reload) {
 	// TODO
 }
 
-func NewUDPStatsEmitter(udpConns []Conn) func() {
-	// No UDP stats for non-linux
-	return func() {}
-}
-
 func (u *StdConn) ListenOut(r EncReader, flush func()) error {
 	buffer := make([]byte, MTU)
 

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/handshake"
 	"github.com/slackhq/nebula/header"
@@ -49,8 +48,6 @@ type HandshakeConfig struct {
 	tryInterval   time.Duration
 	retries       int64
 	triggerBuffer int
-
-	messageMetrics *MessageMetrics
 }
 
 type HandshakeManager struct {
@@ -61,18 +58,14 @@ type HandshakeManager struct {
 	vpnIps  map[netip.Addr]*HandshakeHostInfo
 	indexes map[uint32]*HandshakeHostInfo
 
-	mainHostMap               *HostMap
-	lightHouse                *LightHouse
-	outside                   udp.Conn
-	config                    HandshakeConfig
-	OutboundHandshakeTimer    *LockingTimerWheel[netip.Addr]
-	messageMetrics            *MessageMetrics
-	metricInitiated           metrics.Counter
-	metricTimedOut            metrics.Counter
-	metricRejectedBlocklisted metrics.Counter
-	ecmpGateways              *ecmpGateways
-	f                         *Interface
-	l                         *slog.Logger
+	mainHostMap            *HostMap
+	lightHouse             *LightHouse
+	outside                udp.Conn
+	config                 HandshakeConfig
+	OutboundHandshakeTimer *LockingTimerWheel[netip.Addr]
+	ecmpGateways           *ecmpGateways
+	f                      *Interface
+	l                      *slog.Logger
 
 	// can be used to trigger outbound handshake for the given vpnIp
 	trigger chan netip.Addr
@@ -93,7 +86,7 @@ type HandshakeHostInfo struct {
 	machine  *handshake.Machine // The handshake state machine, set during stage 0 (initiator) or beginHandshake (responder multi-message)
 }
 
-func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback, m *cachedPacketMetrics) {
+func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback) {
 	if len(hh.packetStore) < maxCachedPackets {
 		tempPacket := make([]byte, len(packet))
 		copy(tempPacket, packet)
@@ -107,8 +100,6 @@ func (hh *HandshakeHostInfo) cachePacket(l *slog.Logger, t header.MessageType, s
 		}
 
 	} else {
-		m.dropped.Inc(1)
-
 		if l.Enabled(context.Background(), slog.LevelDebug) {
 			hh.hostinfo.logger(l).Debug("Packet store",
 				"length", len(hh.packetStore),
@@ -200,20 +191,16 @@ func (g *ecmpGateways) markUp(addrs ...netip.Addr) {
 
 func NewHandshakeManager(l *slog.Logger, mainHostMap *HostMap, lightHouse *LightHouse, outside udp.Conn, config HandshakeConfig) *HandshakeManager {
 	return &HandshakeManager{
-		vpnIps:                    map[netip.Addr]*HandshakeHostInfo{},
-		indexes:                   map[uint32]*HandshakeHostInfo{},
-		mainHostMap:               mainHostMap,
-		lightHouse:                lightHouse,
-		outside:                   outside,
-		config:                    config,
-		trigger:                   make(chan netip.Addr, config.triggerBuffer),
-		OutboundHandshakeTimer:    NewLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
-		messageMetrics:            config.messageMetrics,
-		metricInitiated:           metrics.GetOrRegisterCounter("handshake_manager.initiated", nil),
-		metricTimedOut:            metrics.GetOrRegisterCounter("handshake_manager.timed_out", nil),
-		metricRejectedBlocklisted: metrics.GetOrRegisterCounter("handshake_manager.rejected.blocklisted", nil),
-		ecmpGateways:              newECMPGateways(),
-		l:                         l,
+		vpnIps:                 map[netip.Addr]*HandshakeHostInfo{},
+		indexes:                map[uint32]*HandshakeHostInfo{},
+		mainHostMap:            mainHostMap,
+		lightHouse:             lightHouse,
+		outside:                outside,
+		config:                 config,
+		trigger:                make(chan netip.Addr, config.triggerBuffer),
+		OutboundHandshakeTimer: NewLockingTimerWheel[netip.Addr](config.tryInterval, hsTimeout(config.retries, config.tryInterval)),
+		ecmpGateways:           newECMPGateways(),
+		l:                      l,
 	}
 }
 
@@ -315,7 +302,6 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 			})
 		}
 		hh.hostinfo.logger(hm.l).Info("Handshake timed out", fields...)
-		hm.metricTimedOut.Inc(1)
 		hm.ecmpGateways.markDown(vpnIp)
 		hm.DeleteHostInfo(hostinfo)
 		return
@@ -370,7 +356,6 @@ func (hm *HandshakeManager) handleOutbound(vpnIp netip.Addr, lighthouseTriggered
 	// Send the handshake to all known ips, stage 2 takes care of assigning the hostinfo.remote based on the first to reply
 	var sentTo []netip.AddrPort
 	hostinfo.remotes.ForEach(hm.mainHostMap.GetPreferredRanges(), func(addr netip.AddrPort, _ bool) {
-		hm.messageMetrics.Tx(header.Handshake, hh.machine.Subtype(), 1)
 		err := hm.outside.WriteTo(stage0, addr)
 		if err != nil {
 			// These repeat every attempt, so match the success log below and only shout when the remotes changed
@@ -464,7 +449,6 @@ func (hm *HandshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*Han
 		startTime: time.Now(),
 	}
 	hm.vpnIps[vpnAddr] = hh
-	hm.metricInitiated.Inc(1)
 	hm.OutboundHandshakeTimer.Add(vpnAddr, hm.config.tryInterval)
 
 	if cacheCb != nil {
@@ -693,17 +677,6 @@ func (hm *HandshakeManager) ForEachIndex(f controlEach) {
 	}
 }
 
-func (hm *HandshakeManager) EmitStats() {
-	hm.RLock()
-	hostLen := len(hm.vpnIps)
-	indexLen := len(hm.indexes)
-	hm.RUnlock()
-
-	metrics.GetOrRegisterGauge("hostmap.pending.hosts", nil).Update(int64(hostLen))
-	metrics.GetOrRegisterGauge("hostmap.pending.indexes", nil).Update(int64(indexLen))
-	hm.mainHostMap.EmitStats()
-}
-
 // Utility functions below
 
 func generateIndex(l *slog.Logger) (uint32, error) {
@@ -809,7 +782,6 @@ func (hm *HandshakeManager) beginHandshake(via ViaSender, packet []byte, h *head
 		level := slog.LevelError
 		if errors.Is(err, cert.ErrBlockListed) {
 			level = slog.LevelDebug
-			hm.metricRejectedBlocklisted.Inc(1)
 		}
 		f.l.Log(context.Background(), level, "Failed to process handshake packet", "from", via, "error", err)
 		return
@@ -943,9 +915,6 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 
 	response, result, err := machine.ProcessPacket(nil, packet)
 	if err != nil {
-		if errors.Is(err, cert.ErrBlockListed) {
-			hm.metricRejectedBlocklisted.Inc(1)
-		}
 		// Recoverable errors are routine noise, log at Debug. Fatal errors get a Warn.
 		if machine.Failed() {
 			f.l.Warn("Failed to process handshake packet, abandoning",
@@ -1082,15 +1051,13 @@ func (hm *HandshakeManager) continueHandshake(via ViaSender, hh *HandshakeHostIn
 		out := make([]byte, mtu)
 		for _, cp := range hh.packetStore {
 			// TODO: use a SendBatch here. Each callback lands in
-			// sendNoMetrics -> WriteTo: one syscall per cached packet,
+			// sendEncrypted -> WriteTo: one syscall per cached packet,
 			// where one sendmmsg could flush the whole store.
 			cp.callback(cp.messageType, cp.messageSubType, hostinfo, cp.packet, nb, out)
 		}
-		f.cachedPacketMetrics.sent.Inc(int64(len(hh.packetStore)))
 	}
 
 	hostinfo.remotes.RefreshFromHandshake(vpnAddrs)
-	f.metricHandshakes.Update(duration)
 
 	// Don't wait for UpdateWorker
 	if f.lightHouse.IsAnyLighthouseAddr(vpnAddrs) {
@@ -1157,7 +1124,6 @@ func (hm *HandshakeManager) sendHandshakeResponse(via ViaSender, msg []byte, hos
 	}
 
 	f := hm.f
-	f.messageMetrics.Tx(header.Handshake, header.MessageSubType(msg[1]), 1)
 
 	// Common log fields. peerCert may be nil during intermediate
 	// multi-message flows (handshake hasn't completed yet); skip the cert

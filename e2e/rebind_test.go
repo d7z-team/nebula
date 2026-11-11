@@ -256,7 +256,7 @@ func TestRebindRequeriesAfterRelayedSend(t *testing.T) {
 	hi := myControl.GetHostInfoByVpnAddr(theirVpnIpNet[0].Addr(), false)
 	require.NotNil(t, hi, "expected a tunnel to them")
 	require.NotEmpty(t, hi.CurrentRelaysToMe, "them must be reachable only via the relay for this test to mean anything")
-	// sendNoMetrics only reaches SendVia when there is no direct remote, so pin that too. Without this the test
+	// sendEncrypted only reaches SendVia when there is no direct remote, so pin that too. Without this the test
 	// keeps passing while quietly sending direct and never exercising the relay path.
 	require.False(t, hi.CurrentRemote.IsValid(), "them must have no direct remote, otherwise SendVia is never called")
 

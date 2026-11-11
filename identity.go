@@ -13,8 +13,7 @@ import (
 
 type identityFlags struct {
 	// Pem answers with the certificate itself, PEM encoded, in place of the fields read
-	// from it, for a program that verifies it against its own CAs. The info API serves
-	// the same thing as the identity's pem sub-resource.
+	// from it, for a program that verifies it against its own CAs.
 	Pem bool
 }
 
@@ -32,8 +31,7 @@ type identityFlags struct {
 // even with a tunnel to its holder up. And a connection that arrived on any other
 // interface with an overlay source address was never checked by nebula at all, so a
 // program authorizing on this answer should confirm the connection came in on the
-// nebula interface. The field names are an API: the info API serves this shape to
-// programs that were not built against nebula.
+// nebula interface.
 type hostIdentity struct {
 	Name           string         `json:"name"`
 	VpnAddrs       []netip.Addr   `json:"vpnAddrs"`
@@ -83,52 +81,27 @@ func runIdentity(ifce *Interface, args *identityFlags, a []string) (commands.Res
 	return commands.Value(id), nil
 }
 
-// lookupIdentity is where identity's surfaces meet: the command and the info API both
-// resolve an address, or none, to a certificate through it, so they cannot disagree
-// about whose address it is. given says whether an address was passed at all: none is
-// this node, while one that is empty is a caller's mistake and fails to parse. The
-// error is a *lookupError, whose kind tells a surface with status codes whether the
-// thing asked about was not there or the asking was wrong.
+// lookupIdentity resolves an address, or none, to a certificate. given says whether an
+// address was passed at all: none is this node, while one that is empty is a caller's
+// mistake and fails to parse.
 func lookupIdentity(ifce *Interface, addr string, given bool) (crt cert.Certificate, fingerprint string, err error) {
 	cs := ifce.pki.getCertState()
 	if !given {
 		if crt = ownCertificate(cs); crt == nil {
-			return nil, "", &lookupError{kind: lookupNoCertificate, msg: "No certificate is loaded"}
+			return nil, "", fmt.Errorf("No certificate is loaded")
 		}
 		return crt, "", nil
 	}
 
 	vpnAddr, perr := parseVpnAddrWithOptionalPort(addr)
 	if perr != nil {
-		return nil, "", &lookupError{kind: lookupBadAddress, msg: "The provided vpn addr could not be parsed: " + addr}
+		return nil, "", fmt.Errorf("The provided vpn addr could not be parsed: %s", addr)
 	}
 	if crt, fingerprint = findCertificateForVpnAddr(cs, ifce.hostMap, vpnAddr); crt == nil {
-		return nil, "", &lookupError{kind: lookupNoTunnel, msg: "No active tunnel for vpn addr: " + vpnAddr.String()}
+		return nil, "", fmt.Errorf("No active tunnel for vpn addr: %s", vpnAddr)
 	}
 	return crt, fingerprint, nil
 }
-
-// lookupError is why lookupIdentity found no certificate, in words for the asker and a
-// kind for the surface.
-type lookupError struct {
-	kind lookupFailure
-	msg  string
-}
-
-func (e *lookupError) Error() string { return e.msg }
-
-type lookupFailure int
-
-const (
-	// lookupBadAddress: the address did not parse; the asking was wrong.
-	lookupBadAddress lookupFailure = iota
-	// lookupNoTunnel: no established tunnel is behind the address, or it is in a network
-	// this node does not hold; the thing asked about is not there.
-	lookupNoTunnel
-	// lookupNoCertificate: this node has no certificate loaded, which a running nebula
-	// never has; the fault is nobody's who asked.
-	lookupNoCertificate
-)
 
 // textIdentityValue renders what identity reports for a person: the identity, or with
 // -pem the certificate block alone, as print-cert -raw prints it.

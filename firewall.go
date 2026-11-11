@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/firewall"
@@ -70,16 +69,8 @@ type Firewall struct {
 	source string
 
 	defaultLocalCIDRAny bool
-	incomingMetrics     firewallMetrics
-	outgoingMetrics     firewallMetrics
 
 	l *slog.Logger
-}
-
-type firewallMetrics struct {
-	droppedLocalAddr  metrics.Counter
-	droppedRemoteAddr metrics.Counter
-	droppedNoRule     metrics.Counter
 }
 
 type FirewallConntrack struct {
@@ -182,17 +173,6 @@ func NewFirewall(l *slog.Logger, tcpTimeout, UDPTimeout, defaultTimeout time.Dur
 		assignedNetworks: assignedNetworks,
 		unsafeNetworks:   unsafeNetworks,
 		l:                l,
-
-		incomingMetrics: firewallMetrics{
-			droppedLocalAddr:  metrics.GetOrRegisterCounter("firewall.incoming.dropped.local_addr", nil),
-			droppedRemoteAddr: metrics.GetOrRegisterCounter("firewall.incoming.dropped.remote_addr", nil),
-			droppedNoRule:     metrics.GetOrRegisterCounter("firewall.incoming.dropped.no_rule", nil),
-		},
-		outgoingMetrics: firewallMetrics{
-			droppedLocalAddr:  metrics.GetOrRegisterCounter("firewall.outgoing.dropped.local_addr", nil),
-			droppedRemoteAddr: metrics.GetOrRegisterCounter("firewall.outgoing.dropped.remote_addr", nil),
-			droppedNoRule:     metrics.GetOrRegisterCounter("firewall.outgoing.dropped.no_rule", nil),
-		},
 	}
 }
 
@@ -447,20 +427,17 @@ func (f *Firewall) Drop(fp firewall.Packet, incoming bool, h *HostInfo, caPool *
 	if h.networks == nil {
 		// Simple case: Certificate has one address and no unsafe networks
 		if h.vpnAddrs[0] != fp.RemoteAddr {
-			f.metrics(incoming).droppedRemoteAddr.Inc(1)
 			return ErrInvalidRemoteIP
 		}
 	} else {
 		nwType, ok := h.networks.Lookup(fp.RemoteAddr)
 		if !ok {
-			f.metrics(incoming).droppedRemoteAddr.Inc(1)
 			return ErrInvalidRemoteIP
 		}
 		switch nwType {
 		case NetworkTypeVPN:
 			break // nothing special
 		case NetworkTypeVPNPeer:
-			f.metrics(incoming).droppedRemoteAddr.Inc(1)
 			return ErrPeerRejected // reject for now, one day this may have different FW rules
 		case NetworkTypeUnsafe:
 			break // nothing special, one day this may have different FW rules
@@ -468,18 +445,15 @@ func (f *Firewall) Drop(fp firewall.Packet, incoming bool, h *HostInfo, caPool *
 			// The peer's unsafe network overlaps our vpn networks, it is claiming another node's
 			// vpn address as a source. Outbound the address is only a destination.
 			if incoming {
-				f.metrics(incoming).droppedRemoteAddr.Inc(1)
 				return ErrUnsafeVPNOverlap
 			}
 		default:
-			f.metrics(incoming).droppedRemoteAddr.Inc(1)
 			return ErrUnknownNetworkType //should never happen
 		}
 	}
 
 	// Make sure we are supposed to be handling this local ip address
 	if !f.routableNetworks.Contains(fp.LocalAddr) {
-		f.metrics(incoming).droppedLocalAddr.Inc(1)
 		return ErrInvalidLocalIP
 	}
 
@@ -495,7 +469,6 @@ func (f *Firewall) Drop(fp firewall.Packet, incoming bool, h *HostInfo, caPool *
 
 	// We now know which firewall table to check against
 	if !table.match(fp, incoming, h.ConnectionState.peerCert, caPool) {
-		f.metrics(incoming).droppedNoRule.Inc(1)
 		return ErrNoMatchingRule
 	}
 
@@ -505,28 +478,10 @@ func (f *Firewall) Drop(fp firewall.Packet, incoming bool, h *HostInfo, caPool *
 	return nil
 }
 
-func (f *Firewall) metrics(incoming bool) firewallMetrics {
-	if incoming {
-		return f.incomingMetrics
-	} else {
-		return f.outgoingMetrics
-	}
-}
-
 // Destroy cleans up any known cyclical references so the object can be freed by GC. This should be called if a new
 // firewall object is created
 func (f *Firewall) Destroy() {
 	//TODO: clean references if/when needed
-}
-
-func (f *Firewall) EmitStats() {
-	conntrack := f.Conntrack
-	conntrack.Lock()
-	conntrackCount := len(conntrack.Conns)
-	conntrack.Unlock()
-	metrics.GetOrRegisterGauge("firewall.conntrack.count", nil).Update(int64(conntrackCount))
-	metrics.GetOrRegisterGauge("firewall.rules.version", nil).Update(int64(f.rulesVersion))
-	metrics.GetOrRegisterGauge("firewall.rules.hash", nil).Update(int64(f.GetRuleHashFNV()))
 }
 
 func (f *Firewall) inConns(fp firewall.Packet, h *HostInfo, caPool *cert.CAPool, localCache firewall.ConntrackCache) bool {

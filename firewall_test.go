@@ -317,7 +317,6 @@ func TestFirewall_DropOverlaySourceThroughUnsafeNetwork(t *testing.T) {
 
 	// Another node's overlay address, through the unsafe network: refused.
 	assert.Equal(t, ErrUnsafeVPNOverlap, fw.Drop(packet("1.2.3.10"), true, &h, cp, nil))
-	assert.Equal(t, int64(1), fw.incomingMetrics.droppedRemoteAddr.Count())
 
 	// The peer's own address, and an address outside the overlay it routes for: served.
 	require.NoError(t, fw.Drop(packet("1.2.3.9"), true, &h, cp, nil))

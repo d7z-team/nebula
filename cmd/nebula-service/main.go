@@ -117,7 +117,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		local := localapi.Wire(ctrl.Context(), l, c, ctrl.Commands(), ctrl.InfoHandler())
+		local := localapi.WireControl(ctrl.Context(), l, c, ctrl.Commands())
 
 		go ctrl.ShutdownBlock()
 

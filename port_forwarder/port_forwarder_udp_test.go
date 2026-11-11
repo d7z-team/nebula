@@ -99,7 +99,7 @@ func readUdpConnectionToChannel(conn *net.UDPConn) <-chan Pair[[]byte, net.Addr]
 }
 
 func TestUdpInOut2Clients(t *testing.T) {
-	server, sl, client, cl := service.CreateTwoConnectedServices(t, 4244)
+	server, sl, client, cl := createTwoConnectedServices(t, 4244)
 
 	server_pf, err := createPortForwarderFromConfigString(t, sl, server, `
 port_forwarding:

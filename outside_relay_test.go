@@ -8,7 +8,6 @@ import (
 
 	"github.com/flynn/noise"
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/noiseutil"
 	"github.com/slackhq/nebula/overlay/batch"
@@ -80,8 +79,8 @@ func newRelayBatchPath(t *testing.T, cipher noise.CipherFunc) *relayBatchPath {
 	f := &Interface{
 		ctx: t.Context(), l: l, hostMap: newHostMap(l), outside: conn,
 		writers: []udp.Conn{conn}, lightHouse: &LightHouse{l: l},
-		myVpnNetworksTable: &bart.Lite{}, metricTxDropped: metrics.NewCounter(),
-		batchers: []*batch.MultiCoalescer{batch.NewMultiCoalescer(&capturingTun{}, l)},
+		myVpnNetworksTable: &bart.Lite{},
+		batchers:           []*batch.MultiCoalescer{batch.NewMultiCoalescer(&capturingTun{}, l)},
 	}
 	f.connectionManager = &connectionManager{
 		intf: f, relayUsed: map[uint32]struct{}{}, relayUsedLock: &sync.RWMutex{},

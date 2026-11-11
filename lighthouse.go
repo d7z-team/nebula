@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
@@ -85,13 +84,10 @@ type LightHouse struct {
 
 	updateTrigger chan struct{}
 	queryChan     chan netip.Addr
-	// queryDropped counts queries QueryServer dropped because queryChan was full.
-	queryDropped metrics.Counter
 
 	calculatedRemotes atomic.Pointer[bart.Table[[]*calculatedRemote]] // Maps VpnAddr to []*calculatedRemote
 
-	metrics *MessageMetrics
-	l       *slog.Logger
+	l *slog.Logger
 }
 
 // NewLightHouseFromConfig will build a Lighthouse struct from the values provided in the config object
@@ -124,7 +120,6 @@ func NewLightHouseFromConfig(ctx context.Context, l *slog.Logger, c *config.C, c
 		v4Only:             pc != nil && pc.IPv4Only(),
 		updateTrigger:      make(chan struct{}, 1),
 		queryChan:          make(chan netip.Addr, c.GetUint32("handshakes.query_buffer", 1024)),
-		queryDropped:       metrics.GetOrRegisterCounter("lighthouse.query.dropped", nil),
 		l:                  l,
 	}
 	h.localAddrsFn = func(al *LocalAllowList) []netip.Addr {
@@ -138,17 +133,13 @@ func NewLightHouseFromConfig(ctx context.Context, l *slog.Logger, c *config.C, c
 	staticList := make(map[netip.Addr]struct{})
 	h.staticList.Store(&staticList)
 
-	if c.GetBool("stats.lighthouse_metrics", false) {
-		h.metrics = newLighthouseMetrics()
-	}
-
 	err := h.reload(c, true, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
-		r.RestartRequiredIfChanged("lighthouse.am_lighthouse", "listen.port", "handshakes.query_buffer", "stats.lighthouse_metrics")
+		r.RestartRequiredIfChanged("lighthouse.am_lighthouse", "listen.port", "handshakes.query_buffer")
 		err := h.reload(c, false, r)
 		switch v := err.(type) {
 		case *util.ContextualError:
@@ -548,7 +539,6 @@ func (lh *LightHouse) QueryServer(vpnAddr netip.Addr) {
 	select {
 	case lh.queryChan <- vpnAddr:
 	default:
-		lh.queryDropped.Inc(1)
 	}
 }
 
@@ -846,7 +836,6 @@ func (lh *LightHouse) innerQueryServer(addr netip.Addr, nb, out []byte) {
 	var v1Query, v2Query []byte
 	var err error
 	var v cert.Version
-	queried := 0
 	lighthouses := lh.GetLighthouses()
 
 	for _, lhVpnAddr := range lighthouses {
@@ -883,7 +872,6 @@ func (lh *LightHouse) innerQueryServer(addr netip.Addr, nb, out []byte) {
 			}
 
 			lh.ifce.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v1Query, nb, out)
-			queried++
 
 		} else if v == cert.Version2 {
 			if v2Query == nil {
@@ -902,7 +890,6 @@ func (lh *LightHouse) innerQueryServer(addr netip.Addr, nb, out []byte) {
 			}
 
 			lh.ifce.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v2Query, nb, out)
-			queried++
 
 		} else {
 			lh.l.Debug("unsupported protocol version",
@@ -914,7 +901,6 @@ func (lh *LightHouse) innerQueryServer(addr netip.Addr, nb, out []byte) {
 		}
 	}
 
-	lh.metricTx(NebulaMeta_HostQuery, int64(queried))
 }
 
 func (lh *LightHouse) StartUpdateWorker() {
@@ -1008,7 +994,6 @@ func (lh *LightHouse) SendUpdate() {
 
 	var v1Update, v2Update []byte
 	var err error
-	updated := 0
 	lighthouses := lh.GetLighthouses()
 
 	for _, lhVpnAddr := range lighthouses {
@@ -1057,7 +1042,6 @@ func (lh *LightHouse) SendUpdate() {
 			}
 
 			lh.ifce.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v1Update, nb, out)
-			updated++
 
 		} else if v == cert.Version2 {
 			if v2Update == nil {
@@ -1086,7 +1070,6 @@ func (lh *LightHouse) SendUpdate() {
 			}
 
 			lh.ifce.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v2Update, nb, out)
-			updated++
 
 		} else {
 			lh.l.Debug("unsupported protocol version",
@@ -1097,7 +1080,6 @@ func (lh *LightHouse) SendUpdate() {
 		}
 	}
 
-	lh.metricTx(NebulaMeta_HostUpdateNotification, int64(updated))
 }
 
 type LightHouseHandler struct {
@@ -1123,14 +1105,6 @@ func (lh *LightHouse) NewRequestHandler() *LightHouseHandler {
 	}
 
 	return lhh
-}
-
-func (lh *LightHouse) metricRx(t NebulaMeta_MessageType, i int64) {
-	lh.metrics.Rx(header.MessageType(t), 0, i)
-}
-
-func (lh *LightHouse) metricTx(t NebulaMeta_MessageType, i int64) {
-	lh.metrics.Tx(header.MessageType(t), 0, i)
 }
 
 // This method is similar to Reset(), but it re-uses the pointer structs
@@ -1170,8 +1144,6 @@ func (lhh *LightHouseHandler) HandleRequest(rAddr netip.AddrPort, fromVpnAddrs [
 		)
 		return
 	}
-
-	lhh.lh.metricRx(n.Type, 1)
 
 	switch n.Type {
 	case NebulaMeta_HostQuery:
@@ -1260,7 +1232,6 @@ func (lhh *LightHouseHandler) handleHostQuery(n *NebulaMeta, fromVpnAddrs []neti
 		return
 	}
 
-	lhh.lh.metricTx(NebulaMeta_HostQueryReply, 1)
 	w.SendMessageToVpnAddr(header.LightHouse, 0, fromVpnAddrs[0], lhh.pb[:ln], lhh.nb, lhh.out[:0])
 
 	lhh.sendHostPunchNotification(n, fromVpnAddrs, queryVpnAddr, w)
@@ -1323,7 +1294,6 @@ func (lhh *LightHouseHandler) sendHostPunchNotification(n *NebulaMeta, fromVpnAd
 		return
 	}
 
-	lhh.lh.metricTx(NebulaMeta_HostPunchNotification, 1)
 	w.SendMessageToVpnAddr(header.LightHouse, 0, punchNotifDest, lhh.pb[:ln], lhh.nb, lhh.out[:0])
 }
 
@@ -1480,7 +1450,6 @@ func (lhh *LightHouseHandler) handleHostUpdateNotification(n *NebulaMeta, fromVp
 		return
 	}
 
-	lhh.lh.metricTx(NebulaMeta_HostUpdateNotificationAck, 1)
 	w.SendMessageToVpnAddr(header.LightHouse, 0, fromVpnAddrs[0], lhh.pb[:ln], lhh.nb, lhh.out[:0])
 }
 
