@@ -12,6 +12,9 @@ import (
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/localapi"
 	"github.com/slackhq/nebula/logging"
+	"github.com/slackhq/nebula/overlay"
+	"github.com/slackhq/nebula/port_forwarder"
+	"github.com/slackhq/nebula/service"
 	"github.com/slackhq/nebula/util"
 )
 
@@ -91,14 +94,56 @@ func main() {
 		}
 	})
 
-	ctrl, err := nebula.Main(c, *configTest, Build, l, nil)
+	forwardingList := port_forwarder.NewPortForwardingList()
+	disabledTun := c.GetBool("tun.disabled", false)
+	if disabledTun {
+		if err := port_forwarder.ParseConfig(l, c, forwardingList); err != nil {
+			l.Error("Failed to parse port forwarding configuration", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	usePortForwarding := disabledTun && (c.GetBool("port_forwarding.enable_without_rules", false) || !forwardingList.IsEmpty())
+	var deviceFactory overlay.DeviceFactory
+	if usePortForwarding {
+		l.Info("Using userspace networking for port forwarding")
+		deviceFactory = overlay.NewUserDeviceFromConfig
+	}
+
+	ctrl, err := nebula.Main(c, *configTest, Build, l, deviceFactory)
 	if err != nil {
 		util.LogWithContextIfNeeded("Failed to start", err, l)
 		os.Exit(1)
 	}
 
 	if !*configTest {
-		if err := ctrl.Start(); err != nil {
+		var tunService *service.Service
+		var forwardingService *port_forwarder.PortForwardingService
+		if usePortForwarding {
+			tunService, err = service.New(ctrl)
+			if err != nil {
+				util.LogWithContextIfNeeded("Failed to create userspace network service", err, l)
+				os.Exit(1)
+			}
+
+			forwardingService, err = port_forwarder.ConstructFromInitialFwdList(tunService, l, &forwardingList)
+			if err != nil {
+				_ = tunService.CloseAndWait()
+				util.LogWithContextIfNeeded("Failed to create port forwarding service", err, l)
+				os.Exit(1)
+			}
+			if err := forwardingService.Activate(); err != nil {
+				_ = tunService.CloseAndWait()
+				util.LogWithContextIfNeeded("Failed to activate port forwarding", err, l)
+				os.Exit(1)
+			}
+			c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
+				if err := forwardingService.ReloadConfigAndApplyChanges(c); err != nil {
+					l.Error("Failed to reload port forwarding configuration", "error", err)
+					r.Failed()
+				}
+			})
+		} else if err := ctrl.Start(); err != nil {
 			util.LogWithContextIfNeeded("Error while running", err, l)
 			os.Exit(1)
 		}
@@ -108,11 +153,20 @@ func main() {
 		go ctrl.ShutdownBlock()
 		notifyReady(l)
 
-		err := ctrl.Wait()
+		if tunService != nil {
+			err = tunService.Wait()
+		} else {
+			err = ctrl.Wait()
+		}
 
 		// os.Exit skips deferred calls, so the sockets are removed here, before either
 		// exit below, rather than left to a deferred Stop that would never run.
 		local.Stop()
+		if forwardingService != nil {
+			if closeErr := forwardingService.CloseAll(); closeErr != nil {
+				l.Error("Failed to close port forwarding service", "error", closeErr)
+			}
+		}
 
 		if err != nil {
 			l.Error("Nebula stopped due to fatal error", "error", err)

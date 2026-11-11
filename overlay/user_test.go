@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/slackhq/nebula/overlay/tio"
+	"gvisor.dev/gvisor/pkg/buffer"
 )
 
 // newTestUserDevice returns the concrete *UserDevice so tests can reach Pipe()
@@ -17,11 +18,7 @@ func newTestUserDevice(t *testing.T) *UserDevice {
 	if err != nil {
 		t.Fatalf("NewUserDevice: %v", err)
 	}
-	ud, ok := dev.(*UserDevice)
-	if !ok {
-		t.Fatalf("NewUserDevice returned %T, want *UserDevice", dev)
-	}
-	return ud
+	return dev
 }
 
 // TestUserDeviceReadersDistinctBuffers ensures each Queue is actually different
@@ -49,15 +46,10 @@ func TestUserDeviceReadersDistinctBuffers(t *testing.T) {
 	pkt0 := []byte("packet-zero-aaaaaaaa")
 	pkt1 := []byte("packet-one-bbbbbbbbb")
 
-	// The pipe is unbuffered, so writes block until a reader consumes them.
 	// Serialize: write pkt0 (read on q0), then write pkt1 (read on q1).
 	go func() {
-		if _, err := ow.Write(pkt0); err != nil {
-			t.Errorf("write pkt0: %v", err)
-		}
-		if _, err := ow.Write(pkt1); err != nil {
-			t.Errorf("write pkt1: %v", err)
-		}
+		ow <- buffer.NewViewWithData(pkt0)
+		ow <- buffer.NewViewWithData(pkt1)
 	}()
 
 	got0, err := readers[0].Read()
@@ -101,10 +93,9 @@ func TestUserDeviceReadersConcurrentRace(t *testing.T) {
 
 	errs := make(chan error, 3)
 
-	// Each reader parks in Read on the shared outboundReader; io.Pipe hands
-	// each write to whichever reader is currently waiting. We only care that
+	// Each reader parks in Read on the shared outbound channel. We only care that
 	// concurrent Reads into distinct buffers are race-free, so any parked
-	// reader may serve any write.
+	// reader may serve any packet.
 	var wg sync.WaitGroup
 	run := func(idx int) {
 		defer wg.Done()
@@ -132,18 +123,14 @@ func TestUserDeviceReadersConcurrentRace(t *testing.T) {
 	go run(0)
 	go run(1)
 
-	// Feed 2*iterations packets. io.Pipe copies each write straight into the
-	// waiting reader's private buffer, so reusing buf between writes is safe.
+	// Feed 2*iterations packets.
 	go func() {
 		buf := make([]byte, 32)
 		for i := range 2 * iterations {
 			for j := range buf {
 				buf[j] = byte(i + j)
 			}
-			if _, err := ow.Write(buf); err != nil {
-				errs <- err
-				return
-			}
+			ow <- buffer.NewViewWithData(buf)
 		}
 	}()
 

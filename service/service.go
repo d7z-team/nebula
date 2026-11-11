@@ -1,13 +1,14 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 
@@ -137,50 +138,39 @@ func New(control *nebula.Control) (_ *Service, reterr error) {
 	tcpFwd := tcp.NewForwarder(s.ipstack, tcpReceiveBufferSize, maxInFlightConnectionAttempts, s.tcpHandler)
 	s.ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
-	reader, writer := device.Pipe()
-
-	go func() {
-		<-ctx.Done()
-		reader.Close()
-		writer.Close()
-	}()
+	nebula_tun_reader, nebula_tun_writer := device.Pipe()
 
 	// create Goroutines to forward packets between Nebula and Gvisor
 	eg.Go(func() error {
-		buf := make([]byte, header.IPv4MaximumHeaderSize+header.IPv4MaximumPayloadSize)
+		defer linkEP.Close()
 		for {
-			// this will read exactly one packet
-			n, err := reader.Read(buf)
-			if err != nil {
-				// An error after shutdown began is noise from the device pipes
-				// closing, anything else is fatal and must stop nebula too
-				if ctx.Err() != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			case view, ok := <-nebula_tun_reader:
+				if !ok {
 					return nil
 				}
-				s.control.Stop()
-				return err
-			}
-			var proto tcpip.NetworkProtocolNumber
-			switch header.IPVersion(buf[:n]) {
-			case header.IPv4Version:
-				proto = header.IPv4ProtocolNumber
-			case header.IPv6Version:
-				proto = header.IPv6ProtocolNumber
-			default:
-				// Not an IP packet, nothing in the stack can use it
-				continue
-			}
-			packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.MakeWithData(bytes.Clone(buf[:n])),
-			})
-			linkEP.InjectInbound(proto, packetBuf)
-
-			if ctx.Err() != nil {
-				return nil
+				var proto tcpip.NetworkProtocolNumber
+				switch header.IPVersion(view.AsSlice()) {
+				case header.IPv4Version:
+					proto = header.IPv4ProtocolNumber
+				case header.IPv6Version:
+					proto = header.IPv6ProtocolNumber
+				default:
+					view.Release()
+					continue
+				}
+				packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload: buffer.MakeWithView(view),
+				})
+				linkEP.InjectInbound(proto, packetBuf)
+				packetBuf.DecRef()
 			}
 		}
 	})
 	eg.Go(func() error {
+		defer close(nebula_tun_writer)
 		for {
 			packet := linkEP.ReadContext(ctx)
 			if packet == nil {
@@ -189,16 +179,14 @@ func New(control *nebula.Control) (_ *Service, reterr error) {
 				}
 				continue
 			}
-			bufView := packet.ToView()
-			if _, err := bufView.WriteTo(writer); err != nil {
-				// Same shutdown noise handling as the inbound reader
-				if ctx.Err() != nil {
-					return nil
-				}
-				s.control.Stop()
-				return err
+			view := packet.ToView()
+			packet.DecRef()
+			select {
+			case nebula_tun_writer <- view:
+			case <-ctx.Done():
+				view.Release()
+				return nil
 			}
-			bufView.Release()
 		}
 	})
 
@@ -271,6 +259,21 @@ func (s *Service) Dial(network, address string) (net.Conn, error) {
 	return s.DialContext(context.Background(), network, address)
 }
 
+func (s *Service) DialUDP(address string) (*gonet.UDPConn, error) {
+	addr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return nil, err
+	}
+
+	fullAddr := tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(addr.IP),
+		Port: uint16(addr.Port),
+	}
+
+	return gonet.DialUDP(s.ipstack, nil, &fullAddr, getProtocolNumber(addr.AddrPort().Addr()))
+}
+
 // Listen listens on the provided address. Currently only TCP with wildcard
 // addresses are supported. As with net.Listen, "tcp4" accepts only IPv4
 // connections, "tcp6" only IPv6, and "tcp" both. A "tcp4" and a "tcp6"
@@ -328,6 +331,19 @@ func (s *Service) Listen(network, address string) (net.Listener, error) {
 	return l, nil
 }
 
+// ListenUDP listens for UDP packets on the provided address in the userspace stack.
+func (s *Service) ListenUDP(address string) (*gonet.UDPConn, error) {
+	addr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return nil, err
+	}
+	return gonet.DialUDP(s.ipstack, &tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(addr.IP),
+		Port: uint16(addr.Port),
+	}, nil, getProtocolNumber(addr.AddrPort().Addr()))
+}
+
 // Wait blocks until the service has fully stopped, either via Close or a fatal
 // error, and returns the first fatal error if there was one.
 func (s *Service) Wait() error {
@@ -358,6 +374,24 @@ func (s *Service) closeListeners() {
 	for _, l := range listeners {
 		_ = l.Close()
 	}
+}
+
+// CloseAndWait stops the service and waits for userspace networking to be torn down.
+func (s *Service) CloseAndWait() error {
+	if err := s.Close(); err != nil {
+		return err
+	}
+	if err := s.Wait(); err != nil {
+		if errors.Is(err, os.ErrClosed) ||
+			errors.Is(err, net.ErrClosed) ||
+			errors.Is(err, io.EOF) ||
+			errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 func (s *Service) tcpHandler(r *tcp.ForwarderRequest) {

@@ -16,6 +16,8 @@ import (
 // holepunchQueueSize buffers the channel that pending holepunchJobs land on after their delay timer fires.
 const holepunchQueueSize = 64
 
+var punchPacket = []byte{1}
+
 // holepunchJob is one scheduled item delivered to the worker goroutine.
 //   - target valid -> send a UDP punch to target. vpnAddr, if set, is the peer's vpn addr carried for log context.
 //   - target invalid, vpnAddr valid -> send an encrypted test packet to vpnAddr (a "punchback").
@@ -177,7 +179,7 @@ func (p *Punchy) SendPunch(hostinfo *HostInfo) {
 		p.sendPunchToAllRemotes(hostinfo)
 	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
 		p.metricPunchyTx.Inc(1)
-		p.punchConn.WriteTo([]byte{1}, hr)
+		p.punchConn.WriteTo(punchPacket, hr)
 	}
 }
 
@@ -201,7 +203,7 @@ func (p *Punchy) SendPunchToAll(hostinfo *HostInfo) {
 func (p *Punchy) sendPunchToAllRemotes(hostinfo *HostInfo) {
 	hostinfo.remotes.ForEach(p.hm.GetPreferredRanges(), func(addr netip.AddrPort, preferred bool) {
 		p.metricPunchyTx.Inc(1)
-		p.punchConn.WriteTo([]byte{1}, addr)
+		p.punchConn.WriteTo(punchPacket, addr)
 	})
 }
 
