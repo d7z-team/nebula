@@ -1,6 +1,6 @@
 # 在 gVisor 栈上连接 Nebula peer
 
-本例从客户端 `10.42.0.1` 通过 Nebula 隧道连接对端的 TCP 服务。外层 UDP 由操作系统收发，内层 TCP 连接由应用的 gVisor 栈建立。[安装说明](../README.md#安装)
+本例从客户端 `10.42.0.1` 通过 Nebula 隧道连接对端的 TCP 服务。外层 UDP 由操作系统收发，内层 TCP 连接由应用的 gVisor 栈建立。[安装说明](../README.md#installation)
 
 运行示例需要以下条件。
 

@@ -1,63 +1,85 @@
-# 用于 gVisor 的 Nebula 三层网卡
+# Nebula for gVisor
 
-这是一个可嵌入 Go 应用的 Nebula 模块。`nebulagvisor` 将加密隧道挂载为应用内 gVisor 栈的三层虚拟网卡。Nebula 负责节点发现、证书认证和加密传输，应用管理 IP 地址、路由、转发和 socket。
+Embed [Nebula](https://github.com/slackhq/nebula) in a Go application and attach its encrypted overlay as a Layer 3 interface in a [gVisor](https://github.com/google/gvisor) network stack. Nebula handles peer discovery, certificate authentication, and encrypted tunnels. The application manages IP addresses, routes, forwarding, and sockets through gVisor.
 
-- 支持 IPv4、IPv6 和跨地址族下一跳。网关可以转发其证书中 `UnsafeNetworks` 授权的下游流量。
-- 通过静态地址或 lighthouse 发现节点。每个 peer 可选择自动选路、仅直连或仅中转。自动模式根据认证探测测量的时延、抖动和超时切换路径。
-- 默认 UDP 格式与上游 Nebula 互通。可通过 `DatagramTransport` 自定义外层传输，也可通过 `IPPort` 向其他三层设备收发 IP 包。
+## Features
 
-## 安装
+- IPv4 and IPv6 tunnels, including cross-family next hops and gateway forwarding for networks authorized by `UnsafeNetworks` in the gateway's certificate.
+- Peer discovery through static endpoints or lighthouses. Per-peer policies support direct-only, relay-only, and automatic path selection based on latency, jitter, and timeouts observed by authenticated probes.
+- Independent nodes in the same process, with Go APIs for connection management, path checks, port traffic counters, and relay usage.
+- A gVisor link endpoint for the overlay, an `IPPort` for other Layer 3 devices, and a `DatagramTransport` interface for custom underlay transports.
 
-需要 Go 1.27.3 或更高版本。在应用模块根目录克隆仓库，并让 Go 使用这个本地副本。
+## Relationship to upstream Nebula
+
+This project is an independent fork of [`slackhq/nebula`](https://github.com/slackhq/nebula), based on upstream commit [`a136e25`](https://github.com/slackhq/nebula/commit/a136e25a0602ed4f2ada15d0f160e52a2517d9e0). The latest recorded upstream review covers changes through [`7876efa`](https://github.com/slackhq/nebula/commit/7876efaaf499061109ca888f6ad4f197140087b8), with selected fixes backported to this fork.
+
+This fork is distributed as an embeddable Go library with its own `Node` API. Use the upstream project for the standalone Nebula daemon and its YAML configuration.
+
+The default UDP framing interoperates with upstream Nebula. Leave `Options.DatagramMagic` empty when communicating with upstream peers, lighthouses, or relays. Interoperability tests cover v1 and v2 certificates, handshakes initiated by either implementation, and relays running either implementation. The Go management APIs, health-aware path selection, and custom datagram prefixes are features of this fork. [Run the interoperability tests](#testing).
+
+## Installation
+
+Requires Go 1.27.3 or later. From the root of your application's Go module, clone this fork and point a local module replacement at it.
 
 ```sh
-git clone --single-branch https://code.d7z.net/d7z-team/nebula.git ../nebula
-go mod edit -require=github.com/slackhq/nebula@v0.0.0 -replace=github.com/slackhq/nebula=../nebula
+git clone https://code.d7z.net/d7z-team/nebula.git ../nebula
+go mod edit -require=github.com/slackhq/nebula@v0.0.0
+go mod edit -replace=github.com/slackhq/nebula=../nebula
 ```
 
-已有本地副本时，可将 `-replace` 的目标改为实际路径。在应用中导入 `github.com/slackhq/nebula` 和 `github.com/slackhq/nebula/nebulagvisor` 后运行 `go mod tidy`。使用的 gVisor 版本见 [go.mod](go.mod)。
+The fork retains the upstream module path. Import `github.com/slackhq/nebula` and `github.com/slackhq/nebula/nebulagvisor` in your Go code, then run `go mod tidy`. The gVisor revision used by this fork is declared in [`go.mod`](go.mod).
 
-## 快速开始
+## Quick start
 
-直连示例在已有 gVisor 栈上创建网卡，为它分配证书中的 overlay 地址，然后通过隧道拨号到 `10.42.0.254:8080`。首次拨号会触发 Nebula 握手。[完整 TCP 客户端示例](docs/quickstart.md)
+1. Load a Nebula identity and trusted CA pool, then create a node with `nebula.New`.
+2. Create a `nebulagvisor.Endpoint` for the node and register it as a NIC in your gVisor stack. Assign the overlay address from the certificate and add a route to the peer.
+3. Start the node and dial the peer's overlay address through gVisor. The first connection triggers the Nebula handshake.
 
-| 使用场景 | 指南 |
+The [complete TCP client example](docs/quickstart.md) shows setup and cleanup for a connection to `10.42.0.254:8080`.
+
+## Documentation
+
+The guides are written in Chinese and include Go examples.
+
+| Guide | Topics |
 | --- | --- |
-| 从 PEM 加载身份，签发客户端或网关证书 | [证书与信任池](cert/README.md) |
-| 通过网关访问下游子网，设置转发和回程 | [网关转发](docs/nebula-nic.md#经网关访问下游子网) |
-| 指定中转，检查链路质量和切换原因 | [直连、中转与链路健康](docs/paths.md) |
-| 监控端口吞吐量和中转容量 | [节点和流量监控](docs/nebula-nic.md#监控节点和流量) |
-| 与上游 UDP 互通，或为节点配置统一标识 | [数据报前缀](docs/nebula-nic.md#自定义-udp-数据报前缀) |
-| 接入其他三层设备，或调整发送队列 | [IP 数据端口](docs/nebula-nic.md#接入其他三层设备) · [容量参数](docs/nebula-nic.md#调整节点容量) |
-| 刷新节点地址或定位丢包 | [发现与连接](docs/nebula-nic.md#发现与运行时管理) · [排错](docs/nebula-nic.md#排错) |
+| [Certificates and trust pools](cert/README.md) | Load PEM identities and issue client or gateway certificates |
+| [Direct and relayed paths](docs/paths.md) | Configure per-peer policies, probe paths, and inspect failover |
+| [Gateway forwarding and NIC management](docs/nebula-nic.md) | Set up downstream routes, attach other Layer 3 devices, and manage discovery |
+| [Monitoring and troubleshooting](docs/nebula-nic.md#监控节点和流量) | Inspect peer reachability, port traffic, relay capacity, and packet drops |
 
-## 测试
+## Testing
 
-在本仓库根目录运行 `make check` 执行 `go vet` 和全仓测试，运行 `make race` 检查竞态。指定上游 Nebula 可执行文件的绝对路径，可以验证 v1/v2 证书、双向发起握手和两端担任中转的互通组合。
+```sh
+make check  # go vet and the full Go test suite
+make race   # Run the suite with the race detector
+```
+
+To run the interoperability suite, point `NEBULA_INTEROP_BINARY` at an upstream Nebula executable.
 
 ```sh
 NEBULA_INTEROP_BINARY=/path/to/upstream/nebula go test . -run '^TestNodeUpstream(Interop|RelayInitiator)$' -count=1
 ```
 
 <details>
-<summary>转发测试、链路消融实验与基准测试</summary>
+<summary>Forwarding tests and benchmarks</summary>
 
 ```sh
-# 三端双栈网关转发
+# Dual-stack gateway forwarding through gVisor
 go test . -run '^TestNodeGVisorForwardingAndDetach$' -count=1
 
-# 同一轨迹下比较选路策略，并测量重绑后 1,000 个逻辑会话的恢复时间
+# Path selection and recovery after rebinding 1,000 logical sessions
 go test . -run '^(TestPathQualitySelection|TestPathRebindAtScale)$' -v -count=1
 
-# 同一 peer 已有待发查询时，再次请求发现的开销
+# Discovery query coalescing
 go test . -run '^$' -bench '^BenchmarkPendingLighthouseQuery$' -benchmem
 
-# 比较默认格式和两字节前缀对 1300 字节数据报的封装开销
+# Datagram framing with the default format and a two-byte prefix
 go test . -run '^$' -bench '^BenchmarkDatagramFraming$' -benchmem -cpu=1
 ```
 
 </details>
 
-## 许可证
+## License
 
-[MIT License](LICENSE)
+[MIT](LICENSE)
