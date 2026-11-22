@@ -1,17 +1,10 @@
 package cert_test
 
 import (
-	"crypto/ecdh"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"io"
 	"net/netip"
 	"time"
 
 	"github.com/slackhq/nebula/cert"
-	"golang.org/x/crypto/curve25519"
-	"golang.org/x/crypto/ed25519"
 )
 
 // testCertNow is the reference "now" used to derive default before/after times
@@ -22,22 +15,9 @@ var testCertNow = time.Now().Round(time.Second)
 
 // NewTestCaCert will create a new ca certificate
 func NewTestCaCert(version cert.Version, curve cert.Curve, before, after time.Time, networks, unsafeNetworks []netip.Prefix, groups []string) (cert.Certificate, []byte, []byte, []byte) {
-	var err error
-	var pub, priv []byte
-
-	switch curve {
-	case cert.Curve_CURVE25519:
-		pub, priv, err = ed25519.GenerateKey(rand.Reader)
-	case cert.Curve_P256:
-		privk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			panic(err)
-		}
-
-		pub = elliptic.Marshal(elliptic.P256(), privk.PublicKey.X, privk.PublicKey.Y)
-		priv = privk.D.FillBytes(make([]byte, 32))
-	default:
-		// There is no default to allow the underlying lib to respond with an error
+	pub, priv, err := cert.GenerateSigningKey(curve)
+	if err != nil {
+		panic(err)
 	}
 
 	if before.IsZero() {
@@ -84,15 +64,7 @@ func NewTestCert(v cert.Version, curve cert.Curve, ca cert.Certificate, key []by
 		after = testCertNow.Add(time.Second * 60)
 	}
 
-	var pub, priv []byte
-	switch curve {
-	case cert.Curve_CURVE25519:
-		pub, priv = X25519Keypair()
-	case cert.Curve_P256:
-		pub, priv = P256Keypair()
-	default:
-		panic("unknown curve")
-	}
+	pub, priv := mustAgreementKey(curve)
 
 	nc := &cert.TBSCertificate{
 		Version:        v,
@@ -148,26 +120,19 @@ func NewTestCertDifferentVersion(c cert.Certificate, v cert.Version, ca cert.Cer
 }
 
 func X25519Keypair() ([]byte, []byte) {
-	privkey := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, privkey); err != nil {
-		panic(err)
-	}
-
-	pubkey, err := curve25519.X25519(privkey, curve25519.Basepoint)
-	if err != nil {
-		panic(err)
-	}
-
-	return pubkey, privkey
+	return mustAgreementKey(cert.Curve_CURVE25519)
 }
 
 func P256Keypair() ([]byte, []byte) {
-	privkey, err := ecdh.P256().GenerateKey(rand.Reader)
+	return mustAgreementKey(cert.Curve_P256)
+}
+
+func mustAgreementKey(curve cert.Curve) ([]byte, []byte) {
+	pub, priv, err := cert.GenerateKeyAgreementKey(curve)
 	if err != nil {
 		panic(err)
 	}
-	pubkey := privkey.PublicKey()
-	return pubkey.Bytes(), privkey.Bytes()
+	return pub, priv
 }
 
 // NewTestCAPool creates a CAPool from the given CA certificates, panicking on error.

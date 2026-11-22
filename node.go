@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
-	"slices"
 	"sync"
 	"time"
 
@@ -61,8 +59,7 @@ type RelayOptions struct {
 	Relays    []netip.Addr
 }
 
-// Options contains only in-process settings. It performs no file, YAML,
-// socket, interface, route-table, or firewall configuration.
+// Options configures the Nebula tunnel and its caller-supplied transport.
 type Options struct {
 	Identities        []Identity
 	CAPool            *cert.CAPool
@@ -70,42 +67,31 @@ type Options struct {
 	Cipher            string
 	Transport         DatagramTransport
 
-	Lighthouse       LighthouseOptions
-	Punchy           PunchyOptions
-	Relay            RelayOptions
-	Handshake        HandshakeOptions
-	Connections      ConnectionOptions
-	PreferredRanges  []netip.Prefix
-	VirtualAddresses []netip.Addr
-	UnsafeRoutes     []Route
-	MTU              uint32
-	Logger           *slog.Logger
+	Lighthouse      LighthouseOptions
+	Punchy          PunchyOptions
+	Relay           RelayOptions
+	Handshake       HandshakeOptions
+	Connections     ConnectionOptions
+	PreferredRanges []netip.Prefix
+	InboundPolicy   InboundPolicy
+	Logger          *slog.Logger
 }
 
-type nodeState uint8
-
-const (
-	nodeReady nodeState = iota
-	nodeStarted
-	nodeClosed
-)
-
-// Node is an embedded Nebula endpoint backed by a userspace TCP/IP stack.
+// Node owns Nebula tunnels and the outer datagram transport.
 // New takes ownership of Options.Transport when it succeeds.
 type Node struct {
 	mu            sync.Mutex
 	workers       sync.WaitGroup
-	state         nodeState
+	state         NodeState
+	fatalErr      error
 	ctx           context.Context
 	cancel        context.CancelFunc
 	transport     DatagramTransport
-	netstack      *userNetstack
 	engine        *packetEngine
 	handshake     *handshakeManager
 	connections   *connectionManager
 	punchy        *punchManager
 	lighthouse    *lighthouse
-	virtualAddrs  []netip.Addr
 	transportAddr netip.AddrPort
 }
 
@@ -120,116 +106,38 @@ func New(parent context.Context, options Options) (*Node, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	if options.MTU == 0 {
-		options.MTU = 1300
-	}
-	if options.MTU < 1280 || options.MTU > mtu {
-		return nil, fmt.Errorf("MTU must be between 1280 and %d", mtu)
-	}
-
 	pki, err := newPKI(options.Identities, options.CAPool, options.Cipher, options.InitiatingVersion)
 	if err != nil {
 		return nil, err
 	}
-	certificate := pki.getCertState().v2Cert
-	if certificate == nil {
-		certificate = pki.getCertState().v1Cert
-	}
-	for _, identity := range options.Identities {
-		for _, addr := range options.VirtualAddresses {
-			if !prefixesContain(identity.Certificate.UnsafeNetworks(), addr.Unmap()) {
-				return nil, fmt.Errorf("%w: %s is not authorized by identity %q", ErrAddressNotCertified, addr, identity.Certificate.Name())
-			}
-		}
-	}
-	routes, err := newPacketRouteTable(certificate, options.VirtualAddresses, options.UnsafeRoutes)
-	if err != nil {
-		return nil, err
-	}
-	netstack, err := newUserNetstack(routes, pki.getCertState().myVpnNetworks, options.VirtualAddresses, options.MTU)
-	if err != nil {
-		return nil, err
-	}
-
 	ctx, cancel := context.WithCancel(parent)
-	fail := func(err error) (*Node, error) {
+	engine := newPacketEngine(pki, &options, logger)
+	punchy := newPunchManager(logger, options.Transport, options.Punchy)
+	lighthouse, err := newLighthouse(ctx, logger, pki.getCertState(), punchy, &options)
+	if err != nil {
 		cancel()
-		netstack.destroy()
 		return nil, err
 	}
-	hostMap := newHostMap(logger, options.PreferredRanges)
-	punchy := newPunchy(logger, options.Transport, punchyConfig{
-		punch:           options.Punchy.Punch,
-		respond:         options.Punchy.Respond,
-		delay:           options.Punchy.Delay,
-		respondDelay:    options.Punchy.RespondDelay,
-		punchEverything: options.Punchy.TargetAllRemotes,
-	})
-	connections := newConnectionManager(logger, hostMap, punchy, connectionManagerConfig{
-		checkInterval:           options.Connections.CheckInterval,
-		pendingDeletionInterval: options.Connections.PendingDeletionInterval,
-		inactivityTimeout:       options.Connections.InactivityTimeout,
-		dropInactive:            options.Connections.DropInactive,
-	})
-	updateInterval := options.Lighthouse.UpdateInterval
-	if updateInterval == 0 && len(options.Lighthouse.Hosts) > 0 {
-		updateInterval = 10 * time.Second
-	} else if updateInterval < 0 {
-		updateInterval = 0
-	}
-	lighthouse, err := newLightHouse(ctx, logger, pki.getCertState(), punchy, lighthouseConfig{
-		amLighthouse:     options.Lighthouse.AmLighthouse,
-		lighthouses:      cloneAddresses(options.Lighthouse.Hosts),
-		staticHosts:      cloneStaticHosts(options.Lighthouse.StaticHosts),
-		advertiseAddrs:   slices.Clone(options.Lighthouse.AdvertiseEndpoints),
-		endpointProvider: options.Lighthouse.EndpointProvider,
-		relays:           cloneAddresses(options.Relay.Relays),
-		updateInterval:   updateInterval,
-	})
-	if err != nil {
-		return fail(err)
-	}
-	handshakeConfig := defaultHandshakeConfig
-	if options.Handshake.TryInterval > 0 {
-		handshakeConfig.tryInterval = options.Handshake.TryInterval
-	}
-	if options.Handshake.Retries > 0 {
-		handshakeConfig.retries = int64(options.Handshake.Retries)
-	}
-	if options.Handshake.TriggerBuffer > 0 {
-		handshakeConfig.triggerBuffer = options.Handshake.TriggerBuffer
-	}
-	handshake := newHandshakeManager(logger, hostMap, lighthouse, options.Transport, handshakeConfig)
-	lighthouse.handshakeTrigger = handshake.trigger
-	relay := newRelayManager(logger, hostMap, options.Relay.AmRelay, options.Relay.UseRelays)
-	engine, err := newPacketEngine(ctx, &packetEngineConfig{
-		hostMap:           hostMap,
-		Outside:           options.Transport,
-		Netstack:          netstack,
-		Routes:            routes,
-		pki:               pki,
-		handshakeManager:  handshake,
-		lightHouse:        lighthouse,
-		connectionManager: connections,
-		relayManager:      relay,
-		tryPromoteEvery:   defaultPromoteEvery,
-		reQueryEvery:      defaultReQueryEvery,
-		reQueryWait:       defaultReQueryWait,
-		l:                 logger,
-	})
-	if err != nil {
-		return fail(err)
-	}
+	handshake := newHandshakeManager(logger, engine.hostMap, lighthouse, options.Transport, options.Handshake)
+	connections := newConnectionManager(logger, engine.hostMap, punchy, options.Connections)
+	engine.handshakeManager = handshake
+	engine.connectionManager = connections
+	engine.lightHouse = lighthouse
+	connections.engine = engine
 	handshake.f = engine
-	lighthouse.ifce = engine
+	lighthouse.handshakeTrigger = handshake.trigger
+	lighthouse.sender = engine
+	punchy.engine = engine
+	punchy.lh = lighthouse
 	transportAddr, _ := options.Transport.LocalAddr()
 	n := &Node{
-		ctx: ctx, cancel: cancel, transport: options.Transport, netstack: netstack,
+		ctx: ctx, cancel: cancel, transport: options.Transport,
 		engine: engine, handshake: handshake, connections: connections,
-		punchy: punchy, lighthouse: lighthouse, virtualAddrs: cloneAddresses(options.VirtualAddresses),
+		punchy: punchy, lighthouse: lighthouse,
 		transportAddr: unmapAddrPort(transportAddr),
 	}
-	engine.triggerShutdown = func() { _ = n.Close() }
+	// Keep Wait blocked through shutdown, including when it is called before Start.
+	n.workers.Add(1)
 	return n, nil
 }
 
@@ -237,27 +145,28 @@ func (n *Node) Start() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	switch n.state {
-	case nodeStarted:
+	case NodeStateRunning:
 		return ErrNodeStarted
-	case nodeClosed:
+	case NodeStateClosed:
 		return ErrNodeClosed
 	}
-	transportAddr, err := n.engine.activate()
+	transportAddr, err := n.transport.LocalAddr()
 	if err != nil {
-		n.state = nodeClosed
+		n.state = NodeStateClosed
 		n.cancel()
-		_ = n.engine.Close()
-		return err
+		_ = n.closeTransport()
+		return fmt.Errorf("get datagram transport address: %w", err)
 	}
 	n.transportAddr = unmapAddrPort(transportAddr)
-	n.state = nodeStarted
-	n.punchy.configure(n.ctx, n.engine, n.engine.hostMap, n.lighthouse)
+	n.state = NodeStateRunning
+	n.engine.l.Info("Nebula node is active", "networks", n.engine.myVpnNetworks, "transportAddr", transportAddr)
+	n.punchy.ctx = n.ctx
 	n.workers.Go(func() { n.handshake.Run(n.ctx) })
 	n.workers.Go(func() { n.punchy.run(n.ctx) })
 	n.workers.Go(func() { n.connections.Start(n.ctx) })
 	n.workers.Go(n.lighthouse.runQueryWorker)
 	n.workers.Go(n.lighthouse.runUpdateWorker)
-	n.engine.run()
+	n.workers.Go(func() { _ = n.shutdown(n.engine.receiveDatagrams()) })
 	n.workers.Go(func() {
 		<-n.ctx.Done()
 		_ = n.Close()
@@ -265,77 +174,42 @@ func (n *Node) Start() error {
 	return nil
 }
 
-func (n *Node) Close() error {
+func (n *Node) Close() error { return n.shutdown(nil) }
+
+func (n *Node) shutdown(cause error) error {
 	n.mu.Lock()
-	if n.state == nodeClosed {
+	if n.state == NodeStateClosed {
 		n.mu.Unlock()
 		return nil
 	}
-	n.state = nodeClosed
+	if n.ctx.Err() != nil {
+		cause = nil
+	}
+	n.fatalErr = cause
+	n.state = NodeStateClosed
 	n.cancel()
 	n.mu.Unlock()
-	return n.engine.Close()
+	if cause != nil {
+		n.engine.l.Error("datagram transport reader failed", "error", cause)
+	}
+	return n.closeTransport()
+}
+
+// closeTransport is called once after the transition to NodeStateClosed.
+func (n *Node) closeTransport() error {
+	defer n.workers.Done()
+	if port := n.engine.port.Load(); port != nil {
+		port.Close()
+	}
+	return n.transport.Close()
 }
 
 func (n *Node) Wait() error {
-	err := n.engine.wait()
 	n.workers.Wait()
-	return err
+	return n.Err()
 }
 
 func (n *Node) Context() context.Context { return n.ctx }
-
-func (n *Node) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if err := n.requireStarted(); err != nil {
-		return nil, err
-	}
-	return n.netstack.dialContext(ctx, network, address, netip.Addr{})
-}
-
-func (n *Node) Dial(network, address string) (net.Conn, error) {
-	return n.DialContext(context.Background(), network, address)
-}
-
-func (n *Node) Listen(network, address string) (net.Listener, error) {
-	if err := n.requireStarted(); err != nil {
-		return nil, err
-	}
-	return n.netstack.listen(network, address)
-}
-
-func (n *Node) ListenPacket(network, address string) (net.PacketConn, error) {
-	if err := n.requireStarted(); err != nil {
-		return nil, err
-	}
-	return n.netstack.listenPacket(network, address)
-}
-
-type DialerOptions struct {
-	LocalAddr netip.Addr
-}
-
-type Dialer struct {
-	node  *Node
-	local netip.Addr
-}
-
-func (n *Node) Dialer(options DialerOptions) *Dialer {
-	return &Dialer{node: n, local: options.LocalAddr.Unmap()}
-}
-
-func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if d == nil || d.node == nil {
-		return nil, errors.New("nil Nebula dialer")
-	}
-	if err := d.node.requireStarted(); err != nil {
-		return nil, err
-	}
-	return d.node.netstack.dialContext(ctx, network, address, d.local)
-}
-
-func (d *Dialer) Dial(network, address string) (net.Conn, error) {
-	return d.DialContext(context.Background(), network, address)
-}
 
 func (n *Node) Rebind() error {
 	if err := n.requireStarted(); err != nil {
@@ -361,10 +235,10 @@ func (n *Node) Rebind() error {
 func (n *Node) requireStarted() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.state == nodeClosed {
+	if n.state == NodeStateClosed {
 		return ErrNodeClosed
 	}
-	if n.state != nodeStarted {
+	if n.state != NodeStateRunning {
 		return ErrNodeNotStarted
 	}
 	if n.ctx.Err() != nil {
@@ -377,14 +251,6 @@ func cloneAddresses(in []netip.Addr) []netip.Addr {
 	out := make([]netip.Addr, len(in))
 	for i, addr := range in {
 		out[i] = addr.Unmap()
-	}
-	return out
-}
-
-func cloneStaticHosts(in map[netip.Addr][]netip.AddrPort) map[netip.Addr][]netip.AddrPort {
-	out := make(map[netip.Addr][]netip.AddrPort, len(in))
-	for addr, endpoints := range in {
-		out[addr.Unmap()] = slices.Clone(endpoints)
 	}
 	return out
 }

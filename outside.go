@@ -9,10 +9,10 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-// readOutsidePackets processes one received underlay packet. Message payloads
+// dispatchDatagram processes one received underlay packet. Message payloads
 // are decrypted in place, so the caller must not reuse packet until it returns.
-func (f *packetEngine) readOutsidePackets(via packetSender, packet []byte, rxc *rxContext) {
-	h := rxc.h
+func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rxContext) {
+	h := &rxc.h
 	err := h.Parse(packet)
 	if err != nil {
 		// Hole punch packets are 0 or 1 byte big, so lets ignore printing those errors
@@ -70,14 +70,14 @@ func (f *packetEngine) readOutsidePackets(via packetSender, packet []byte, rxc *
 	if isMessageRelay {
 		hostinfo = f.hostMap.QueryRelayIndex(h.RemoteIndex)
 	} else {
-		hostinfo = f.hostMap.QueryIndexCached(h.RemoteIndex, rxc.hostmapCache)
+		hostinfo = f.hostMap.QueryIndex(h.RemoteIndex)
 	}
 
 	// At this point we should have a valid existing tunnel, verify and send
 	// recvError if necessary
 	if hostinfo == nil || hostinfo.connectionState == nil {
 		if !via.IsRelayed {
-			f.maybeSendRecvError(via.UdpAddr, h.RemoteIndex)
+			f.sendRecvError(via.UdpAddr, h.RemoteIndex)
 		}
 		return
 	}
@@ -113,13 +113,13 @@ func (f *packetEngine) readOutsidePackets(via packetSender, packet []byte, rxc *
 
 	// Roam before we respond
 	f.handleHostRoaming(hostinfo, via)
-	f.connectionManager.recordInbound(hostinfo)
+	hostinfo.markIn()
 
 	switch h.Type {
 	case header.Message:
 		switch h.Subtype {
 		case header.MessageNone:
-			f.handleOutsideMessagePacket(hostinfo, h.MessageCounter, out, rxc)
+			f.deliverIP(hostinfo, out)
 		default:
 			hostinfo.logger(f.l).Error("IsValidSubType was true, but unexpected message subtype seen", "from", via, "header", h)
 			return
@@ -127,7 +127,7 @@ func (f *packetEngine) readOutsidePackets(via packetSender, packet []byte, rxc *
 
 	case header.LightHouse:
 		//TODO: assert via is not relayed
-		rxc.lhh.HandleRequest(via.UdpAddr, hostinfo.vpnAddrs, out, f)
+		rxc.lhh.HandleRequest(via.UdpAddr, hostinfo.vpnAddrs, out)
 
 	case header.Test:
 		switch h.Subtype {
@@ -160,13 +160,13 @@ func (f *packetEngine) readOutsidePackets(via packetSender, packet []byte, rxc *
 }
 
 func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSender, packet []byte, rxc *rxContext) {
-	h := rxc.h
+	h := &rxc.h
 	// Successfully validated the thing. Get rid of the relay header and the AEAD tag
 	signedPayload := packet[header.Len : len(packet)-hostinfo.connectionState.dKey.Overhead()]
 	// Pull the Roaming parts up here, and return in all call paths.
 	f.handleHostRoaming(hostinfo, via)
 	// Track usage of both the hostInfo and the relay for the received & authenticated packet
-	f.connectionManager.recordInbound(hostinfo)
+	hostinfo.markIn()
 	f.connectionManager.recordRelayUse(h.RemoteIndex)
 
 	relay, ok := hostinfo.relayState.QueryRelayForByIdx(h.RemoteIndex)
@@ -187,7 +187,7 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 			relay:     relay,
 			IsRelayed: true,
 		}
-		f.readOutsidePackets(via, signedPayload, rxc)
+		f.dispatchDatagram(via, signedPayload, rxc)
 	case relayTypeForwarding:
 		// Find the target hostInfo relay object
 		targetHI, targetRelay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relay.PeerAddr)
@@ -293,27 +293,28 @@ func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
 
 }
 
-func (f *packetEngine) handleOutsideMessagePacket(hostinfo *hostInfo, _ uint64, packet []byte, _ *rxContext) {
-	inner, err := parseInnerPacket(packet)
-	if err != nil {
-		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("dropping invalid inbound packet", "error", err)
-		}
+func (f *packetEngine) deliverIP(hostinfo *hostInfo, packet []byte) {
+	port := f.port.Load()
+	if port == nil || port.ctx.Err() != nil {
 		return
 	}
-	if err := f.routes.validateInbound(inner, hostinfo); err != nil {
-		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("dropping unauthorized inbound packet", "error", err)
-		}
+	ip, err := parseInnerPacket(packet)
+	peer := hostinfo.vpnAddrs[0]
+	var reason string
+	switch {
+	case err != nil:
+		reason = "invalid inner IP packet"
+	case !f.authorizesLocal(ip.destination):
+		reason = "local certificate does not authorize destination"
+	case !hostinfo.authorizes(ip.source):
+		reason = "peer certificate does not authorize source"
+	case f.inboundPolicy != nil && !f.inboundPolicy(peer, ip.source, ip.destination):
+		reason = "inbound policy denied packet"
+	default:
+		port.deliver(packet)
 		return
 	}
-	if err := f.netstack.inject(packet); err != nil && f.l.Enabled(context.Background(), slog.LevelDebug) {
-		hostinfo.logger(f.l).Debug("failed to inject inbound packet into userspace stack", "error", err)
-	}
-}
-
-func (f *packetEngine) maybeSendRecvError(endpoint netip.AddrPort, index uint32) {
-	f.sendRecvError(endpoint, index)
+	port.recordDrop(true, peer, ip, reason, 1)
 }
 
 func (f *packetEngine) sendRecvError(endpoint netip.AddrPort, index uint32) {

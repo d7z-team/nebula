@@ -49,11 +49,10 @@ func TestNodeSnapshotLifecycleAndCopies(t *testing.T) {
 	underlay := netip.MustParseAddrPort("127.0.0.1:22001")
 	transport := newMemoryDatagramNetwork(underlay)[0]
 	node, err := New(t.Context(), Options{
-		Identities:       []Identity{a.identity},
-		CAPool:           pool,
-		Transport:        transport,
-		VirtualAddresses: []netip.Addr{a.virtual},
-		Logger:           slog.New(slog.DiscardHandler),
+		Identities: []Identity{a.identity},
+		CAPool:     pool,
+		Transport:  transport,
+		Logger:     slog.New(slog.DiscardHandler),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -65,17 +64,14 @@ func TestNodeSnapshotLifecycleAndCopies(t *testing.T) {
 	require.Equal(t, NodeStateReady, ready.State)
 	require.Equal(t, underlay, ready.TransportAddress)
 	require.Contains(t, ready.OverlayAddresses, a.addr)
-	require.Equal(t, []netip.Addr{a.virtual}, ready.VirtualAddresses)
 	require.Len(t, ready.Certificates, 1)
 	require.NotSame(t, a.identity.Certificate, ready.Certificates[0])
 	require.Nil(t, node.Err())
 
 	ready.OverlayAddresses[0] = netip.IPv4Unspecified()
-	ready.VirtualAddresses[0] = netip.IPv4Unspecified()
 	ready.Certificates[0].Networks()[0] = netip.MustParsePrefix("10.99.0.1/24")
 	again := node.Snapshot()
 	require.Contains(t, again.OverlayAddresses, a.addr)
-	require.Equal(t, []netip.Addr{a.virtual}, again.VirtualAddresses)
 	require.Equal(t, a.addr, again.Certificates[0].Networks()[0].Addr())
 
 	require.NoError(t, node.Start())
@@ -392,7 +388,8 @@ func TestNodeDisconnectPeerClosesEveryTunnelOnce(t *testing.T) {
 	require.Equal(t, DisconnectResult{}, result)
 }
 
-func TestNodeDisconnectRemovesTunnelBeforeNotificationWrite(t *testing.T) {
+func newGatedNodePair(t *testing.T) (*Node, *gatedWriteTransport, nodeTestIdentity, nodeTestIdentity) {
+	t.Helper()
 	pool, a, b := newNodeTestIdentities(t)
 	underlayA := netip.MustParseAddrPort("127.0.0.1:22005")
 	underlayB := netip.MustParseAddrPort("127.0.0.1:22006")
@@ -424,6 +421,11 @@ func TestNodeDisconnectRemovesTunnelBeforeNotificationWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, nodeA.ConnectPeer(ctx, b.addr))
+	return nodeA, gated, a, b
+}
+
+func TestNodeDisconnectRemovesTunnelBeforeNotificationWrite(t *testing.T) {
+	nodeA, gated, _, b := newGatedNodePair(t)
 	gated.enabled.Store(true)
 	result := make(chan error, 1)
 	go func() {

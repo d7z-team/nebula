@@ -1,10 +1,8 @@
 package nebula
 
 import (
-	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"net/netip"
 
 	"github.com/slackhq/nebula/header"
@@ -14,53 +12,10 @@ import (
 
 var errTunnelCounterExhausted = errors.New("tunnel message counter is exhausted")
 
-func (f *packetEngine) consumeInsidePacket(packet, nonce []byte) {
-	p, err := parseInnerPacket(packet)
-	if err != nil {
-		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			f.l.Debug("dropping invalid outbound packet", "error", err)
-		}
-		return
-	}
-
-	via, ok := f.routes.resolve(p.destination)
-	if !ok {
-		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			f.l.Debug("dropping outbound packet without a route", "destination", p.destination)
-		}
-		return
-	}
-
-	hostinfo, ready := f.handshakeManager.GetOrHandshake(via, func(hh *handshakeHostInfo) {
-		hh.cachePacket(f.l, header.Message, header.MessageNone, packet, f.sendMessageNow)
-	})
-	if hostinfo == nil || !ready {
-		return
-	}
-	if err := f.routes.validateOutbound(p, hostinfo); err != nil {
-		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("dropping unauthorized outbound packet", "error", err)
-		}
-		return
-	}
-
-	f.sendEncrypted(header.Message, header.MessageNone, hostinfo.connectionState, hostinfo, netip.AddrPort{}, packet, nonce, make([]byte, 0, len(packet)+header.MaxOverhead))
-}
-
 // Handshake starts a tunnel handshake with an overlay address. It is a no-op
 // when a usable tunnel already exists or a handshake is already in progress.
 func (f *packetEngine) Handshake(vpnAddr netip.Addr) {
 	f.handshakeManager.GetOrHandshake(vpnAddr.Unmap(), nil)
-}
-
-func (f *packetEngine) sendMessageNow(t header.MessageType, st header.MessageSubType, hostinfo *hostInfo, packet, nonce, out []byte) {
-	if t == header.Message {
-		p, err := parseInnerPacket(packet)
-		if err != nil || f.routes.validateOutbound(p, hostinfo) != nil {
-			return
-		}
-	}
-	f.sendEncrypted(t, st, hostinfo.connectionState, hostinfo, netip.AddrPort{}, packet, nonce, out)
 }
 
 // SendMessageToVpnAddr resolves vpnAddr to a tunnel and sends an encrypted
@@ -68,7 +23,7 @@ func (f *packetEngine) sendMessageNow(t header.MessageType, st header.MessageSub
 // unsafe routing is used solely for inner IP packets.
 func (f *packetEngine) SendMessageToVpnAddr(t header.MessageType, st header.MessageSubType, vpnAddr netip.Addr, p, nb, out []byte) {
 	hostInfo, ready := f.handshakeManager.GetOrHandshake(vpnAddr.Unmap(), func(hh *handshakeHostInfo) {
-		hh.cachePacket(f.l, t, st, p, f.SendMessageToHostInfo)
+		hh.cacheControlPacket(f.l, t, st, p)
 	})
 	if hostInfo == nil || !ready {
 		return
@@ -81,11 +36,11 @@ func (f *packetEngine) SendMessageToHostInfo(t header.MessageType, st header.Mes
 }
 
 func (f *packetEngine) send(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, p, nb, out []byte) {
-	f.sendEncrypted(t, st, ci, hostinfo, netip.AddrPort{}, p, nb, out)
+	f.sendTo(t, st, ci, hostinfo, netip.AddrPort{}, p, nb, out)
 }
 
-func (f *packetEngine) sendTo(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, p, nb, out []byte) {
-	f.sendEncrypted(t, st, ci, hostinfo, remote, p, nb, out)
+func (f *packetEngine) sendTo(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, p, nb, out []byte) (TunnelPath, error) {
+	return f.sendEncryptedWithRoute(t, st, ci, hostinfo, remote, nil, nil, p, nb, out)
 }
 
 func (f *packetEngine) dropExhausted(hostinfo *hostInfo, counter uint64, message string) {
@@ -108,7 +63,7 @@ func (f *packetEngine) prepareSendVia(via *hostInfo, relay *relay, authenticated
 	}
 
 	out = header.Encode(out, header.Version, header.Message, header.MessageRelay, relay.RemoteIndex, counter)
-	f.connectionManager.recordOutboundNoRebind(via)
+	via.markOutOnly() // The direct path consumes the rebind epoch.
 	if len(out)+len(authenticatedData)+via.connectionState.eKey.Overhead() > cap(out) {
 		if noiseutil.EncryptLockNeeded {
 			via.connectionState.writeLock.Unlock()
@@ -133,29 +88,30 @@ func (f *packetEngine) prepareSendVia(via *hostInfo, relay *relay, authenticated
 	return out, nil
 }
 
-// SendVia authenticates an already Nebula-framed packet through an established
-// relay tunnel. End-to-end encryption belongs to the inner packet.
-func (f *packetEngine) SendVia(via *hostInfo, relay *relay, authenticatedData, nonce, out []byte, noCopy bool) {
-	toSend, err := f.prepareSendVia(via, relay, authenticatedData, nonce, out, noCopy)
+// sendVia authenticates an already encrypted Nebula packet for the relay.
+func (f *packetEngine) sendVia(via *hostInfo, relay *relay, data, nonce, out []byte, noCopy bool) (TunnelPath, error) {
+	toSend, err := f.prepareSendVia(via, relay, data, nonce, out, noCopy)
 	if err != nil {
-		return
+		return TunnelPath{}, err
 	}
-	if err := f.outside.WriteTo(toSend, via.GetRemote()); err != nil {
+	path := TunnelPath{Endpoint: via.GetRemote(), Relay: via.vpnAddrs[0]}
+	if err := f.outside.WriteTo(toSend, path.Endpoint); err != nil {
 		if l, ok := logging.RateLimited(f.l, f.udpRelayTxErrLimiter); ok {
 			via.logger(l).Info("failed to write relayed datagram", "error", err)
 		}
+		return path, err
 	}
+	return path, nil
 }
 
-func (f *packetEngine) sendEncrypted(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, payload, nonce, out []byte) {
-	f.sendEncryptedWithRoute(t, st, ci, hostinfo, remote, nil, nil, payload, nonce, out)
-}
-
-func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, relayHostInfo *hostInfo, relayRoute *relay, payload, nonce, out []byte) {
+func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.MessageSubType, ci *connectionState, hostinfo *hostInfo, remote netip.AddrPort, relayHostInfo *hostInfo, relayRoute *relay, payload, nonce, out []byte) (TunnelPath, error) {
 	if ci == nil || ci.eKey == nil {
-		return
+		return TunnelPath{}, ErrPeerUnavailable
 	}
-	useRelay := !remote.IsValid() && !hostinfo.GetRemote().IsValid()
+	if !remote.IsValid() {
+		remote = hostinfo.GetRemote()
+	}
+	useRelay := !remote.IsValid()
 	need := header.Len + len(payload) + ci.eKey.Overhead()
 	if useRelay {
 		need += header.Len + ci.eKey.Overhead()
@@ -164,7 +120,7 @@ func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.Me
 		if l, ok := logging.RateLimited(f.l, f.txOversizeLimiter); ok {
 			hostinfo.logger(l).Error("dropping oversized outbound packet", "bufferCapacity", cap(out), "required", need)
 		}
-		return
+		return TunnelPath{}, io.ErrShortBuffer
 	}
 
 	fullOut := out[:0]
@@ -182,10 +138,10 @@ func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.Me
 			ci.writeLock.Unlock()
 		}
 		f.dropExhausted(hostinfo, counter, "dropping outbound packet: tunnel message counter is exhausted")
-		return
+		return TunnelPath{}, errTunnelCounterExhausted
 	}
 	out = header.Encode(out, header.Version, t, st, hostinfo.remoteIndexId, counter)
-	if t != header.CloseTunnel && f.connectionManager.recordOutbound(hostinfo) {
+	if t != header.CloseTunnel && hostinfo.markOut(f.rebindEpoch.Load()) {
 		f.lightHouse.QueryServer(hostinfo.vpnAddrs[0])
 	}
 
@@ -196,23 +152,20 @@ func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.Me
 	}
 	if err != nil {
 		hostinfo.logger(f.l).Error("failed to encrypt outgoing packet", "error", err, "counter", counter)
-		return
+		return TunnelPath{}, err
 	}
 
-	if !remote.IsValid() {
-		remote = hostinfo.GetRemote()
-	}
 	if remote.IsValid() {
-		if err := f.outside.WriteTo(out, remote); err != nil {
+		err := f.outside.WriteTo(out, remote)
+		if err != nil {
 			if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
 				hostinfo.logger(l).Error("failed to write outgoing datagram", "error", err, "remote", remote)
 			}
 		}
-		return
+		return TunnelPath{Endpoint: remote}, err
 	}
 	if relayHostInfo != nil && relayRoute != nil {
-		f.SendVia(relayHostInfo, relayRoute, out, nonce, fullOut[:header.Len+len(out)], true)
-		return
+		return f.sendVia(relayHostInfo, relayRoute, out, nonce, fullOut[:header.Len+len(out)], true)
 	}
 
 	for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
@@ -221,7 +174,7 @@ func (f *packetEngine) sendEncryptedWithRoute(t header.MessageType, st header.Me
 			hostinfo.relayState.DeleteRelay(relayIP)
 			continue
 		}
-		f.SendVia(relayHostInfo, relay, out, nonce, fullOut[:header.Len+len(out)], true)
-		return
+		return f.sendVia(relayHostInfo, relay, out, nonce, fullOut[:header.Len+len(out)], true)
 	}
+	return TunnelPath{}, ErrPeerUnavailable
 }

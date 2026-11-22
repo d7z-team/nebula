@@ -1,6 +1,7 @@
 package nebula
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -29,7 +30,6 @@ const (
 type NodeSnapshot struct {
 	State             NodeState
 	OverlayAddresses  []netip.Addr
-	VirtualAddresses  []netip.Addr
 	Certificates      []cert.Certificate
 	InitiatingVersion cert.Version
 	TransportAddress  netip.AddrPort
@@ -45,13 +45,11 @@ func (n *Node) Snapshot() NodeSnapshot {
 	n.mu.Unlock()
 
 	out := NodeSnapshot{
-		State:            NodeState(state),
+		State:            state,
 		OverlayAddresses: cloneAddresses(n.engine.myVpnAddrs),
-		VirtualAddresses: cloneAddresses(n.virtualAddrs),
 		TransportAddress: transportAddr,
 	}
-	slices.SortFunc(out.OverlayAddresses, func(a, b netip.Addr) int { return a.Compare(b) })
-	slices.SortFunc(out.VirtualAddresses, func(a, b netip.Addr) int { return a.Compare(b) })
+	slices.SortFunc(out.OverlayAddresses, netip.Addr.Compare)
 	cs := n.engine.pki.getCertState()
 	out.InitiatingVersion = cs.DefaultVersion()
 	if cs.v1Cert != nil {
@@ -63,13 +61,12 @@ func (n *Node) Snapshot() NodeSnapshot {
 	return out
 }
 
-// Err reports the transport or userspace-stack failure that caused the Node
+// Err reports the datagram transport failure that caused the Node
 // to shut down. Explicit Close and a Node that is still running return nil.
 func (n *Node) Err() error {
-	if err := n.engine.fatalErr.Load(); err != nil {
-		return *err
-	}
-	return nil
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.fatalErr
 }
 
 type PeerState uint8
@@ -79,6 +76,12 @@ const (
 	PeerStateEstablished
 )
 
+// TunnelPath identifies the underlay destination and optional overlay relay.
+type TunnelPath struct {
+	Endpoint netip.AddrPort
+	Relay    netip.Addr
+}
+
 // PeerSnapshot is a detached view of one logical Nebula peer. A connecting
 // peer has a nil Certificate and an invalid CurrentEndpoint.
 type PeerSnapshot struct {
@@ -86,6 +89,7 @@ type PeerSnapshot struct {
 	State            PeerState
 	HandshakePending bool
 	CurrentEndpoint  netip.AddrPort
+	LastDataPath     TunnelPath // Last successful IP datagram write to the transport.
 	KnownEndpoints   []netip.AddrPort
 	RelayCandidates  []netip.Addr
 	Initiator        bool
@@ -163,14 +167,17 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 	peerByAddress := make(map[netip.Addr]int)
 	for _, h := range established {
 		addresses := cloneAddresses(h.vpnAddrs)
-		slices.SortFunc(addresses, func(a, b netip.Addr) int { return a.Compare(b) })
-		known, relays := copyPeerRemotes(h.remotes, hostMap.GetPreferredRanges())
+		slices.SortFunc(addresses, netip.Addr.Compare)
+		known, relays := h.remotes.candidates().copyPaths()
 		peer := PeerSnapshot{
 			Addresses:       addresses,
 			State:           PeerStateEstablished,
 			CurrentEndpoint: unmapAddrPort(h.GetRemote()),
 			KnownEndpoints:  known,
 			RelayCandidates: relays,
+		}
+		if path := h.lastDataPath.Load(); path != nil {
+			peer.LastDataPath = *path
 		}
 		if h.connectionState != nil {
 			peer.Initiator = h.connectionState.initiator
@@ -201,9 +208,9 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 			continue
 		}
 		addresses := cloneAddresses(hh.hostinfo.vpnAddrs)
-		known, relays := copyPeerRemotes(hh.hostinfo.remotes, hostMap.GetPreferredRanges())
+		known, relays := hh.hostinfo.remotes.candidates().copyPaths()
 		hh.Unlock()
-		slices.SortFunc(addresses, func(a, b netip.Addr) int { return a.Compare(b) })
+		slices.SortFunc(addresses, netip.Addr.Compare)
 
 		matched := -1
 		for _, addr := range addresses {
@@ -290,7 +297,7 @@ func (n *Node) ConnectPeer(ctx context.Context, addr netip.Addr) error {
 	n.handshake.StartHandshake(addr, nil)
 	n.engine.hostMap.RUnlock()
 
-	interval := n.handshake.config.tryInterval / 4
+	interval := n.handshake.config.TryInterval / 4
 	if interval <= 0 || interval > 25*time.Millisecond {
 		interval = 25 * time.Millisecond
 	}
@@ -369,17 +376,7 @@ func (n *Node) DisconnectPeer(addr netip.Addr, options DisconnectOptions) (Disco
 		}
 		return false
 	}
-	result := DisconnectResult{HandshakesCanceled: n.cancelPendingHandshakes(func(addrs []netip.Addr) bool {
-		return matchesTarget(addrs)
-	})}
-	tunnels := n.collectTunnels(func(h *hostInfo) bool { return matchesTarget(h.vpnAddrs) })
-	sortTunnelsRelayLast(tunnels)
-	for _, h := range tunnels {
-		if n.disconnectTunnel(h, options.LocalOnly) {
-			result.TunnelsClosed++
-		}
-	}
-	return result, nil
+	return n.disconnectMatching(options.LocalOnly, matchesTarget), nil
 }
 
 // DisconnectAll cancels pending handshakes and closes all established
@@ -390,41 +387,42 @@ func (n *Node) DisconnectAll(options DisconnectAllOptions) (DisconnectResult, er
 		return DisconnectResult{}, err
 	}
 
-	lighthouses := make(map[netip.Addr]struct{})
-	if options.KeepLighthouses {
-		for _, addr := range n.lighthouse.GetLighthouses() {
-			lighthouses[addr.Unmap()] = struct{}{}
+	return n.disconnectMatching(options.LocalOnly, func(addrs []netip.Addr) bool {
+		return !options.KeepLighthouses || !n.lighthouse.IsAnyLighthouseAddr(addrs)
+	}), nil
+}
+
+func (n *Node) disconnectMatching(localOnly bool, include func([]netip.Addr) bool) DisconnectResult {
+	result := DisconnectResult{HandshakesCanceled: n.cancelPendingHandshakes(include)}
+	hosts := n.engine.hostMap
+	hosts.RLock()
+	tunnels := make([]*hostInfo, 0, len(hosts.Indexes))
+	for _, h := range hosts.Indexes {
+		if include(h.vpnAddrs) {
+			tunnels = append(tunnels, h)
 		}
 	}
-	keep := func(addrs []netip.Addr) bool {
-		for _, addr := range addrs {
-			if _, ok := lighthouses[addr.Unmap()]; ok {
-				return true
-			}
-		}
-		return false
-	}
-	result := DisconnectResult{HandshakesCanceled: n.cancelPendingHandshakes(func(addrs []netip.Addr) bool {
-		return !keep(addrs)
-	})}
-	tunnels := n.collectTunnels(func(h *hostInfo) bool { return !keep(h.vpnAddrs) })
+	hosts.RUnlock()
 	sortTunnelsRelayLast(tunnels)
 	for _, h := range tunnels {
-		if n.disconnectTunnel(h, options.LocalOnly) {
+		if n.disconnectTunnel(h, localOnly) {
 			result.TunnelsClosed++
 		}
 	}
-	return result, nil
+	return result
 }
 
 func sortTunnelsRelayLast(tunnels []*hostInfo) {
 	relayAddresses := make(map[netip.Addr]struct{})
 	relayTunnels := make(map[*hostInfo]bool, len(tunnels))
 	for _, h := range tunnels {
-		relayTunnels[h] = len(h.relayState.CopyRelayForIps()) > 0
-		for _, addr := range h.relayState.CopyRelayIps() {
+		rs := &h.relayState
+		rs.RLock()
+		relayTunnels[h] = len(rs.relayForByAddr) > 0
+		for _, addr := range rs.relays {
 			relayAddresses[addr.Unmap()] = struct{}{}
 		}
+		rs.RUnlock()
 	}
 	for _, h := range tunnels {
 		for _, addr := range h.vpnAddrs {
@@ -447,19 +445,16 @@ func sortTunnelsRelayLast(tunnels []*hostInfo) {
 				return cmp
 			}
 		}
-		if a.localIndexId < b.localIndexId {
-			return -1
-		}
-		if a.localIndexId > b.localIndexId {
-			return 1
-		}
-		return 0
+		return cmp.Compare(a.localIndexId, b.localIndexId)
 	})
 }
 
 func (n *Node) validatePeerAddress(addr netip.Addr) error {
-	if !addr.IsValid() || !containsOverlayAddressNetwork(n.engine.myVpnNetworks, addr) || n.engine.myVpnAddrsTable.Contains(addr) {
+	if addr.Zone() != "" || !isTunnelUnicast(addr) || !n.engine.myVpnNetworksTable.Contains(addr) || n.engine.myVpnAddrsTable.Contains(addr) {
 		return fmt.Errorf("%w: %s is not a remote overlay address", ErrPeerUnavailable, addr)
+	}
+	if _, broadcast := n.engine.overlayBroadcasts[addr]; broadcast {
+		return fmt.Errorf("%w: %s is an overlay broadcast address", ErrPeerUnavailable, addr)
 	}
 	return nil
 }
@@ -473,18 +468,6 @@ func (n *Node) peerConnectionState(addr netip.Addr) (established, pending bool) 
 	n.handshake.RUnlock()
 	hostMap.RUnlock()
 	return
-}
-
-func (n *Node) collectTunnels(include func(*hostInfo) bool) []*hostInfo {
-	n.engine.hostMap.RLock()
-	tunnels := make([]*hostInfo, 0, len(n.engine.hostMap.Indexes))
-	for _, h := range n.engine.hostMap.Indexes {
-		if include(h) {
-			tunnels = append(tunnels, h)
-		}
-	}
-	n.engine.hostMap.RUnlock()
-	return tunnels
 }
 
 func (n *Node) cancelPendingHandshakes(include func([]netip.Addr) bool) int {
@@ -543,22 +526,6 @@ func (n *Node) disconnectTunnel(h *hostInfo, localOnly bool) bool {
 		n.engine.sendCloseTunnelWithRoute(h, remote, relayHostInfo, relayRoute)
 	}
 	return true
-}
-
-func copyPeerRemotes(remotes *remoteList, preferred []netip.Prefix) ([]netip.AddrPort, []netip.Addr) {
-	if remotes == nil {
-		return nil, nil
-	}
-	known := remotes.CopyAddrs(preferred)
-	for i := range known {
-		known[i] = unmapAddrPort(known[i])
-	}
-	slices.SortFunc(known, func(a, b netip.AddrPort) int { return a.Compare(b) })
-	remotes.RLock()
-	relays := cloneAddresses(remotes.relays)
-	remotes.RUnlock()
-	slices.SortFunc(relays, func(a, b netip.Addr) int { return a.Compare(b) })
-	return known, relays
 }
 
 func unmapAddrPort(addr netip.AddrPort) netip.AddrPort {

@@ -1,12 +1,9 @@
 package nebula
 
 import (
-	"context"
-	"errors"
-	"fmt"
+	"encoding/binary"
 	"log/slog"
 	"net/netip"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,29 +14,13 @@ import (
 
 const mtu = 9001
 
-type packetEngineConfig struct {
-	hostMap           *hostMap
-	Outside           DatagramTransport
-	Netstack          *userNetstack
-	Routes            *packetRouteTable
-	pki               *pkiState
-	handshakeManager  *handshakeManager
-	lightHouse        *lighthouse
-	connectionManager *connectionManager
-	relayManager      *relayManager
-
-	tryPromoteEvery uint32
-	reQueryEvery    uint32
-	reQueryWait     time.Duration
-
-	l *slog.Logger
-}
-
 type packetEngine struct {
 	hostMap              *hostMap
 	outside              DatagramTransport
-	netstack             *userNetstack
-	routes               *packetRouteTable
+	port                 atomic.Pointer[IPPort]
+	localUnsafe          bart.Lite
+	overlayBroadcasts    map[netip.Addr]struct{}
+	inboundPolicy        InboundPolicy
 	pki                  *pkiState
 	connectionManager    *connectionManager
 	handshakeManager     *handshakeManager
@@ -48,175 +29,81 @@ type packetEngine struct {
 	myVpnAddrsTable      *bart.Lite
 	myVpnNetworks        []netip.Prefix
 	myVpnNetworksTable   *bart.Lite
-	closed               atomic.Bool
 	relayManager         *relayManager
-	tryPromoteEvery      uint32
-	reQueryEvery         uint32
-	reQueryWait          time.Duration
 	rebindEpoch          atomic.Uint32
-	ctx                  context.Context
-	wg                   sync.WaitGroup
 	udpTxErrLimiter      *ratelimit.Limiter
 	udpRelayTxErrLimiter *ratelimit.Limiter
 	txOversizeLimiter    *ratelimit.Limiter
-	fatalErr             atomic.Pointer[error]
-	triggerShutdown      func()
 	l                    *slog.Logger
 }
 
-type encWriter interface {
-	SendVia(via *hostInfo, relay *relay, ad, nb, out []byte, nocopy bool)
-	SendMessageToVpnAddr(t header.MessageType, st header.MessageSubType, vpnAddr netip.Addr, p, nb, out []byte)
-	SendMessageToHostInfo(t header.MessageType, st header.MessageSubType, hostinfo *hostInfo, p, nb, out []byte)
-	Handshake(vpnAddr netip.Addr)
-	GetHostInfo(vpnAddr netip.Addr) *hostInfo
-	GetCertState() *certificateState
-}
-
-func newPacketEngine(ctx context.Context, c *packetEngineConfig) (*packetEngine, error) {
-	if c.Outside == nil {
-		return nil, errors.New("no datagram transport")
+func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetEngine {
+	// Each log site has its own one-event-per-second budget.
+	newLogLimiter := func() *ratelimit.Limiter {
+		limiter, err := ratelimit.New(1, time.Second)
+		if err != nil {
+			panic(err)
+		}
+		return limiter
 	}
-	if c.Netstack == nil {
-		return nil, errors.New("no userspace network stack")
-	}
-	if c.Routes == nil {
-		return nil, errors.New("no packet route table")
-	}
-	if c.pki == nil {
-		return nil, errors.New("no certificate state")
-	}
-	if c.connectionManager == nil {
-		return nil, errors.New("no connection manager")
-	}
-
-	udpTxErrLimiter, err := ratelimit.New(1, time.Second)
-	if err != nil {
-		return nil, err
-	}
-	udpRelayTxErrLimiter, err := ratelimit.New(1, time.Second)
-	if err != nil {
-		return nil, err
-	}
-	txOversizeLimiter, err := ratelimit.New(1, time.Second)
-	if err != nil {
-		return nil, err
-	}
-
-	cs := c.pki.getCertState()
+	cs := pki.getCertState()
+	hosts := newHostMap(logger)
 	f := &packetEngine{
-		ctx:                  ctx,
-		pki:                  c.pki,
-		hostMap:              c.hostMap,
-		outside:              c.Outside,
-		netstack:             c.Netstack,
-		routes:               c.Routes,
-		handshakeManager:     c.handshakeManager,
-		lightHouse:           c.lightHouse,
+		l:             logger,
+		hostMap:       hosts,
+		outside:       opts.Transport,
+		inboundPolicy: opts.InboundPolicy,
+		pki:           pki,
+		relayManager: &relayManager{
+			l: logger, hostmap: hosts,
+			amRelay: opts.Relay.AmRelay, useRelays: opts.Relay.UseRelays && !opts.Relay.AmRelay,
+		},
 		myVpnNetworks:        cs.myVpnNetworks,
 		myVpnNetworksTable:   cs.myVpnNetworksTable,
 		myVpnAddrs:           cs.myVpnAddrs,
 		myVpnAddrsTable:      cs.myVpnAddrsTable,
-		relayManager:         c.relayManager,
-		connectionManager:    c.connectionManager,
-		udpTxErrLimiter:      udpTxErrLimiter,
-		udpRelayTxErrLimiter: udpRelayTxErrLimiter,
-		txOversizeLimiter:    txOversizeLimiter,
-		tryPromoteEvery:      c.tryPromoteEvery,
-		reQueryEvery:         c.reQueryEvery,
-		reQueryWait:          c.reQueryWait,
-		l:                    c.l,
+		overlayBroadcasts:    make(map[netip.Addr]struct{}),
+		udpTxErrLimiter:      newLogLimiter(),
+		udpRelayTxErrLimiter: newLogLimiter(),
+		txOversizeLimiter:    newLogLimiter(),
 	}
-	f.connectionManager.engine = f
-	f.wg.Add(1)
-	return f, nil
-}
-
-func (f *packetEngine) activate() (netip.AddrPort, error) {
-	addr, err := f.outside.LocalAddr()
-	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("get datagram transport address: %w", err)
+	for _, prefix := range cs.myVpnNetworks {
+		if prefix.Addr().Is4() && prefix.Bits() < 31 {
+			ip := prefix.Addr().As4()
+			hostMask := ^uint32(0) >> prefix.Bits()
+			binary.BigEndian.PutUint32(ip[:], binary.BigEndian.Uint32(ip[:])|hostMask)
+			f.overlayBroadcasts[netip.AddrFrom4(ip)] = struct{}{}
+		}
 	}
-	f.l.Info("Nebula node is active",
-		"networks", f.myVpnNetworks,
-		"transportAddr", addr,
-	)
-	return addr, nil
-}
-
-func (f *packetEngine) run() {
-	f.wg.Go(f.listenOut)
-	f.wg.Go(f.listenIn)
-}
-
-func (f *packetEngine) wait() error {
-	f.wg.Wait()
-	if err := f.fatalErr.Load(); err != nil {
-		return *err
+	for _, prefix := range cs.GetDefaultCertificate().UnsafeNetworks() {
+		f.localUnsafe.Insert(prefix)
 	}
-	return nil
-}
-
-func (f *packetEngine) onFatal(err error) {
-	if !f.fatalErr.CompareAndSwap(nil, &err) {
-		return
-	}
-	if f.triggerShutdown != nil {
-		f.triggerShutdown()
-	}
+	return f
 }
 
 type rxContext struct {
-	scratch      []byte
-	nb           []byte
-	h            *header.H
-	hostmapCache map[uint32]*hostInfo
-	lhh          *lighthouseHandler
+	scratch []byte
+	nb      []byte
+	h       header.H
+	lhh     *lighthouseHandler
 }
 
-func newRxContext(f *packetEngine) *rxContext {
-	return &rxContext{
-		scratch:      make([]byte, mtu),
-		nb:           make([]byte, 12, 12),
-		h:            &header.H{},
-		hostmapCache: make(map[uint32]*hostInfo),
-		lhh:          f.lightHouse.NewRequestHandler(),
+func (f *packetEngine) receiveDatagrams() error {
+	rxc := &rxContext{
+		scratch: make([]byte, mtu),
+		nb:      make([]byte, 12),
+		lhh:     f.lightHouse.NewRequestHandler(),
 	}
-}
-
-func (f *packetEngine) listenOut() {
-	rxc := newRxContext(f)
 	packet := make([]byte, mtu+header.MaxOverhead)
 	for {
 		n, from, err := f.outside.ReadFrom(packet)
 		if err != nil {
-			if !f.closed.Load() && f.ctx.Err() == nil {
-				f.l.Error("datagram transport reader failed", "error", err)
-				f.onFatal(err)
-			}
-			return
+			return err
 		}
 		if n <= 0 || n > len(packet) {
 			continue
 		}
-		f.readOutsidePackets(packetSender{UdpAddr: from}, packet[:n], rxc)
-		clear(rxc.hostmapCache)
-	}
-}
-
-func (f *packetEngine) listenIn() {
-	nonce := make([]byte, 12, 12)
-	for {
-		view, err := f.netstack.readPacket(f.ctx)
-		if err != nil {
-			if !f.closed.Load() && f.ctx.Err() == nil {
-				f.l.Error("userspace network stack reader failed", "error", err)
-				f.onFatal(err)
-			}
-			return
-		}
-		f.consumeInsidePacket(view.AsSlice(), nonce)
-		view.Release()
+		f.dispatchDatagram(packetSender{UdpAddr: from}, packet[:n], rxc)
 	}
 }
 
@@ -226,17 +113,4 @@ func (f *packetEngine) GetHostInfo(vpnAddr netip.Addr) *hostInfo {
 
 func (f *packetEngine) GetCertState() *certificateState {
 	return f.pki.getCertState()
-}
-
-func (f *packetEngine) Close() error {
-	if !f.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	var errs []error
-	if err := f.outside.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	f.netstack.destroy()
-	f.wg.Done()
-	return errors.Join(errs...)
 }

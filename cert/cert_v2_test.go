@@ -262,7 +262,8 @@ func TestCertificateV2_VerifyPrivateKey(t *testing.T) {
 	err = c.VerifyPrivateKey(Curve_CURVE25519, rawPriv)
 	require.NoError(t, err)
 
-	_, priv2 := X25519Keypair()
+	_, priv2, err := GenerateKeyAgreementKey(Curve_CURVE25519)
+	require.NoError(t, err)
 	err = c.VerifyPrivateKey(Curve_P256, priv2)
 	require.ErrorIs(t, err, ErrPublicPrivateCurveMismatch)
 
@@ -308,7 +309,6 @@ func TestCertificateV2_VerifyPrivateKeyP256(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, caKey2, _ := NewTestCaCert(Version2, Curve_P256, time.Time{}, time.Time{}, nil, nil, nil)
-	require.NoError(t, err)
 	err = ca.VerifyPrivateKey(Curve_P256, caKey2)
 	require.Error(t, err)
 
@@ -320,7 +320,8 @@ func TestCertificateV2_VerifyPrivateKeyP256(t *testing.T) {
 	err = c.VerifyPrivateKey(Curve_P256, rawPriv)
 	require.NoError(t, err)
 
-	_, priv2 := P256Keypair()
+	_, priv2, err := GenerateKeyAgreementKey(Curve_P256)
+	require.NoError(t, err)
 	err = c.VerifyPrivateKey(Curve_P256, priv2)
 	require.Error(t, err)
 }

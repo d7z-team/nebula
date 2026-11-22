@@ -19,7 +19,6 @@ import (
 const defaultPromoteEvery = 1000       // Count of packets sent before we try moving a tunnel to a preferred underlay ip address
 const defaultReQueryEvery = 5000       // Count of packets sent before re-querying a hostinfo to the lighthouse
 const defaultReQueryWait = time.Minute // Minimum amount of seconds to wait before re-querying a hostinfo the lighthouse. Evaluated every ReQueryEvery
-const maxRemotes = 10
 
 // maxHostInfosPerVPNAddr is the max number of hostinfos we will track for a given vpn ip
 // 5 allows for an initial handshake and each host pair re-handshaking twice
@@ -63,10 +62,9 @@ type hostMap struct {
 	// Entries in moreHosts are only ever written by unlockedSetHostsForAddr; Hosts is written
 	// directly only in the single-hostinfo fast paths where moreHosts is known to have no entry,
 	// and unlockedDeleteHostInfo swaps either map for a fresh one when it fully drains.
-	Hosts           map[netip.Addr]*hostInfo
-	moreHosts       map[netip.Addr][]*hostInfo
-	preferredRanges []netip.Prefix
-	l               *slog.Logger
+	Hosts     map[netip.Addr]*hostInfo
+	moreHosts map[netip.Addr][]*hostInfo
+	l         *slog.Logger
 }
 
 // For synchronization, treat the pointed-to relay struct as immutable. To edit the relay
@@ -126,13 +124,6 @@ func (rs *relayState) CopyAllRelayFor() []*relay {
 	return ret
 }
 
-func (rs *relayState) GetRelayForByAddr(addr netip.Addr) (*relay, bool) {
-	rs.RLock()
-	defer rs.RUnlock()
-	r, ok := rs.relayForByAddr[addr]
-	return r, ok
-}
-
 func (rs *relayState) InsertRelayTo(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
@@ -147,16 +138,6 @@ func (rs *relayState) CopyRelayIps() []netip.Addr {
 	ret := make([]netip.Addr, len(rs.relays))
 	copy(ret, rs.relays)
 	return ret
-}
-
-func (rs *relayState) CopyRelayForIps() []netip.Addr {
-	rs.RLock()
-	defer rs.RUnlock()
-	currentRelays := make([]netip.Addr, 0, len(rs.relayForByAddr))
-	for relayIp := range rs.relayForByAddr {
-		currentRelays = append(currentRelays, relayIp)
-	}
-	return currentRelays
 }
 
 func (rs *relayState) CopyRelayForIdxs() []uint32 {
@@ -237,6 +218,7 @@ const (
 
 type hostInfo struct {
 	remote          atomic.Pointer[netip.AddrPort]
+	lastDataPath    atomic.Pointer[TunnelPath]
 	connectionState *connectionState
 
 	// Traffic bits, pendingDeletion, and the rebind epoch we last sent under
@@ -295,18 +277,11 @@ func (v packetSender) String() string {
 type cachedPacket struct {
 	messageType    header.MessageType
 	messageSubType header.MessageSubType
-	callback       packetCallback
 	packet         []byte
 }
 
-type packetCallback func(t header.MessageType, st header.MessageSubType, h *hostInfo, p, nb, out []byte)
-
-func newHostMap(l *slog.Logger, preferred ...[]netip.Prefix) *hostMap {
-	ranges := []netip.Prefix{}
-	if len(preferred) > 0 {
-		ranges = slices.Clone(preferred[0])
-	}
-	hm := &hostMap{
+func newHostMap(l *slog.Logger) *hostMap {
+	return &hostMap{
 		Indexes:       map[uint32]*hostInfo{},
 		Relays:        map[uint32]*hostInfo{},
 		RemoteIndexes: map[uint32]*hostInfo{},
@@ -314,8 +289,6 @@ func newHostMap(l *slog.Logger, preferred ...[]netip.Prefix) *hostMap {
 		moreHosts:     map[netip.Addr][]*hostInfo{},
 		l:             l,
 	}
-	hm.preferredRanges = ranges
-	return hm
 }
 
 // unlockedSetHostsForAddr stores the per-address hostinfo list (list[0] is the primary). An empty
@@ -370,12 +343,6 @@ func (hm *hostMap) DeleteHostInfo(hostinfo *hostInfo) bool {
 	hm.Unlock()
 
 	return final
-}
-
-func (hm *hostMap) MakePrimary(hostinfo *hostInfo) {
-	hm.Lock()
-	defer hm.Unlock()
-	hm.unlockedMakePrimary(hostinfo)
 }
 
 // unlockedMakePrimary reports whether hostinfo is (now) the primary for each of its addresses,
@@ -474,52 +441,28 @@ func (hm *hostMap) unlockedDeleteHostInfo(hostinfo *hostInfo) bool {
 	return final
 }
 
-func (hm *hostMap) QueryIndexCached(index uint32, cache map[uint32]*hostInfo) *hostInfo {
-	if out, ok := cache[index]; ok {
-		return out
-	}
-	out := hm.QueryIndex(index)
-	if out != nil {
-		cache[index] = out
-	}
-	return out
-}
-
 func (hm *hostMap) QueryIndex(index uint32) *hostInfo {
 	hm.RLock()
-	if h, ok := hm.Indexes[index]; ok {
-		hm.RUnlock()
-		return h
-	} else {
-		hm.RUnlock()
-		return nil
-	}
+	defer hm.RUnlock()
+	return hm.Indexes[index]
 }
 
 func (hm *hostMap) QueryRelayIndex(index uint32) *hostInfo {
 	hm.RLock()
-	if h, ok := hm.Relays[index]; ok {
-		hm.RUnlock()
-		return h
-	} else {
-		hm.RUnlock()
-		return nil
-	}
+	defer hm.RUnlock()
+	return hm.Relays[index]
 }
 
 func (hm *hostMap) QueryReverseIndex(index uint32) *hostInfo {
 	hm.RLock()
-	if h, ok := hm.RemoteIndexes[index]; ok {
-		hm.RUnlock()
-		return h
-	} else {
-		hm.RUnlock()
-		return nil
-	}
+	defer hm.RUnlock()
+	return hm.RemoteIndexes[index]
 }
 
-func (hm *hostMap) QueryVpnAddr(vpnIp netip.Addr) *hostInfo {
-	return hm.queryVpnAddr(vpnIp, nil)
+func (hm *hostMap) QueryVpnAddr(addr netip.Addr) *hostInfo {
+	hm.RLock()
+	defer hm.RUnlock()
+	return hm.Hosts[addr]
 }
 
 func (hm *hostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp netip.Addr) (*hostInfo, *relay, error) {
@@ -570,27 +513,11 @@ func (hm *hostMap) unlockedDisestablishVpnAddrRelayFor(hi *hostInfo) {
 	}
 }
 
-func (hm *hostMap) queryVpnAddr(vpnIp netip.Addr, promoteIfce *packetEngine) *hostInfo {
-	hm.RLock()
-	if h, ok := hm.Hosts[vpnIp]; ok {
-		hm.RUnlock()
-		// Do not attempt promotion if you are a lighthouse
-		if promoteIfce != nil && !promoteIfce.lightHouse.amLighthouse {
-			h.TryPromoteBest(hm.GetPreferredRanges(), promoteIfce)
-		}
-		return h
-
-	}
-
-	hm.RUnlock()
-	return nil
-}
-
 // unlockedAddHostInfo assumes you have a write-lock and will add a hostinfo object to the hostmap Indexes and RemoteIndexes maps.
 // If an entry exists for the Hosts table (vpnIp -> hostinfo) then the provided hostinfo will be made primary
 func (hm *hostMap) unlockedAddHostInfo(hostinfo *hostInfo, f *packetEngine) {
 	for _, addr := range hostinfo.vpnAddrs {
-		hm.unlockedInnerAddHostInfo(addr, hostinfo, f)
+		hm.unlockedAddForAddress(addr, hostinfo)
 	}
 
 	hm.Indexes[hostinfo.localIndexId] = hostinfo
@@ -609,7 +536,7 @@ func (hm *hostMap) unlockedAddHostInfo(hostinfo *hostInfo, f *packetEngine) {
 	}
 }
 
-func (hm *hostMap) unlockedInnerAddHostInfo(vpnAddr netip.Addr, hostinfo *hostInfo, f *packetEngine) {
+func (hm *hostMap) unlockedAddForAddress(vpnAddr netip.Addr, hostinfo *hostInfo) {
 	existing, ok := hm.Hosts[vpnAddr]
 	if !ok {
 		// Common case, the first hostinfo for this address. moreHosts stays empty.
@@ -634,44 +561,36 @@ func (hm *hostMap) unlockedInnerAddHostInfo(vpnAddr netip.Addr, hostinfo *hostIn
 	}
 }
 
-func (hm *hostMap) GetPreferredRanges() []netip.Prefix {
-	return hm.preferredRanges
-}
-
-func (i *hostInfo) TryPromoteBest(preferredRanges []netip.Prefix, ifce *packetEngine) {
+func (i *hostInfo) TryPromoteBest(ifce *packetEngine) {
 	c := i.promoteCounter.Add(1)
-	if c%ifce.tryPromoteEvery == 0 {
+	if c%defaultPromoteEvery == 0 {
 		remote := i.GetRemote()
 
 		// return early if we are already on a preferred remote
-		if remote.IsValid() {
-			rIP := remote.Addr()
-			for _, l := range preferredRanges {
-				if l.Contains(rIP) {
-					return
-				}
-			}
+		preferred := i.remotes.preferredRanges
+		if remote.IsValid() && isPreferred(remote.Addr(), preferred) {
+			return
 		}
 
-		i.remotes.ForEach(preferredRanges, func(addr netip.AddrPort, preferred bool) {
-			if remote.IsValid() && (!addr.IsValid() || !preferred) {
-				return
+		for _, addr := range i.remotes.candidates().endpoints {
+			if remote.IsValid() && (!addr.IsValid() || !isPreferred(addr.Addr(), preferred)) {
+				continue
 			}
 
 			// Try to send a test packet to that host, this should
 			// cause it to detect a roaming event and switch remotes
 			ifce.sendTo(header.Test, header.TestRequest, i.connectionState, i, addr, []byte(""), make([]byte, 12, 12), make([]byte, mtu))
-		})
+		}
 	}
 
 	// Re query our lighthouses for new remotes occasionally
-	if c%ifce.reQueryEvery == 0 && ifce.lightHouse != nil {
+	if c%defaultReQueryEvery == 0 && ifce.lightHouse != nil {
 		now := time.Now().UnixNano()
 		if now < i.nextLHQuery.Load() {
 			return
 		}
 
-		i.nextLHQuery.Store(now + int64(ifce.reQueryWait))
+		i.nextLHQuery.Store(now + int64(defaultReQueryWait))
 		ifce.lightHouse.QueryServer(i.vpnAddrs[0])
 	}
 }
@@ -759,7 +678,7 @@ func (i *hostInfo) SetRemote(remote netip.AddrPort) {
 
 // SetRemoteIfPreferred returns true if the remote was changed. The lastRoam
 // time on the hostInfo will also be updated.
-func (i *hostInfo) SetRemoteIfPreferred(hm *hostMap, via packetSender) bool {
+func (i *hostInfo) SetRemoteIfPreferred(via packetSender) bool {
 	if via.IsRelayed {
 		return false
 	}
@@ -773,7 +692,7 @@ func (i *hostInfo) SetRemoteIfPreferred(hm *hostMap, via packetSender) bool {
 	// NOTE: We do this loop here instead of calling `isPreferred` in
 	// remote_list.go so that we only have to loop over preferredRanges once.
 	newIsPreferred := false
-	for _, l := range hm.GetPreferredRanges() {
+	for _, l := range i.remotes.preferredRanges {
 		// return early if we are already on a preferred remote
 		if l.Contains(currentRemote.Addr()) {
 			return false

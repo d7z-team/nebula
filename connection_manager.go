@@ -28,10 +28,10 @@ const (
 type connectionManager struct {
 	// relayUsed holds which relay localIndexs are in use
 	relayUsed     map[uint32]struct{}
-	relayUsedLock *sync.RWMutex
+	relayUsedLock sync.RWMutex
 
 	hostMap      *hostMap
-	trafficTimer *lockingTimerWheel[uint32]
+	trafficTimer *timerWheel[uint32]
 	engine       *packetEngine
 	punchy       *punchManager
 
@@ -43,57 +43,27 @@ type connectionManager struct {
 	l *slog.Logger
 }
 
-type connectionManagerConfig struct {
-	checkInterval           time.Duration
-	pendingDeletionInterval time.Duration
-	inactivityTimeout       time.Duration
-	dropInactive            bool
-}
-
-func newConnectionManager(l *slog.Logger, hm *hostMap, p *punchManager, cfg connectionManagerConfig) *connectionManager {
-	if cfg.checkInterval <= 0 {
-		cfg.checkInterval = 5 * time.Second
+func newConnectionManager(l *slog.Logger, hm *hostMap, p *punchManager, cfg ConnectionOptions) *connectionManager {
+	if cfg.CheckInterval <= 0 {
+		cfg.CheckInterval = 5 * time.Second
 	}
-	if cfg.pendingDeletionInterval <= 0 {
-		cfg.pendingDeletionInterval = 10 * time.Second
+	if cfg.PendingDeletionInterval <= 0 {
+		cfg.PendingDeletionInterval = 10 * time.Second
 	}
-	if cfg.inactivityTimeout <= 0 {
-		cfg.inactivityTimeout = 10 * time.Minute
+	if cfg.InactivityTimeout <= 0 {
+		cfg.InactivityTimeout = 10 * time.Minute
 	}
-	cm := &connectionManager{
-		hostMap:                 hm,
-		l:                       l,
-		punchy:                  p,
+	minimum := min(500*time.Millisecond, cfg.CheckInterval, cfg.PendingDeletionInterval)
+	maximum := max(cfg.CheckInterval, cfg.PendingDeletionInterval)
+	return &connectionManager{
+		hostMap: hm, l: l, punchy: p,
 		relayUsed:               make(map[uint32]struct{}),
-		relayUsedLock:           &sync.RWMutex{},
-		checkInterval:           cfg.checkInterval,
-		pendingDeletionInterval: cfg.pendingDeletionInterval,
+		trafficTimer:            newTimerWheel[uint32](minimum, maximum),
+		checkInterval:           cfg.CheckInterval,
+		pendingDeletionInterval: cfg.PendingDeletionInterval,
+		inactivityTimeout:       cfg.InactivityTimeout,
+		dropInactive:            cfg.DropInactive,
 	}
-	minimum := min(500*time.Millisecond, cfg.checkInterval, cfg.pendingDeletionInterval)
-	maximum := max(cfg.checkInterval, cfg.pendingDeletionInterval)
-	cm.trafficTimer = newLockingTimerWheel[uint32](minimum, maximum)
-	cm.inactivityTimeout = cfg.inactivityTimeout
-	cm.dropInactive = cfg.dropInactive
-	return cm
-}
-
-func (cm *connectionManager) getInactivityTimeout() time.Duration {
-	return cm.inactivityTimeout
-}
-
-func (cm *connectionManager) recordInbound(h *hostInfo) {
-	h.markIn()
-}
-
-// recordOutboundNoRebind records outbound traffic without consuming the rebind epoch; the direct path
-// to the relay consumes the edge, the via send must not.
-func (cm *connectionManager) recordOutboundNoRebind(h *hostInfo) {
-	h.markOutOnly()
-}
-
-// recordOutbound records outbound traffic and reports whether we rebound since this tunnel last sent.
-func (cm *connectionManager) recordOutbound(h *hostInfo) bool {
-	return h.markOut(cm.engine.rebindEpoch.Load())
 }
 
 func (cm *connectionManager) recordRelayUse(localIndex uint32) {
@@ -109,18 +79,8 @@ func (cm *connectionManager) recordRelayUse(localIndex uint32) {
 	cm.relayUsedLock.Unlock()
 }
 
-// getAndResetTrafficCheck returns if there was any inbound or outbound traffic within the last tick and
-// resets the state for this local index
-func (cm *connectionManager) getAndResetTrafficCheck(h *hostInfo, now time.Time) (bool, bool) {
-	in, out := h.takeTraffic()
-	if in || out {
-		h.lastUsed = now
-	}
-	return in, out
-}
-
 func (cm *connectionManager) Start(ctx context.Context) {
-	clockSource := time.NewTicker(cm.trafficTimer.t.tickDuration)
+	clockSource := time.NewTicker(cm.trafficTimer.tickDuration)
 	defer clockSource.Stop()
 
 	p := []byte("")
@@ -192,55 +152,34 @@ func (cm *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *hostInfo
 		existing, ok := newhostinfo.relayState.QueryRelayForByIp(r.PeerAddr)
 
 		var index uint32
-		var relayFrom netip.Addr
-		var relayTo netip.Addr
-		switch {
-		case ok:
-			switch existing.State {
-			case relayEstablished, relayPeerRequested, relayDisestablished:
-				// This relay already exists in newhostinfo, then do nothing.
+		if ok {
+			if existing.State != relayRequested {
 				continue
-			case relayRequested:
-				// The relay exists in a requested state; re-send the request.
-				index = existing.LocalIndex
-				switch r.Type {
-				case relayTypeTerminal:
-					relayFrom = cm.engine.myVpnAddrs[0]
-					relayTo = existing.PeerAddr
-				case relayTypeForwarding:
-					relayFrom = existing.PeerAddr
-					relayTo = newhostinfo.vpnAddrs[0]
-				default:
-					// should never happen
-					panic(fmt.Sprintf("Migrating unknown relay type: %v", r.Type))
-				}
 			}
-		case !ok:
+			index = existing.LocalIndex
+		} else {
 			cm.relayUsedLock.RLock()
-			if _, relayUsed := cm.relayUsed[r.LocalIndex]; !relayUsed {
-				// The relay hasn't been used; don't migrate it.
-				cm.relayUsedLock.RUnlock()
+			_, used := cm.relayUsed[r.LocalIndex]
+			cm.relayUsedLock.RUnlock()
+			if !used {
 				continue
 			}
-			cm.relayUsedLock.RUnlock()
-			// The relay doesn't exist at all; create some relay state and send the request.
 			var err error
 			index, err = addRelay(cm.l, newhostinfo, cm.hostMap, r.PeerAddr, nil, r.Type, relayRequested)
 			if err != nil {
 				cm.l.Error("failed to migrate relay to new hostinfo", "error", err)
 				continue
 			}
-			switch r.Type {
-			case relayTypeTerminal:
-				relayFrom = cm.engine.myVpnAddrs[0]
-				relayTo = r.PeerAddr
-			case relayTypeForwarding:
-				relayFrom = r.PeerAddr
-				relayTo = newhostinfo.vpnAddrs[0]
-			default:
-				// should never happen
-				panic(fmt.Sprintf("Migrating unknown relay type: %v", r.Type))
-			}
+		}
+
+		var relayFrom, relayTo netip.Addr
+		switch r.Type {
+		case relayTypeTerminal:
+			relayFrom, relayTo = cm.engine.myVpnAddrs[0], r.PeerAddr
+		case relayTypeForwarding:
+			relayFrom, relayTo = r.PeerAddr, newhostinfo.vpnAddrs[0]
+		default:
+			panic(fmt.Sprintf("Migrating unknown relay type: %v", r.Type))
 		}
 
 		// Send a CreateRelayRequest to the peer.
@@ -311,13 +250,13 @@ func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Tim
 	}
 
 	primary := cm.hostMap.Hosts[hostinfo.vpnAddrs[0]]
-	mainHostInfo := true
-	if primary != nil && primary != hostinfo {
-		mainHostInfo = false
-	}
+	mainHostInfo := primary == nil || primary == hostinfo
 
 	// Check for traffic on this hostinfo
-	inTraffic, outTraffic := cm.getAndResetTrafficCheck(hostinfo, now)
+	inTraffic, outTraffic := hostinfo.takeTraffic()
+	if inTraffic || outTraffic {
+		hostinfo.lastUsed = now
+	}
 
 	// A hostinfo is determined alive if there is incoming traffic
 	if inTraffic {
@@ -360,10 +299,10 @@ func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Tim
 	}
 
 	decision := doNothing
-	if hostinfo != nil && hostinfo.connectionState != nil && mainHostInfo {
+	if hostinfo.connectionState != nil && mainHostInfo {
 		if !outTraffic {
-			inactiveFor, isInactive := cm.isInactive(hostinfo, now)
-			if isInactive {
+			inactiveFor := now.Sub(hostinfo.lastUsed)
+			if cm.dropInactive && inactiveFor >= cm.inactivityTimeout {
 				// Tunnel is inactive, tear it down
 				hostinfo.logger(cm.l).Info("Dropping tunnel due to inactivity",
 					"inactiveDuration", inactiveFor,
@@ -404,22 +343,6 @@ func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Tim
 	hostinfo.setPendingDeletion(true)
 	cm.trafficTimer.Add(hostinfo.localIndexId, cm.pendingDeletionInterval)
 	return decision, hostinfo, nil
-}
-
-func (cm *connectionManager) isInactive(hostinfo *hostInfo, now time.Time) (time.Duration, bool) {
-	if !cm.dropInactive {
-		// We aren't configured to drop inactive tunnels
-		return 0, false
-	}
-
-	inactiveDuration := now.Sub(hostinfo.lastUsed)
-	if inactiveDuration < cm.getInactivityTimeout() {
-		// It's not considered inactive
-		return inactiveDuration, false
-	}
-
-	// The tunnel is inactive
-	return inactiveDuration, true
 }
 
 func (cm *connectionManager) shouldSwapPrimary(current *hostInfo) bool {

@@ -22,14 +22,6 @@ type holepunchJob struct {
 	vpnAddr netip.Addr
 }
 
-// lighthouseChecker is the slice of lighthouse that punchManager actually needs.
-// Defined here so punchManager doesn't take a *lighthouse dependency (lighthouse
-// already holds a *punchManager, and the bidirectional pointer reference is awkward
-// even within the same package). Tests can also substitute a fake.
-type lighthouseChecker interface {
-	IsAnyLighthouseAddr(vpnAddrs []netip.Addr) bool
-}
-
 type punchManager struct {
 	punch           bool
 	respond         bool
@@ -40,40 +32,27 @@ type punchManager struct {
 	sched     *scheduler[holepunchJob]
 	punchConn DatagramTransport
 
-	ctx  context.Context
-	ifce encWriter
-	hm   *hostMap
-	lh   lighthouseChecker
+	ctx    context.Context
+	engine *packetEngine
+	lh     *lighthouse
 
 	l *slog.Logger
 }
 
-type punchyConfig struct {
-	punch           bool
-	respond         bool
-	delay           time.Duration
-	respondDelay    time.Duration
-	punchEverything bool
-}
-
-func newPunchy(l *slog.Logger, transport DatagramTransport, cfg punchyConfig) *punchManager {
-	if cfg.delay <= 0 {
-		cfg.delay = time.Second
+func newPunchManager(l *slog.Logger, transport DatagramTransport, cfg PunchyOptions) *punchManager {
+	if cfg.Delay <= 0 {
+		cfg.Delay = time.Second
 	}
-	if cfg.respondDelay <= 0 {
-		cfg.respondDelay = 5 * time.Second
+	if cfg.RespondDelay <= 0 {
+		cfg.RespondDelay = 5 * time.Second
 	}
-	p := &punchManager{
-		l:         l,
-		punchConn: transport,
-		sched:     newScheduler[holepunchJob](holepunchQueueSize),
+	return &punchManager{
+		l: l, punchConn: transport,
+		sched: newScheduler[holepunchJob](holepunchQueueSize),
+		punch: cfg.Punch, respond: cfg.Respond,
+		delay: cfg.Delay, respondDelay: cfg.RespondDelay,
+		punchEverything: cfg.TargetAllRemotes,
 	}
-	p.punch = cfg.punch
-	p.respond = cfg.respond
-	p.delay = cfg.delay
-	p.respondDelay = cfg.respondDelay
-	p.punchEverything = cfg.punchEverything
-	return p
 }
 
 // Schedule queues a punch packet to target, to be sent after the configured delay.
@@ -83,7 +62,7 @@ func (p *punchManager) Schedule(target netip.AddrPort, vpnAddr netip.Addr) {
 	if !target.IsValid() || p.ctx == nil {
 		return
 	}
-	p.scheduleJob(holepunchJob{target: target, vpnAddr: vpnAddr}, p.delay)
+	p.sched.Schedule(p.ctx, holepunchJob{target: target, vpnAddr: vpnAddr}, p.delay)
 }
 
 // ScheduleRespond queues a punchback test packet to vpnAddr after the configured respond delay,
@@ -92,13 +71,7 @@ func (p *punchManager) ScheduleRespond(vpnAddr netip.Addr) {
 	if !p.respond || p.ctx == nil {
 		return
 	}
-	p.scheduleJob(holepunchJob{vpnAddr: vpnAddr}, p.respondDelay)
-}
-
-// scheduleJob delegates to the pooled scheduler.
-// The callback observes p.ctx so a job that becomes due after Stop is dropped instead of queued.
-func (p *punchManager) scheduleJob(job holepunchJob, delay time.Duration) {
-	p.sched.Schedule(p.ctx, job, delay)
+	p.sched.Schedule(p.ctx, holepunchJob{vpnAddr: vpnAddr}, p.respondDelay)
 }
 
 // SendPunch sends an immediate keepalive punch for an idle hostinfo.
@@ -124,29 +97,16 @@ func (p *punchManager) SendPunch(hostinfo *hostInfo) {
 // NAT state warm, but non-primary remotes need separate refresh, so we fan out to all of them (the redundant
 // primary punch is harmless). Gated on punchy.punch and the lighthouse-skip rule.
 func (p *punchManager) SendPunchToAll(hostinfo *hostInfo) {
-	if !p.punchEverything {
-		return
-	}
-	if !p.punch {
-		return
-	}
-	if p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
+	if !p.punchEverything || !p.punch || p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
 		return
 	}
 	p.sendPunchToAllRemotes(hostinfo)
 }
 
 func (p *punchManager) sendPunchToAllRemotes(hostinfo *hostInfo) {
-	hostinfo.remotes.ForEach(p.hm.GetPreferredRanges(), func(addr netip.AddrPort, preferred bool) {
+	for _, addr := range hostinfo.remotes.candidates().endpoints {
 		p.punchConn.WriteTo(punchPacket, addr)
-	})
-}
-
-func (p *punchManager) configure(ctx context.Context, ifce encWriter, hm *hostMap, lh lighthouseChecker) {
-	p.ctx = ctx
-	p.ifce = ifce
-	p.hm = hm
-	p.lh = lh
+	}
 }
 
 // run drains scheduled punch work until the node context is cancelled.
@@ -168,7 +128,7 @@ func (p *punchManager) run(ctx context.Context) {
 			if p.l.Enabled(context.Background(), slog.LevelDebug) {
 				p.l.Debug("Sending a nebula test packet", "vpnAddr", job.vpnAddr)
 			}
-			p.ifce.SendMessageToVpnAddr(header.Test, header.TestRequest, job.vpnAddr, []byte(""), nb, out)
+			p.engine.SendMessageToVpnAddr(header.Test, header.TestRequest, job.vpnAddr, []byte(""), nb, out)
 		}
 	})
 }

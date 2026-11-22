@@ -9,7 +9,8 @@ import (
 
 // DatagramTransport carries encrypted Nebula wire packets. Implementations
 // must preserve datagram boundaries. New takes ownership after it returns a
-// Node and closes the transport during shutdown to unblock ReadFrom.
+// Node and closes the transport during shutdown. Close must unblock pending
+// ReadFrom and WriteTo calls. Writes from multiple tunnels may be concurrent.
 type DatagramTransport interface {
 	ReadFrom([]byte) (int, netip.AddrPort, error)
 	WriteTo([]byte, netip.AddrPort) error

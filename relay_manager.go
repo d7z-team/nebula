@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
-	"sync/atomic"
 
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/header"
@@ -17,45 +16,26 @@ import (
 type relayManager struct {
 	l         *slog.Logger
 	hostmap   *hostMap
-	amRelay   atomic.Bool
-	useRelays atomic.Bool
-}
-
-func newRelayManager(l *slog.Logger, hostmap *hostMap, amRelay, useRelays bool) *relayManager {
-	rm := &relayManager{
-		l:       l,
-		hostmap: hostmap,
-	}
-	rm.amRelay.Store(amRelay)
-	rm.useRelays.Store(useRelays && !amRelay)
-	return rm
-}
-
-func (rm *relayManager) GetAmRelay() bool {
-	return rm.amRelay.Load()
-}
-
-func (rm *relayManager) GetUseRelays() bool {
-	return rm.useRelays.Load()
+	amRelay   bool
+	useRelays bool
 }
 
 // StartRelays drives the relay-establishment side of an outbound handshake attempt.
 // For each candidate relay it either kicks off a handshake to the relay, sends a CreateRelayRequest, retransmits
 // one that may have been lost, or, once the relay is established, forwards the in-progress
 // stage 0 handshake packet for vpnIp through it.
-func (rm *relayManager) StartRelays(f *packetEngine, vpnIp netip.Addr, hh *handshakeHostInfo, stage0 []byte) {
+func (rm *relayManager) StartRelays(f *packetEngine, vpnIp netip.Addr, hh *handshakeHostInfo, stage0 []byte, relays []netip.Addr) {
 	hostinfo := hh.hostinfo
-	if !rm.GetUseRelays() || len(hostinfo.remotes.relays) == 0 {
+	if !rm.useRelays || len(relays) == 0 {
 		hh.lastRelays = nil
 		return
 	}
 
-	relays := hostinfo.remotes.relays
 	listLevel := slog.LevelDebug
 	prior := hh.lastRelays
 	if !slices.Equal(relays, prior) {
 		listLevel = slog.LevelInfo
-		hh.lastRelays = slices.Clone(relays)
+		hh.lastRelays = relays
 	}
 	hl := hostinfo.logger(rm.l)
 	hl.Log(context.Background(), listLevel, "Attempt to relay through hosts", "relays", relays)
@@ -146,7 +126,7 @@ func (rm *relayManager) StartRelays(f *packetEngine, vpnIp netip.Addr, hh *hands
 		switch existingRelay.State {
 		case relayEstablished:
 			hl.Log(context.Background(), level, "Send handshake via relay", "relay", relay.String())
-			f.SendVia(relayHostInfo, existingRelay, stage0, make([]byte, 12), make([]byte, mtu), false)
+			f.sendVia(relayHostInfo, existingRelay, stage0, make([]byte, 12), make([]byte, mtu), false)
 		case relayDisestablished:
 			// Mark this relay as 'requested'
 			relayHostInfo.relayState.UpdateRelayForByIpState(vpnIp, relayRequested)
@@ -509,7 +489,7 @@ func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *hostInfo, f 
 		return
 	} else {
 		// the target is not me. Create a relay to the target, from me.
-		if !rm.GetAmRelay() {
+		if !rm.amRelay {
 			return
 		}
 		if !slices.Contains(h.vpnAddrs, from) {

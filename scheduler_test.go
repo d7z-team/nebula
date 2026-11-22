@@ -1,75 +1,63 @@
 package nebula
 
 import (
+	"context"
+	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-func TestScheduler_PooledReuse(t *testing.T) {
-	ctx := t.Context()
+func TestSchedulerDelivery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, stop := context.WithCancel(t.Context())
+		defer stop()
+		s := newScheduler[int](16)
+		delivered := make(chan int, 64)
+		go s.Run(ctx, func(val int) { delivered <- val })
 
-	s := newScheduler[int](16)
-	delivered := make(chan int, 256)
-	go s.Run(ctx, func(item int) { delivered <- item })
-
-	const N = 100
-	for i := range N {
-		s.Schedule(ctx, i, time.Millisecond)
-	}
-
-	deadline := time.After(2 * time.Second)
-	got := 0
-	for got < N {
-		select {
-		case <-delivered:
-			got++
-		case <-deadline:
-			t.Fatalf("only %d/%d items delivered", got, N)
+		canceled, cancel := context.WithCancel(ctx)
+		s.Schedule(canceled, -1, time.Second)
+		cancel()
+		for batch := range 2 {
+			var want []int
+			for i := range 32 {
+				val := batch*32 + i
+				s.Schedule(ctx, val, time.Second)
+				want = append(want, val)
+			}
+			synctest.Wait()
+			require.Empty(t, delivered)
+			time.Sleep(time.Second)
+			synctest.Wait()
+			require.Len(t, delivered, len(want))
+			got := make([]int, len(want))
+			for i := range got {
+				got[i] = <-delivered
+			}
+			slices.Sort(got)
+			require.Equal(t, want, got)
 		}
-	}
+	})
 }
 
-// BenchmarkScheduler_Schedule reports allocations per Schedule call.
-// In steady state the scheduler's sync.Pool means we should see zero allocs per op once the pool warms up.
-func BenchmarkScheduler_Schedule(b *testing.B) {
+// Drain each batch so the bound on outstanding timers is independent of b.N.
+func BenchmarkScheduler(b *testing.B) {
+	const batch = 64
 	ctx := b.Context()
-
-	s := newScheduler[int](b.N)
-	go s.Run(ctx, func(int) {})
-
+	s := newScheduler[int](batch)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s.Schedule(ctx, i, time.Microsecond)
-	}
-}
-
-// BenchmarkBareAfterFunc is the comparison baseline.
-// What we'd pay per Schedule if punchManager called time.AfterFunc directly without the pooled scheduler.
-// Allocates a *time.Timer plus a closure each call.
-func BenchmarkBareAfterFunc(b *testing.B) {
-	ctx := b.Context()
-
-	queue := make(chan int, b.N)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-queue:
-			}
+	for i := 0; i < b.N; {
+		n := min(batch, b.N-i)
+		for j := range n {
+			s.Schedule(ctx, j, 0)
 		}
-	}()
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		i := i
-		time.AfterFunc(time.Microsecond, func() {
-			select {
-			case queue <- i:
-			case <-ctx.Done():
-			}
-		})
+		for range n {
+			<-s.queue
+		}
+		i += n
 	}
 }
