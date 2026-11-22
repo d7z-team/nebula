@@ -10,9 +10,6 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-// holepunchQueueSize buffers the channel that pending holepunchJobs land on after their delay timer fires.
-const holepunchQueueSize = 64
-
 var punchPacket = []byte{1}
 
 // holepunchJob is one scheduled item delivered to the worker goroutine.
@@ -24,15 +21,10 @@ type holepunchJob struct {
 }
 
 type punchManager struct {
-	punch           bool
-	respond         bool
-	delay           time.Duration
-	respondDelay    time.Duration
-	punchEverything bool
-
-	sched  *scheduler[holepunchJob]
-	mu     sync.Mutex
-	queued map[holepunchJob]bool
+	options PunchyOptions
+	sched   *scheduler[holepunchJob]
+	mu      sync.Mutex
+	queued  map[holepunchJob]bool
 
 	ctx    context.Context
 	engine *packetEngine
@@ -42,18 +34,14 @@ type punchManager struct {
 }
 
 func newPunchManager(l *slog.Logger, cfg PunchyOptions) *punchManager {
-	if cfg.Delay <= 0 {
-		cfg.Delay = time.Second
-	}
-	if cfg.RespondDelay <= 0 {
-		cfg.RespondDelay = 5 * time.Second
-	}
+	cfg.Delay = positiveOr(cfg.Delay, time.Second)
+	cfg.RespondDelay = positiveOr(cfg.RespondDelay, 5*time.Second)
+	cfg.QueueSize = positiveOr(cfg.QueueSize, 64)
 	return &punchManager{
-		l: l, queued: make(map[holepunchJob]bool),
-		sched: newScheduler[holepunchJob](holepunchQueueSize),
-		punch: cfg.Punch, respond: cfg.Respond,
-		delay: cfg.Delay, respondDelay: cfg.RespondDelay,
-		punchEverything: cfg.TargetAllRemotes,
+		options: cfg,
+		sched:   newScheduler[holepunchJob](cfg.QueueSize),
+		queued:  make(map[holepunchJob]bool),
+		l:       l,
 	}
 }
 
@@ -64,16 +52,16 @@ func (p *punchManager) Schedule(target netip.AddrPort, vpnAddr netip.Addr) {
 	if !target.IsValid() || p.ctx == nil {
 		return
 	}
-	p.queue(holepunchJob{target: target, vpnAddr: vpnAddr}, p.delay)
+	p.queue(holepunchJob{target: target, vpnAddr: vpnAddr}, p.options.Delay)
 }
 
 // ScheduleRespond queues a punchback test packet to vpnAddr after the configured respond delay,
 // gated on punchy.respond. No-op when respond is disabled or before Start has been called.
 func (p *punchManager) ScheduleRespond(vpnAddr netip.Addr) {
-	if !p.respond || p.ctx == nil {
+	if !p.options.Respond || p.ctx == nil {
 		return
 	}
-	p.queue(holepunchJob{vpnAddr: vpnAddr}, p.respondDelay)
+	p.queue(holepunchJob{vpnAddr: vpnAddr}, p.options.RespondDelay)
 }
 
 func (p *punchManager) queue(job holepunchJob, delay time.Duration) {
@@ -81,7 +69,7 @@ func (p *punchManager) queue(job holepunchJob, delay time.Duration) {
 		return
 	}
 	p.mu.Lock()
-	if p.queued[job] || len(p.queued) >= holepunchQueueSize {
+	if p.queued[job] || len(p.queued) >= p.options.QueueSize {
 		p.mu.Unlock()
 		return
 	}
@@ -94,14 +82,14 @@ func (p *punchManager) queue(job holepunchJob, delay time.Duration) {
 // Target-all-remotes mode picks the targets. It is gated by PunchyOptions.Punch and the lighthouse-skip rule
 // (lighthouses don't get keepalive punches because the regular update interval keeps their NAT state warm).
 func (p *punchManager) SendPunch(hostinfo *hostInfo) {
-	if !p.punch {
+	if !p.options.Punch {
 		return
 	}
 	if p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
 		return
 	}
 
-	if p.punchEverything {
+	if p.options.TargetAllRemotes {
 		p.sendPunchToAllRemotes(hostinfo)
 	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
 		p.engine.writePath(hostinfo, tunnelRoute{TunnelPath: TunnelPath{Endpoint: hr}}, punchPacket, true, nil)
@@ -113,7 +101,7 @@ func (p *punchManager) SendPunch(hostinfo *hostInfo) {
 // NAT state warm, but non-primary remotes need separate refresh, so we fan out to all of them (the redundant
 // primary punch is harmless). Gated on punchy.punch and the lighthouse-skip rule.
 func (p *punchManager) SendPunchToAll(hostinfo *hostInfo) {
-	if !p.punchEverything || !p.punch || p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
+	if !p.options.TargetAllRemotes || !p.options.Punch || p.lh.IsAnyLighthouseAddr(hostinfo.vpnAddrs) {
 		return
 	}
 	p.sendPunchToAllRemotes(hostinfo)

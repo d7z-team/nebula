@@ -15,7 +15,14 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// Options configures the L3 interface. A zero MTU selects 1300.
+const (
+	// DefaultMTU is used when Options.MTU is zero.
+	DefaultMTU = 1300
+	// MinMTU is the smallest MTU supported by this dual-stack endpoint.
+	MinMTU = 1280
+)
+
+// Options configures the L3 interface. A zero MTU selects DefaultMTU.
 type Options struct {
 	MTU uint32
 }
@@ -37,10 +44,10 @@ func NewEndpoint(node *nebula.Node, opts Options) (*Endpoint, error) {
 		return nil, errors.New("node is required")
 	}
 	if opts.MTU == 0 {
-		opts.MTU = 1300
+		opts.MTU = DefaultMTU
 	}
-	if opts.MTU < 1280 || opts.MTU > nebula.MaxIPPacketSize {
-		return nil, fmt.Errorf("MTU must be between 1280 and %d", nebula.MaxIPPacketSize)
+	if opts.MTU < MinMTU || opts.MTU > nebula.MaxIPPacketSize {
+		return nil, fmt.Errorf("MTU must be between %d and %d", MinMTU, nebula.MaxIPPacketSize)
 	}
 	// channel.Endpoint supplies a headerless dispatcher. TX uses the port's
 	// bounded per-peer queues directly, so the channel needs no TX queue.
@@ -96,7 +103,7 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 
 // SetMTU clamps the value to the supported dual-stack tunnel limits.
 func (e *Endpoint) SetMTU(mtu uint32) {
-	e.networkLink.SetMTU(min(max(mtu, 1280), nebula.MaxIPPacketSize))
+	e.networkLink.SetMTU(min(max(mtu, MinMTU), nebula.MaxIPPacketSize))
 }
 
 // ClearPending discards queued frames for the exact overlay next hop.

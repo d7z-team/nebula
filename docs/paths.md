@@ -38,7 +38,7 @@ if err != nil {
 log.Printf("sent=%v received=%v rtt=%v", check.Sent, check.Received, check.RTT)
 ```
 
-上游 Nebula 能回显标准的加密 Test 消息。它可以沿另一条路径返回。`Sent` 和 `Received` 分别记录去程和回程，只有 `SamePath` 为真的样本用于比较 RTT 和抖动。探测回显和业务包也可能采用不同路径。
+上游 Nebula 能回显标准的加密 Test 消息。`Sent` 和 `Received` 分别记录探测的去程和回程，只有 `SamePath` 为真的样本参与 RTT 和抖动比较。要确认业务包实际走的路径，查看 `node.Peer(addr)` 快照中的 `LastDataPath`。
 
 单端收紧策略后，如果本机已有验证成功的中转，却收到违反策略的直连业务包，本机会丢弃该包并沿中转重新握手。需要从发送端约束两个方向的业务时，在两端都配置 `RelayOnly`。
 
@@ -47,11 +47,41 @@ log.Printf("sent=%v received=%v rtt=%v", check.Sent, check.Received, check.RTT)
 | `ErrPathPolicy` | 请求路径或探测回程违反本机策略。 |
 | `ErrPathTimeout` | 已发出探测，等待期限内未收到认证回显。 |
 | `ErrPathChanged` | 检查期间发生了 Rebind、会话退役或相关策略更新，可以重新检查指定路径。 |
+| `ErrPeerUnavailable` | peer 或指定中转不可用，或在 `CheckTimeout` 内未取得路径检查结果。 |
 
 ## 自动巡检与切换
 
-活跃 peer 的主路约每 10 秒检查一次，备用路径约每 30 秒检查一次。节点共享控制包预算（每秒 100 个，突发 40 个），其中后台探测最多每秒 20 个，突发 10 个。实际间隔随负载和随机错峰变化。普通空闲连接暂停质量巡检。给指定 peer 设置 `MonitorInterval` 可在空闲时继续检查，并在断连后重建。巡检流量单独计量。
+活跃 peer 定期采样主路和备路，实际间隔随节点共享预算和随机错峰变化。普通空闲连接暂停巡检。给指定 peer 设置 `MonitorInterval` 可在空闲时继续检查，并在断连后重建。
 
-- **性能换路**需要备用路径连续三次明显优于主路，且主路已保持至少 30 秒。
-- **故障接管**发生在主路连续三次探测超时且备用路径近期验证成功时。故障线路从 30 秒开始退避重试。
-- **查看切换原因**时，读取 `node.Peer(addr)` 返回的快照。`PathHealth.Active` 和 `Standby` 包含采样间隔、抖动及近期超时数。`LastCheck` 记录最近探测，`Reason` 记录最近一次选路原因。`LastDataPath` 记录最近一次成功提交的业务包路径。
+- **性能换路**默认需要备用路径连续三次明显优于主路，且主路已保持至少 30 秒。
+- **故障接管**默认发生在主路连续三次探测超时且备用路径近期验证成功时。故障线路从 30 秒开始退避重试。
+- **查看切换原因**时，读取 peer 快照的 `PathHealth.Reason` 和 `PathHealth.LastCheck`。用 `PathHealth.Active`、`PathHealth.Standby` 对比主备路径的采样间隔、抖动和近期超时数。
+
+## 调整探测与选路
+
+在 `nebula.New` 前设置 `opts.Paths.Probes` 和 `opts.Paths.Selection`。下面的配置将主路采样周期改为 5 秒，并在主路连续两次超时后允许近期验证成功的备路接管。
+
+```go
+opts.Paths.Probes.ActiveInterval = 5 * time.Second
+opts.Paths.Selection.FailureThreshold = 2
+```
+
+| `Paths.Probes` 字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `ActiveInterval`、`StandbyInterval`、`IdleTimeout` | 10 秒、30 秒、1 分钟 | 活跃连接的主备采样周期和进入空闲状态的时间。空闲时设置了 `MonitorInterval` 的 peer 使用该周期，备路约为其三倍。 |
+| `TickInterval`、`SweepInterval` | 125 毫秒、10 秒 | 调度时钟精度，以及清理半开中转和检查需重连 peer 的周期。 |
+| `InitialTimeout`、`MinTimeout`、`MaxTimeout` | 1 秒、300 毫秒、5 秒 | 首次探测的回显等待时间和自适应等待时间的上下界，首次等待也受上下界约束。 |
+| `CheckTimeout` | 10 秒 | 连接建立后，手动 `CheckPeerPath` 等待路径和探测结果的期限。调用方仍可用 context 提前结束等待。 |
+| `ControlBudget`、`ProbeBudget` | 突发 40、每 10 毫秒补 1 个；突发 10、每 50 毫秒补 1 个 | 使用 `nebula.PacketBudget{Burst: ..., Every: ...}` 配置。定期采样和手动 `CheckPeerPath` 共用探测预算，发送时还受控制包总预算约束。中转邻接故障复核只使用控制包预算。 |
+
+| `Paths.Selection` 字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `FailureThreshold`、`RetryInterval` | 3 次、250 毫秒 | 主路连续超时达到阈值时触发故障处理，未达阈值时提前重试。 |
+| `SwitchThreshold`、`HoldTime` | 3 次、30 秒 | 性能换路所需的连续优势次数与同路往返样本数，以及主路的最短保持时间。 |
+| `Freshness`、`MeasurementTTL` | 45 秒、90 秒 | 备路接管或主路对比所用样本的有效期，以及 RTT 估计器的重置间隔。 |
+| `SampleWindow` | 16 次 | 近期超时统计窗口，可设 1 至 64。 |
+| `MinImprovement`、`ImprovementPercent` | 15 毫秒、20% | 与主路评分比较，绝对改善量与相对改善量取较大者作为换路门槛。 |
+| `JitterThreshold`、`JitterPercent` | 15 毫秒、20% | 对比绝对抖动和相对于平滑 RTT 的阈值，取较大者判定抖动降级。 |
+| `MinBackoff`、`MaxBackoff`、`RecoveryInterval` | 30 秒、5 分钟、30 秒 | 故障线路的初始和最大退避时间，以及恢复握手的最小间隔。 |
+
+零值或负值采用默认值。超时和退避的下界须小于或等于上界，百分比按整数填写（例如 `20` 表示 20%），最大为 100。节点创建时会检查这些约束。

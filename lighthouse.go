@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -59,6 +61,7 @@ type lighthouse struct {
 	relaysForMe []netip.Addr
 
 	updateTrigger chan struct{}
+	maxReported   int
 	queryChan     chan netip.Addr
 	queuedQueries sync.Map // overlay address to *pendingQuery, while enqueueing or sending
 	updateGate    chan struct{}
@@ -86,8 +89,9 @@ func newLighthouse(ctx context.Context, l *slog.Logger, cs *certificateState, p 
 		punchy:             p,
 		addrMap:            make(map[netip.Addr]*remoteList),
 		endpointProvider:   cfg.EndpointProvider,
+		maxReported:        positiveOr(cfg.MaxReported, 10),
 		updateTrigger:      make(chan struct{}, 1),
-		queryChan:          make(chan netip.Addr, 1024),
+		queryChan:          make(chan netip.Addr, positiveOr(cfg.QueryBuffer, 1024)),
 		updateGate:         make(chan struct{}, 1),
 		lighthouses:        cloneAddresses(cfg.Hosts),
 		advertiseAddrs:     slices.Clone(cfg.AdvertiseEndpoints),
@@ -244,29 +248,6 @@ func (lh *lighthouse) getOrCreateRemotes(vpnAddrs []netip.Addr) *remoteList {
 	return lh.getOrCreateRemotesLocked(vpnAddrs)
 }
 
-// withPeerRecord marshals a reply using the record reported by the peer itself.
-// Acquire the remote lock before releasing the lighthouse lock to pin this entry.
-func (lh *lighthouse) withPeerRecord(addr netip.Addr, marshal func(*discoveryRecord) (int, error)) (bool, int, error) {
-	lh.RLock()
-	remotes := lh.addrMap[addr]
-	if remotes == nil {
-		lh.RUnlock()
-		return false, 0, nil
-	}
-	remotes.RLock()
-	lh.RUnlock()
-	defer remotes.RUnlock()
-	if slices.Contains(remotes.vpnAddrs, addr) {
-		addr = remotes.vpnAddrs[0]
-	}
-	record := remotes.records[addr]
-	if record == nil {
-		return false, 0, nil
-	}
-	n, err := marshal(record)
-	return true, n, err
-}
-
 func (lh *lighthouse) DeleteVpnAddrs(allVpnAddrs []netip.Addr) {
 	// First we check the static host map. If any of the VpnAddrs to be deleted are present, do nothing.
 	lh.Lock()
@@ -327,9 +308,9 @@ func (lh *lighthouse) replaceReport(addrs []netip.Addr, owner netip.Addr, detail
 	defer remotes.Unlock()
 
 	record := remotes.recordForUpdate(owner)
-	record.v4.replaceReported(details.V4AddrPorts, lh.myVpnNetworksTable, protoV4AddrPortToNetAddrPort)
-	record.v6.replaceReported(details.V6AddrPorts, lh.myVpnNetworksTable, protoV6AddrPortToNetAddrPort)
-	record.relays = append(record.relays[:0], relays[:min(len(relays), maxRemotes)]...)
+	record.v4.replaceReported(details.V4AddrPorts, lh.maxReported, lh.myVpnNetworksTable, protoV4AddrPortToNetAddrPort)
+	record.v6.replaceReported(details.V6AddrPorts, lh.maxReported, lh.myVpnNetworksTable, protoV6AddrPortToNetAddrPort)
+	record.relays = append(record.relays[:0], relays[:min(len(relays), lh.maxReported)]...)
 }
 
 func (lh *lighthouse) IsLighthouseAddr(vpnAddr netip.Addr) bool {
@@ -397,7 +378,7 @@ func (lh *lighthouse) sendToLighthouses(ctx context.Context, kind NebulaMeta_Mes
 				record.appendTo(details, v)
 			}
 			msg := NebulaMeta{Type: kind, Details: details}
-			data, err := msg.Marshal()
+			data, err := msg.marshalDiscovery(nil)
 			if err != nil {
 				lh.l.Error("failed to marshal lighthouse message", "type", kind, "error", err)
 				continue
@@ -532,31 +513,56 @@ func (lh *lighthouse) NewRequestHandler() *lighthouseHandler {
 		nb:   make([]byte, 12),
 		out:  make([]byte, mtu),
 		l:    lh.l,
-		pb:   make([]byte, mtu),
+		pb:   make([]byte, mtu-header.MaxOverhead),
 		meta: &NebulaMeta{Details: &NebulaMetaDetails{}},
 	}
 }
 
-// This method is similar to Reset(), but it re-uses the pointer structs
-// so that we don't have to re-allocate them
-func (lhh *lighthouseHandler) resetMeta() *NebulaMeta {
+// Reset scalar fields while retaining scratch space for the next message.
+func (lhh *lighthouseHandler) resetMeta(kind NebulaMeta_MessageType) *NebulaMeta {
 	details := lhh.meta.Details
-	lhh.meta.Reset()
-
-	// Keep the array memory around
-	details.V4AddrPorts = details.V4AddrPorts[:0]
-	details.V6AddrPorts = details.V6AddrPorts[:0]
-	details.RelayVpnAddrs = details.RelayVpnAddrs[:0]
-	details.OldRelayVpnAddrs = details.OldRelayVpnAddrs[:0]
-	details.OldVpnAddr = 0
-	details.VpnAddr = nil
-	lhh.meta.Details = details
-
+	*details = NebulaMetaDetails{
+		V4AddrPorts: details.V4AddrPorts[:0], V6AddrPorts: details.V6AddrPorts[:0],
+		RelayVpnAddrs: details.RelayVpnAddrs[:0], OldRelayVpnAddrs: details.OldRelayVpnAddrs[:0],
+	}
+	*lhh.meta = NebulaMeta{Type: kind, Details: details}
 	return lhh.meta
 }
 
+// marshalDiscovery fits the largest common per-list cap in one relayed datagram.
+// Each list retains its original order. The caller owns msg and may reuse buf.
+func (msg *NebulaMeta) marshalDiscovery(buf []byte) ([]byte, error) {
+	const limit = mtu - header.MaxOverhead
+	size := msg.Size()
+	if size > limit {
+		d := msg.Details
+		original := *d
+		trim := func(n int) {
+			d.V4AddrPorts = original.V4AddrPorts[:min(n, len(original.V4AddrPorts))]
+			d.V6AddrPorts = original.V6AddrPorts[:min(n, len(original.V6AddrPorts))]
+			d.RelayVpnAddrs = original.RelayVpnAddrs[:min(n, len(original.RelayVpnAddrs))]
+			d.OldRelayVpnAddrs = original.OldRelayVpnAddrs[:min(n, len(original.OldRelayVpnAddrs))]
+		}
+		count := max(len(d.V4AddrPorts), len(d.V6AddrPorts), len(d.RelayVpnAddrs), len(d.OldRelayVpnAddrs))
+		firstTooLarge := sort.Search(count, func(n int) bool {
+			trim(n)
+			return msg.Size() > limit
+		})
+		if firstTooLarge == 0 {
+			return nil, io.ErrShortBuffer
+		}
+		trim(firstTooLarge - 1)
+		size = msg.Size()
+	}
+	if cap(buf) < size {
+		buf = make([]byte, size)
+	}
+	n, err := msg.MarshalToSizedBuffer(buf[:size])
+	return buf[:n], err
+}
+
 func (lhh *lighthouseHandler) HandleRequest(rAddr netip.AddrPort, fromVpnAddrs []netip.Addr, p []byte) {
-	n := lhh.resetMeta()
+	n := lhh.resetMeta(NebulaMeta_None)
 	err := n.Unmarshal(p)
 	if err != nil {
 		lhh.l.Error("Failed to unmarshal lighthouse packet",
@@ -621,82 +627,68 @@ func (lhh *lighthouseHandler) handleHostQuery(n *NebulaMeta, fromVpnAddrs []neti
 		return
 	}
 
-	found, ln, err := lhh.lh.withPeerRecord(queryVpnAddr, func(c *discoveryRecord) (int, error) {
-		n = lhh.resetMeta()
-		n.Type = NebulaMeta_HostQueryReply
-		if err := n.Details.setVPNAddr(queryVpnAddr, useVersion); err != nil {
-			return 0, err
-		}
-		c.appendTo(n.Details, useVersion)
-		return n.MarshalTo(lhh.pb)
-	})
-
-	if !found {
+	requester := fromVpnAddrs[0]
+	if !lhh.sendPeerRecord(NebulaMeta_HostQueryReply, requester, queryVpnAddr, queryVpnAddr, useVersion) {
 		return
 	}
 
-	if err != nil {
-		lhh.l.Error("Failed to marshal lighthouse host query reply",
-			"error", err,
-			"vpnAddrs", fromVpnAddrs,
-		)
-		return
-	}
-
-	lhh.lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, fromVpnAddrs[0], lhh.pb[:ln], lhh.nb, lhh.out[:0])
-
-	lhh.sendHostPunchNotification(fromVpnAddrs, queryVpnAddr)
-}
-
-// sendHostPunchNotification signals the other side to punch some zero byte udp packets
-func (lhh *lighthouseHandler) sendHostPunchNotification(fromVpnAddrs []netip.Addr, punchNotifDest netip.Addr) {
-	whereToPunch := fromVpnAddrs[0]
-	// Resolve the target before taking the querier's remoteList lock below. GetHostInfo takes the
-	// hostmap lock, and the hostmap is taken before the lighthouse, which is taken before a
-	// remoteList, so looking it up inside the callback would deadlock.
-	targetHI := lhh.lh.sender.GetHostInfo(punchNotifDest)
-	found, ln, err := lhh.lh.withPeerRecord(whereToPunch, func(c *discoveryRecord) (int, error) {
-		n := lhh.resetMeta()
-		n.Type = NebulaMeta_HostPunchNotification
-		var useVersion cert.Version
-		if targetHI == nil {
-			useVersion = lhh.lh.sender.GetCertState().initiatingVersion
-		} else {
-			crt := targetHI.GetCert().Certificate
-			useVersion = crt.Version()
-			// we can only retarget if we have a hostinfo
-			newDest, ok := findNetworkUnion(crt.Networks(), fromVpnAddrs)
-			if ok {
-				whereToPunch = newDest
-			} else {
-				if lhh.l.Enabled(context.Background(), slog.LevelDebug) {
-					lhh.l.Debug("unable to punch to host, no addresses in common",
-						"to", crt.Networks(),
-					)
-				}
+	// Tell the queried peer where to punch, using an address it can route to.
+	punchAddr := requester
+	if target := lhh.lh.sender.GetHostInfo(queryVpnAddr); target != nil {
+		crt := target.GetCert().Certificate
+		useVersion = crt.Version()
+		punchAddr = netip.Addr{}
+		for _, network := range crt.Networks() {
+			if i := slices.IndexFunc(fromVpnAddrs, network.Contains); i >= 0 {
+				punchAddr = fromVpnAddrs[i]
+				break
 			}
 		}
-
-		if err := n.Details.setVPNAddr(whereToPunch, useVersion); err != nil {
-			return 0, err
+		if !punchAddr.IsValid() {
+			lhh.l.Debug("using primary punch address outside recipient networks", "address", requester)
+			punchAddr = requester
 		}
-		c.appendTo(n.Details, useVersion)
-		return n.MarshalTo(lhh.pb)
-	})
-
-	if !found {
-		return
+	} else {
+		useVersion = lhh.lh.sender.GetCertState().initiatingVersion
 	}
+	lhh.sendPeerRecord(NebulaMeta_HostPunchNotification, queryVpnAddr, requester, punchAddr, useVersion)
+}
 
+// owner selects the self-reported record. advertised can be another address
+// on that peer's certificate, chosen for the recipient's network and version.
+func (lhh *lighthouseHandler) sendPeerRecord(kind NebulaMeta_MessageType, to, owner, advertised netip.Addr, version cert.Version) bool {
+	lh := lhh.lh
+	lh.RLock()
+	remotes := lh.addrMap[owner]
+	if remotes == nil {
+		lh.RUnlock()
+		return false
+	}
+	remotes.RLock()
+	lh.RUnlock()
+	if slices.Contains(remotes.vpnAddrs, owner) {
+		owner = remotes.vpnAddrs[0]
+	}
+	record := remotes.records[owner]
+	if record == nil {
+		remotes.RUnlock()
+		return false
+	}
+	msg := lhh.resetMeta(kind)
+	record.appendTo(msg.Details, version)
+	remotes.RUnlock()
+
+	if err := msg.Details.setVPNAddr(advertised, version); err != nil {
+		lhh.l.Error("invalid discovery record address", "address", advertised, "error", err)
+		return false
+	}
+	payload, err := msg.marshalDiscovery(lhh.pb)
 	if err != nil {
-		lhh.l.Error("Failed to marshal lighthouse host was queried for",
-			"error", err,
-			"vpnAddrs", fromVpnAddrs,
-		)
-		return
+		lhh.l.Error("failed to marshal discovery record", "type", kind, "peer", owner, "error", err)
+		return false
 	}
-
-	lhh.lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, punchNotifDest, lhh.pb[:ln], lhh.nb, lhh.out[:0])
+	lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, to, payload, lhh.nb, lhh.out[:0])
+	return true
 }
 
 func (c *discoveryRecord) appendTo(d *NebulaMetaDetails, v cert.Version) {
@@ -765,8 +757,7 @@ func (lhh *lighthouseHandler) handleHostUpdateNotification(n *NebulaMeta, fromVp
 
 	lhh.lh.replaceReport(fromVpnAddrs, fromVpnAddrs[0], n.Details)
 
-	n = lhh.resetMeta()
-	n.Type = NebulaMeta_HostUpdateNotificationAck
+	n = lhh.resetMeta(NebulaMeta_HostUpdateNotificationAck)
 	if useVersion == cert.Version1 {
 		if err := n.Details.setVPNAddr(fromVpnAddrs[0], useVersion); err != nil {
 			lhh.l.Error("invalid lighthouse acknowledgement address", "error", err)
@@ -774,7 +765,7 @@ func (lhh *lighthouseHandler) handleHostUpdateNotification(n *NebulaMeta, fromVp
 		}
 	}
 
-	ln, err := n.MarshalTo(lhh.pb)
+	payload, err := n.marshalDiscovery(lhh.pb)
 	if err != nil {
 		lhh.l.Error("Failed to marshal lighthouse host update ack",
 			"error", err,
@@ -783,7 +774,7 @@ func (lhh *lighthouseHandler) handleHostUpdateNotification(n *NebulaMeta, fromVp
 		return
 	}
 
-	lhh.lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, fromVpnAddrs[0], lhh.pb[:ln], lhh.nb, lhh.out[:0])
+	lhh.lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, fromVpnAddrs[0], payload, lhh.nb, lhh.out[:0])
 }
 
 func (lhh *lighthouseHandler) handleHostPunchNotification(n *NebulaMeta, fromVpnAddrs []netip.Addr) {
@@ -889,18 +880,6 @@ func (d *NebulaMetaDetails) GetRelays() []netip.Addr {
 		}
 	}
 	return relays
-}
-
-// FindNetworkUnion returns the first netip.Addr contained in the list of provided netip.Prefix, if able
-func findNetworkUnion(prefixes []netip.Prefix, addrs []netip.Addr) (netip.Addr, bool) {
-	for i := range prefixes {
-		for j := range addrs {
-			if prefixes[i].Contains(addrs[j]) {
-				return addrs[j], true
-			}
-		}
-	}
-	return netip.Addr{}, false
 }
 
 func (d *NebulaMetaDetails) setVPNAddr(addr netip.Addr, v cert.Version) error {

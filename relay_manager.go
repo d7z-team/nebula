@@ -145,7 +145,7 @@ func (hm *hostMap) getOrAddRelay(leg *hostInfo, peer netip.Addr, remoteIndex uin
 		}
 		return existing, nil
 	}
-	if len(hm.Relays) >= 8192 {
+	if len(hm.Relays) >= hm.maxRelayMappings {
 		return nil, errors.New("relay capacity reached")
 	}
 	for range 32 {
@@ -183,7 +183,7 @@ func (f *packetEngine) directNeighbor(addr netip.Addr) *hostInfo {
 		return nil
 	}
 	if h != nil && h.GetRemote().IsValid() {
-		if h.paths.failedDirect(h.GetRemote()) {
+		if h.paths.failedDirect(h.GetRemote(), f.paths.selection.FailureThreshold) {
 			now := time.Now()
 			h.verifyNeighbor(now.Add(-time.Second), now)
 			return nil
@@ -232,7 +232,7 @@ func (f *packetEngine) sendRelayControl(leg *hostInfo, from, to netip.Addr, init
 		rs := &leg.relayState
 		rs.Lock()
 		entry := rs.relayForByIdx[initiator]
-		if entry == nil || time.Since(entry.lastRequest) < 100*time.Millisecond {
+		if entry == nil || time.Since(entry.lastRequest) < f.hostMap.relayRequestInterval {
 			rs.Unlock()
 			return
 		}
@@ -373,7 +373,7 @@ func (hm *hostMap) expirePendingRelays(now time.Time) {
 	for idx, h := range hm.Relays {
 		rs := &h.relayState
 		rs.Lock()
-		if r := rs.relayForByIdx[idx]; r != nil && r.State != relayEstablished && now.Sub(r.created) > time.Minute {
+		if r := rs.relayForByIdx[idx]; r != nil && r.State != relayEstablished && now.Sub(r.created) > hm.pendingRelayTimeout {
 			delete(hm.Relays, idx)
 			delete(rs.relayForByIdx, idx)
 			delete(rs.relayForByAddr, r.PeerAddr)

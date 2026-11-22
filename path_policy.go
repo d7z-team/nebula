@@ -33,12 +33,6 @@ type PeerPathPolicy struct {
 	MonitorInterval time.Duration
 }
 
-// PathOptions selects a default policy and optional per-identity overrides.
-type PathOptions struct {
-	Default PeerPathPolicy
-	Peers   map[netip.Addr]PeerPathPolicy
-}
-
 var (
 	ErrPathPolicy  = errors.New("tunnel path denied by policy")
 	ErrPathTimeout = errors.New("tunnel path probe timed out")
@@ -47,14 +41,22 @@ var (
 	errPathBudget  = errors.New("path control budget exhausted")
 )
 
+// The runtime policy map is replaced atomically. Probe settings are fixed at New.
+type pathPolicies struct {
+	Default PeerPathPolicy
+	Peers   map[netip.Addr]PeerPathPolicy
+}
+
 type pathManager struct {
-	config atomic.Pointer[PathOptions]
-	checks *timerWheel[*hostInfo]
+	probes    PathProbeOptions
+	selection PathSelectionOptions
+	config    atomic.Pointer[pathPolicies]
+	checks    *timerWheel[*hostInfo]
 	// Writers hold a shared permit across the final policy check and UDP submission.
 	// Policy readers elsewhere use the immutable config without taking this lock.
-	ctx                 context.Context
-	submit              *semaphore.Weighted
-	control, background *ratelimit.Limiter
+	ctx                        context.Context
+	submit                     *semaphore.Weighted
+	controlBudget, probeBudget *ratelimit.Limiter
 }
 
 func (p PeerPathPolicy) validate(n *Node, peer netip.Addr) (PeerPathPolicy, error) {
@@ -80,7 +82,7 @@ func (p *pathManager) init(n *Node, opts PathOptions) error {
 	if err != nil {
 		return err
 	}
-	cfg := PathOptions{Default: d, Peers: make(map[netip.Addr]PeerPathPolicy, len(opts.Peers))}
+	cfg := pathPolicies{Default: d, Peers: make(map[netip.Addr]PeerPathPolicy, len(opts.Peers))}
 	for addr, v := range opts.Peers {
 		addr = addr.Unmap()
 		if err := n.validatePeerAddress(addr); err != nil {
@@ -96,10 +98,21 @@ func (p *pathManager) init(n *Node, opts PathOptions) error {
 		cfg.Peers[addr] = v
 	}
 	p.ctx, p.submit = n.ctx, semaphore.NewWeighted(math.MaxInt64)
-	p.checks = newTimerWheel[*hostInfo](pathTick, time.Second)
+	if err := opts.normalizeTuning(); err != nil {
+		return err
+	}
+	p.probes, p.selection = opts.Probes, opts.Selection
+	// Every scheduled item has a delay of exactly one tick.
+	p.checks = newTimerWheel[*hostInfo](p.probes.TickInterval, p.probes.TickInterval)
 	p.config.Store(&cfg)
-	p.control, _ = ratelimit.New(40, 10*time.Millisecond)
-	p.background, _ = ratelimit.New(10, 50*time.Millisecond)
+	p.controlBudget, err = ratelimit.New(p.probes.ControlBudget.Burst, p.probes.ControlBudget.Every)
+	if err != nil {
+		return fmt.Errorf("path control budget: %w", err)
+	}
+	p.probeBudget, err = ratelimit.New(p.probes.ProbeBudget.Burst, p.probes.ProbeBudget.Every)
+	if err != nil {
+		return fmt.Errorf("path probe budget: %w", err)
+	}
 	return nil
 }
 
@@ -173,7 +186,7 @@ func matchesIdentity(list []netip.Addr, addr netip.Addr, aliases []netip.Addr) b
 }
 
 // Every explicit alias constraint applies. The default applies only without an override.
-func (cfg *PathOptions) allows(ids []netip.Addr, relay netip.Addr, remotes *remoteList, aliases ...netip.Addr) bool {
+func (cfg *pathPolicies) allows(ids []netip.Addr, relay netip.Addr, remotes *remoteList, aliases ...netip.Addr) bool {
 	match := func(v PeerPathPolicy) bool {
 		if !relay.IsValid() {
 			return v.Mode != RelayOnly
@@ -212,7 +225,7 @@ func (hm *hostMap) relayIdentities(addr netip.Addr) []netip.Addr {
 	return nil
 }
 
-func (cfg *PathOptions) policy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
+func (cfg *pathPolicies) policy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
 	var v PeerPathPolicy
 	var constrained, found bool
 	for _, id := range ids {
@@ -313,7 +326,7 @@ func (f *packetEngine) routeLive(h *hostInfo, r tunnelRoute) bool {
 		return false
 	}
 	entry, ok := r.leg.relayState.mappingByIndex(r.local)
-	return ok && entry.State == relayEstablished && entry.Type == relayTypeTerminal && entry.RemoteIndex == r.remote && slices.Contains(h.vpnAddrs, entry.PeerAddr) && !r.leg.paths.failedDirect(r.Endpoint)
+	return ok && entry.State == relayEstablished && entry.Type == relayTypeTerminal && entry.RemoteIndex == r.remote && slices.Contains(h.vpnAddrs, entry.PeerAddr) && !r.leg.paths.failedDirect(r.Endpoint, f.paths.selection.FailureThreshold)
 }
 
 func (f *packetEngine) writePath(h *hostInfo, r tunnelRoute, packet []byte, control bool, ingress *hostInfo) error {
@@ -325,11 +338,11 @@ func (f *packetEngine) writePath(h *hostInfo, r tunnelRoute, packet []byte, cont
 		return errWritePolicy
 	}
 	if control {
-		if _, ok := f.paths.control.Allow(); !ok {
+		if _, ok := f.paths.controlBudget.Allow(); !ok {
 			return errPathBudget
 		}
 	}
-	return f.outside.WriteTo(packet, r.Endpoint)
+	return f.writeDatagram(packet, r.Endpoint)
 }
 
 func (f *packetEngine) handshakeAllowed(ids []netip.Addr, v packetSender, remotes *remoteList) bool {

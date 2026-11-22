@@ -18,15 +18,25 @@ var (
 	ErrNodeNotStarted = errors.New("nebula node is not started")
 )
 
+// positiveOr applies the package convention for optional sizes and intervals.
+func positiveOr[T ~int | ~int64](value, fallback T) T {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
 // EndpointProvider supplies the node's current externally reachable transport
 // endpoints. Calls are serialized. A provider must honor ctx and must not
 // synchronously call AdvertiseNow or Rebind on the same Node.
 type EndpointProvider func(context.Context) ([]netip.AddrPort, error)
 
 type HandshakeOptions struct {
-	TryInterval   time.Duration
-	Retries       int
-	TriggerBuffer int
+	TryInterval      time.Duration
+	Retries          int
+	TriggerBuffer    int
+	ControlQueueSize int // Control packets retained per pending handshake. Default 100.
+	RefreshAttempt   int // Retry on which to refresh discovery. Default 5.
 }
 
 type PunchyOptions struct {
@@ -35,6 +45,7 @@ type PunchyOptions struct {
 	Delay            time.Duration
 	RespondDelay     time.Duration
 	TargetAllRemotes bool
+	QueueSize        int // Maximum pending punch jobs. Default 64.
 }
 
 type ConnectionOptions struct {
@@ -42,6 +53,8 @@ type ConnectionOptions struct {
 	PendingDeletionInterval time.Duration
 	InactivityTimeout       time.Duration
 	DropInactive            bool
+	MaxTunnelsPerAddress    int           // Concurrent tunnels retained across rehandshakes. Default 5.
+	RoamSuppressInterval    time.Duration // Minimum interval between probe requests for the same roaming candidate. Default 2s.
 }
 
 type LighthouseOptions struct {
@@ -51,11 +64,16 @@ type LighthouseOptions struct {
 	AdvertiseEndpoints []netip.AddrPort
 	EndpointProvider   EndpointProvider
 	UpdateInterval     time.Duration
+	QueryBuffer        int // Queued peer queries. Default 1024.
+	MaxReported        int // Candidates per report, separately for IPv4, IPv6, and relays. Default 10.
 }
 
 type RelayOptions struct {
-	Serve        bool
-	AdvertiseVia []netip.Addr
+	Serve           bool
+	AdvertiseVia    []netip.Addr
+	MaxMappings     int           // Local relay indices shared by all neighbors. Default 8192.
+	PendingTimeout  time.Duration // Lifetime of a half-open mapping. Default 1m.
+	RequestInterval time.Duration // Minimum interval between requests for one mapping. Default 100ms.
 }
 
 // Options configures the Nebula tunnel and its caller-supplied transport.
@@ -65,7 +83,11 @@ type Options struct {
 	InitiatingVersion cert.Version
 	Cipher            string
 	Transport         DatagramTransport
+	// DatagramMagic prefixes each outer datagram, including hole punches.
+	// Use the same bytes on every peer and relay. Empty uses upstream framing.
+	DatagramMagic []byte
 
+	IPPort          IPPortOptions
 	Lighthouse      LighthouseOptions
 	Punchy          PunchyOptions
 	Relay           RelayOptions
@@ -87,6 +109,7 @@ type Node struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	transport     DatagramTransport
+	portOptions   IPPortOptions
 	engine        *packetEngine
 	handshake     *handshakeManager
 	connections   *connectionManager
@@ -132,6 +155,10 @@ func New(parent context.Context, options Options) (*Node, error) {
 	transportAddr, _ := options.Transport.LocalAddr()
 	n := &Node{
 		ctx: ctx, cancel: cancel, transport: options.Transport,
+		portOptions: IPPortOptions{
+			QueueSize:        positiveOr(options.IPPort.QueueSize, 512),
+			PerPeerQueueSize: positiveOr(options.IPPort.PerPeerQueueSize, 100),
+		},
 		engine: engine, handshake: handshake, connections: connections,
 		punchy: punchy, lighthouse: lighthouse,
 		transportAddr: unmapAddrPort(transportAddr),

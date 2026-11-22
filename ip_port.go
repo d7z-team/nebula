@@ -11,11 +11,14 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-const (
-	// MaxIPPacketSize is the largest complete IP frame carried by a Nebula NIC.
-	MaxIPPacketSize    = mtu
-	maxQueuedIPPackets = 512
-)
+// MaxIPPacketSize is the largest complete IP frame carried by a Nebula NIC.
+const MaxIPPacketSize = mtu
+
+// IPPortOptions bounds queued IP packets for both OpenIPPort and gVisor endpoints.
+type IPPortOptions struct {
+	QueueSize        int // Maximum across all next hops. Default 512.
+	PerPeerQueueSize int // Maximum per next hop. Default 100.
+}
 
 var (
 	ErrPortInUse           = errors.New("node already has an IP port")
@@ -143,6 +146,12 @@ func (p *IPPort) Stats() PortStats {
 	return stats
 }
 
+// queueFull is called under p.mu for both initial admission and a route retry.
+func (p *IPPort) queueFull(q *peerQueue) bool {
+	limits := p.node.portOptions
+	return p.queued >= limits.QueueSize || (q != nil && len(q.packets) >= limits.PerPeerQueueSize)
+}
+
 // WriteIP accepts a copy into a bounded queue. An empty next hop selects a
 // directly connected overlay destination. The authenticated peer is checked
 // again when the queue is serviced, including after a pending handshake.
@@ -187,11 +196,11 @@ func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
 		return ErrPortClosed
 	}
 	q := p.queues[peer]
-	if p.queued >= maxQueuedIPPackets || (q != nil && len(q.packets) >= maxCachedPackets) {
+	if p.queueFull(q) {
 		return ErrQueueFull
 	}
 	if q == nil {
-		if p.workers >= maxQueuedIPPackets {
+		if p.workers >= p.node.portOptions.QueueSize {
 			return ErrQueueFull
 		}
 		ctx, cancel := context.WithCancel(p.ctx)
@@ -257,7 +266,7 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 			// No datagram was submitted. Keep this frame ahead of later packets
 			// if the original queue is still attached and has room.
 			p.mu.Lock()
-			if p.queues[peer] == q && len(q.packets) < maxCachedPackets && p.queued < maxQueuedIPPackets {
+			if p.queues[peer] == q && !p.queueFull(q) {
 				q.packets = append(q.packets, queuedIP{})
 				copy(q.packets[1:], q.packets[:len(q.packets)-1])
 				q.packets[0] = packet

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/fips140"
 	"fmt"
+	"math"
 	"net/netip"
 	"testing"
 	"testing/synctest"
@@ -37,6 +38,14 @@ func pathTestIdentities(t *testing.T, version cert.Version, count int) (*cert.CA
 
 func pathTestMesh(t *testing.T, count int) ([]*Node, []nodeTestIdentity, []*memoryDatagramTransport) {
 	t.Helper()
+	return pathTestMeshWithOptions(t, count, Options{
+		Relay: RelayOptions{Serve: true}, Handshake: HandshakeOptions{TryInterval: 30 * time.Millisecond},
+		Punchy: PunchyOptions{Punch: true, Respond: true, Delay: time.Millisecond},
+	})
+}
+
+func pathTestMeshWithOptions(t *testing.T, count int, opts Options) ([]*Node, []nodeTestIdentity, []*memoryDatagramTransport) {
+	t.Helper()
 	pool, ids := pathTestIdentities(t, cert.Version2, count)
 	var endpoints []netip.AddrPort
 	for i := range ids {
@@ -51,8 +60,9 @@ func pathTestMesh(t *testing.T, count int) ([]*Node, []nodeTestIdentity, []*memo
 				static[other.addr] = []netip.AddrPort{endpoints[j]}
 			}
 		}
-		n, err := New(t.Context(), Options{Identities: []Identity{id.identity}, CAPool: pool, Transport: transports[i], Relay: RelayOptions{Serve: true}, Handshake: HandshakeOptions{TryInterval: 30 * time.Millisecond}, Lighthouse: LighthouseOptions{StaticHosts: static},
-			Punchy: PunchyOptions{Punch: true, Respond: true, Delay: time.Millisecond}})
+		opts.Identities, opts.CAPool, opts.Transport = []Identity{id.identity}, pool, transports[i]
+		opts.Lighthouse.StaticHosts = static
+		n, err := New(t.Context(), opts)
 		require.NoError(t, err)
 		require.NoError(t, n.Start())
 		nodes = append(nodes, n)
@@ -129,12 +139,14 @@ func TestPathQualitySelection(t *testing.T) {
 	// The trace is shared by all three policies. Each step represents one virtual
 	// second of user traffic and a sampling opportunity on each eligible route.
 	type metrics struct{ probes, switches, earlySwitches, outage, switchAt int }
+	var opts PathOptions
+	require.NoError(t, opts.normalizeTuning())
 	results := map[string]metrics{}
 	for _, mode := range []string{"full", "without-canary", "without-hysteresis"} {
 		var s sessionPaths
 		var m metrics
 		now := time.Unix(100, 0)
-		s.adopt(fast, now, "handshake")
+		s.setHandshakeRoute(fast, now, 10*time.Second)
 		for tick := 1; tick <= 90; tick++ {
 			now = now.Add(time.Second)
 			before := s.active
@@ -159,7 +171,7 @@ func TestPathQualitySelection(t *testing.T) {
 				if r == stable && tick >= 68 {
 					result.Err = ErrPathTimeout
 				}
-				s.record(r, result)
+				s.record(r, result, &opts.Selection)
 				m.probes++
 			}
 			if mode == "without-hysteresis" {
@@ -328,7 +340,7 @@ func TestPathRebindAtScale(t *testing.T) {
 			reply := &hostInfo{vpnAddrs: bSession.vpnAddrs, remotes: bSession.remotes, connectionState: bSession.connectionState, localIndexId: h.remoteIndexId, remoteIndexId: h.localIndexId}
 			h.remote.Store(&tr[1].addr)
 			reply.remote.Store(&tr[0].addr)
-			h.paths.adopt(tunnelRoute{TunnelPath: TunnelPath{Endpoint: tr[1].addr}}, time.Now(), "handshake")
+			h.paths.setHandshakeRoute(tunnelRoute{TunnelPath: TunnelPath{Endpoint: tr[1].addr}}, time.Now(), a.engine.paths.probes.ActiveInterval)
 			a.engine.hostMap.Lock()
 			a.engine.hostMap.Hosts[addr] = h
 			a.engine.hostMap.Indexes[h.localIndexId] = h
@@ -336,7 +348,7 @@ func TestPathRebindAtScale(t *testing.T) {
 			b.engine.hostMap.Lock()
 			b.engine.hostMap.Indexes[reply.localIndexId] = reply
 			b.engine.hostMap.Unlock()
-			a.engine.paths.checks.Add(h, pathTick)
+			a.engine.paths.checks.Add(h, a.engine.paths.probes.TickInterval)
 			peers = append(peers, h)
 			// Repeated requests from every dependent peer share one pending direct adjacency.
 			for range 3 {
@@ -430,7 +442,12 @@ func TestPathPolicyCertificateAliases(t *testing.T) {
 
 func TestPathControlBudgetAndDuplicatePunches(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		nodes, ids, tr := pathTestMesh(t, 2)
+		nodes, ids, tr := pathTestMeshWithOptions(t, 2, Options{
+			Punchy: PunchyOptions{Delay: time.Millisecond},
+			Paths: PathOptions{Probes: PathProbeOptions{
+				ControlBudget: PacketBudget{Burst: 4, Every: 50 * time.Millisecond},
+			}},
+		})
 		a := nodes[0]
 		target := ids[1].addr
 		ep := tr[1].addr
@@ -445,14 +462,14 @@ func TestPathControlBudgetAndDuplicatePunches(t *testing.T) {
 		for range 1000 {
 			a.engine.writePath(h, route, punchPacket, true, nil)
 		}
-		require.Equal(t, 40, tr[0].network.writesTo(tr[0].addr, ep).total)
+		require.Equal(t, 4, tr[0].network.writesTo(tr[0].addr, ep).total)
 		for range 10 {
 			time.Sleep(100 * time.Millisecond)
 			for range 100 {
 				a.engine.writePath(h, route, punchPacket, true, nil)
 			}
 		}
-		require.Equal(t, 140, tr[0].network.writesTo(tr[0].addr, ep).total)
+		require.Equal(t, 24, tr[0].network.writesTo(tr[0].addr, ep).total)
 	})
 }
 
@@ -491,7 +508,7 @@ func TestSharedRelayFailure(t *testing.T) {
 				require.NotEmpty(t, requests)
 			}
 		}
-		require.Eventually(t, func() bool { return h.paths.failedDirect(tr[2].addr) }, 6*time.Second, 100*time.Millisecond)
+		require.Eventually(t, func() bool { return h.paths.failedDirect(tr[2].addr, a.engine.paths.selection.FailureThreshold) }, 6*time.Second, 100*time.Millisecond)
 		for _, peer := range endpoints {
 			require.Nil(t, a.handshake.queryVpnIp(peer))
 			require.False(t, a.engine.currentRoute(a.engine.hostMap.QueryVpnAddr(peer)).Endpoint.IsValid())
@@ -505,5 +522,115 @@ func TestSharedRelayFailure(t *testing.T) {
 				return err == nil && check.Received.Relay == relayID
 			}, 90*time.Second, time.Second)
 		}
+	})
+}
+
+func TestConfiguredPathSelection(t *testing.T) {
+	opts := PathOptions{Selection: PathSelectionOptions{
+		SwitchThreshold: 2, FailureThreshold: 2, SampleWindow: 2,
+		HoldTime: time.Second, Freshness: 2 * time.Second,
+		MinBackoff: 2 * time.Second, MaxBackoff: 5 * time.Second,
+	}}
+	require.NoError(t, opts.normalizeTuning())
+	direct := tunnelRoute{TunnelPath: TunnelPath{Endpoint: netip.MustParseAddrPort("192.0.2.1:1")}}
+	backup := tunnelRoute{TunnelPath: TunnelPath{Endpoint: netip.MustParseAddrPort("192.0.2.2:2")}}
+	now := time.Unix(100, 0)
+	var paths sessionPaths
+	paths.setHandshakeRoute(direct, now, time.Second)
+	observe := func(r tunnelRoute, delay time.Duration, err error) {
+		paths.record(r, PathCheckResult{At: now, SamePath: true, RTT: delay, Err: err}, &opts.Selection)
+	}
+	observe(direct, 200*time.Millisecond, nil)
+	for i := range 2 {
+		now = now.Add(time.Second)
+		observe(backup, 20*time.Millisecond, nil)
+		if i == 0 {
+			require.Equal(t, direct, paths.active)
+		}
+	}
+	require.Equal(t, backup, paths.active)
+	// Refresh the standby immediately before failing the primary twice.
+	observe(direct, 200*time.Millisecond, nil)
+	observe(backup, 0, ErrPathTimeout)
+	require.Equal(t, backup, paths.active)
+	observe(backup, 0, ErrPathTimeout)
+	require.Equal(t, direct, paths.active)
+	q := paths.samples[backup]
+	require.Equal(t, 2, q.Samples)
+	require.Equal(t, 2, q.Timeouts)
+	for _, backoff := range []time.Duration{2 * time.Second, 4 * time.Second, 5 * time.Second} {
+		require.Equal(t, now.Add(backoff), q.RetryAfter)
+		observe(backup, 0, ErrPathTimeout)
+	}
+	observe(backup, time.Millisecond, nil)
+	require.Equal(t, 1, q.Timeouts)
+	require.True(t, q.RetryAfter.IsZero())
+}
+
+func TestInvalidPathTuning(t *testing.T) {
+	pool, id, _ := newNodeTestIdentities(t)
+	for _, paths := range []PathOptions{
+		{Probes: PathProbeOptions{MinTimeout: 2 * time.Second, MaxTimeout: time.Second}},
+		{Selection: PathSelectionOptions{MinBackoff: time.Minute, MaxBackoff: time.Second}},
+		{Selection: PathSelectionOptions{SampleWindow: 65}},
+		{Selection: PathSelectionOptions{ImprovementPercent: 101}},
+		{Probes: PathProbeOptions{ControlBudget: PacketBudget{Every: time.Duration(math.MaxInt64), Burst: 2}}},
+	} {
+		tr := newMemoryDatagramNetwork(netip.MustParseAddrPort("127.0.0.1:34001"))[0]
+		_, err := New(t.Context(), Options{Identities: []Identity{id.identity}, CAPool: pool, Transport: tr, Paths: paths})
+		require.Error(t, err)
+		require.NoError(t, tr.Close())
+	}
+}
+
+func TestManualPathProbeBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		nodes, ids, _ := pathTestMeshWithOptions(t, 2, Options{Paths: PathOptions{
+			Probes: PathProbeOptions{ProbeBudget: PacketBudget{Burst: 1, Every: 200 * time.Millisecond}},
+		}})
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		first, err := nodes[0].CheckPeerPath(ctx, ids[1].addr, TunnelPath{})
+		require.NoError(t, err)
+		second, err := nodes[0].CheckPeerPath(ctx, ids[1].addr, TunnelPath{})
+		require.NoError(t, err)
+		require.Equal(t, 200*time.Millisecond, second.At.Sub(first.At))
+	})
+}
+
+func TestConfiguredPathChecksAndRelayExpiry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		nodes, ids, tr := pathTestMeshWithOptions(t, 2, Options{
+			Paths: PathOptions{Probes: PathProbeOptions{
+				TickInterval: 5 * time.Millisecond, SweepInterval: 50 * time.Millisecond,
+				ActiveInterval: 200 * time.Millisecond, MinTimeout: 50 * time.Millisecond, MaxTimeout: 50 * time.Millisecond,
+			}},
+			Relay: RelayOptions{MaxMappings: 1, PendingTimeout: 100 * time.Millisecond},
+		})
+		n := nodes[0]
+		require.NoError(t, n.ConnectPeer(t.Context(), ids[1].addr))
+		require.Eventually(t, func() bool {
+			p, ok := n.Peer(ids[1].addr)
+			return ok && p.PathHealth.Active.Samples > 0
+		}, 400*time.Millisecond, 10*time.Millisecond)
+
+		hm := n.engine.hostMap
+		h := hm.QueryVpnAddr(ids[1].addr)
+		target := ids[1].addr.Next()
+		mapping, err := hm.getOrAddRelay(h, target, 0, relayTypeTerminal, relayRequested)
+		require.NoError(t, err)
+		_, err = hm.getOrAddRelay(h, target.Next(), 0, relayTypeTerminal, relayRequested)
+		require.ErrorContains(t, err, "relay capacity reached")
+		time.Sleep(160 * time.Millisecond)
+		synctest.Wait()
+		require.Nil(t, hm.QueryRelayIndex(mapping.LocalIndex))
+		_, err = hm.getOrAddRelay(h, target.Next(), 0, relayTypeTerminal, relayRequested)
+		require.NoError(t, err)
+
+		tr[0].network.blockBoth(tr[0].addr, tr[1].addr)
+		start := time.Now()
+		_, err = n.CheckPeerPath(t.Context(), ids[1].addr, TunnelPath{})
+		require.ErrorIs(t, err, ErrPathTimeout)
+		require.Less(t, time.Since(start), 100*time.Millisecond)
 	})
 }

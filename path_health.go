@@ -23,7 +23,7 @@ type PathQuality struct {
 	LastProbe               time.Time
 	Interval                time.Duration // Actual time between completed samples on this path.
 	SRTT, Jitter            time.Duration
-	Samples, Timeouts       int // A rolling window of up to 16 completed checks.
+	Samples, Timeouts       int // Completed checks in the configured rolling sample window.
 	LastSuccess, RetryAfter time.Time
 }
 
@@ -37,33 +37,37 @@ type PeerPathSnapshot struct {
 
 type pathSample struct {
 	PathQuality
-	window                    uint16
+	window                    uint64
 	failures, wins, symmetric int
 	previous, deviation       time.Duration
 	measured                  time.Time
 }
 
-func (s *pathSample) observe(now time.Time, rtt time.Duration, same, timeout bool) {
+func (s *pathSample) observe(result PathCheckResult, cfg *PathSelectionOptions) {
+	now, rtt := result.At, result.RTT
 	if !s.LastProbe.IsZero() {
 		s.Interval = now.Sub(s.LastProbe)
 	}
 	s.LastProbe = now
-	s.window <<= 1
-	s.Samples = min(s.Samples+1, 16)
-	if timeout {
+	s.window = (s.window << 1) & (uint64(1)<<cfg.SampleWindow - 1)
+	s.Samples = min(s.Samples+1, cfg.SampleWindow)
+	if result.Err != nil {
 		s.window |= 1
 		s.failures++
 		s.wins = 0
-		if s.failures >= 3 {
-			delay := min(5*time.Minute, 30*time.Second*time.Duration(1<<min(s.failures-3, 4)))
+		if s.failures >= cfg.FailureThreshold {
+			delay := cfg.MinBackoff
+			for i := cfg.FailureThreshold; i < s.failures && delay < cfg.MaxBackoff; i++ {
+				delay += min(delay, cfg.MaxBackoff-delay)
+			}
 			s.RetryAfter = now.Add(delay)
 		}
 	} else {
 		s.LastSuccess = now
 		s.failures = 0
 		s.RetryAfter = time.Time{}
-		if same {
-			if s.SRTT == 0 || now.Sub(s.measured) > 90*time.Second {
+		if result.SamePath {
+			if s.SRTT == 0 || now.Sub(s.measured) > cfg.MeasurementTTL {
 				s.SRTT = rtt
 				s.deviation = rtt / 2
 				s.Jitter = 0
@@ -81,13 +85,18 @@ func (s *pathSample) observe(now time.Time, rtt time.Duration, same, timeout boo
 			s.symmetric = 0
 		}
 	}
-	s.Timeouts = bits.OnesCount16(s.window)
-	s.Degraded = s.failures > 0 || (s.symmetric >= 3 && s.Jitter >= max(15*time.Millisecond, s.SRTT/5))
+	s.Timeouts = bits.OnesCount64(s.window)
+	s.Degraded = s.failures > 0 || (s.symmetric >= 3 && s.Jitter >= max(cfg.JitterThreshold, percentage(s.SRTT, cfg.JitterPercent)))
+}
+
+// percentage avoids multiplying a full-width duration before division.
+func percentage(d time.Duration, pct int) time.Duration {
+	return (d/100)*time.Duration(pct) + (d%100)*time.Duration(pct)/100
 }
 
 // readyForFailover reports whether a standby has a recent, uninterrupted success.
-func (s *pathSample) readyForFailover(now time.Time) bool {
-	return s != nil && s.failures == 0 && now.Sub(s.LastSuccess) < 45*time.Second
+func (s *pathSample) readyForFailover(now time.Time, freshness time.Duration) bool {
+	return s != nil && s.failures == 0 && now.Sub(s.LastSuccess) < freshness
 }
 
 func (s *pathSample) cost() time.Duration {
@@ -113,10 +122,11 @@ type sessionPaths struct {
 	samples         map[tunnelRoute]*pathSample
 	pending         *pathProbe
 
-	last            PathCheckResult
-	reason          string
-	changed, demand time.Time
-	roam            netip.AddrPort
+	last                 PathCheckResult
+	reason               string
+	changed, demand      time.Time
+	roamCandidate        netip.AddrPort
+	lastRoamProbeRequest time.Time
 
 	nextActive, nextBackup   time.Time
 	nextDiscovery, nextBuild time.Time
@@ -128,12 +138,12 @@ type sessionPaths struct {
 	cursor                   int
 }
 
-func (s *sessionPaths) adopt(r tunnelRoute, now time.Time, why string) {
+func (s *sessionPaths) setHandshakeRoute(r tunnelRoute, now time.Time, activeInterval time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.active, s.changed, s.reason = r, now, why
+	s.active, s.changed, s.reason = r, now, "handshake"
 	s.demand = now
-	s.nextActive = now.Add(10 * time.Second)
+	s.nextActive = now.Add(activeInterval)
 }
 
 // syncEpoch discards measurements made on a previous local binding. Caller holds mu.
@@ -147,11 +157,11 @@ func (s *sessionPaths) syncEpoch(epoch uint32, now time.Time) {
 	s.nextActive, s.nextBackup = now, now
 }
 
-func (s *sessionPaths) failedDirect(addr netip.AddrPort) bool {
+func (s *sessionPaths) failedDirect(addr netip.AddrPort, threshold int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sample := s.samples[tunnelRoute{TunnelPath: TunnelPath{Endpoint: addr}}]
-	return sample != nil && sample.failures >= 3
+	return sample != nil && sample.failures >= threshold
 }
 
 // verifyNeighbor coalesces dependent peers' recovery checks on the direct adjacency.
@@ -216,7 +226,7 @@ func (s *sessionPaths) complete(p *pathProbe, result PathCheckResult) {
 }
 
 // record runs under the session lock, after the reply or timeout has been attributed.
-func (s *sessionPaths) record(r tunnelRoute, result PathCheckResult) {
+func (s *sessionPaths) record(r tunnelRoute, result PathCheckResult, cfg *PathSelectionOptions) {
 	now := result.At
 	if s.samples == nil {
 		s.samples = make(map[tunnelRoute]*pathSample)
@@ -234,14 +244,14 @@ func (s *sessionPaths) record(r tunnelRoute, result PathCheckResult) {
 		q = &pathSample{PathQuality: PathQuality{Path: r.TunnelPath}}
 		s.samples[r] = q
 	}
-	q.observe(now, result.RTT, result.SamePath, result.Err != nil)
+	q.observe(result, cfg)
 	if result.Err != nil {
 		if r == s.active {
-			s.nextActive = now.Add(250 * time.Millisecond)
-			if q.failures >= 3 {
+			s.nextActive = now.Add(cfg.RetryInterval)
+			if q.failures >= cfg.FailureThreshold {
 				s.active = tunnelRoute{}
 				s.reason = "probe timeout"
-				if alt := s.samples[s.standby]; alt.readyForFailover(now) {
+				if alt := s.samples[s.standby]; alt.readyForFailover(now, cfg.Freshness) {
 					s.active = s.standby
 					s.reason = "failover"
 				}
@@ -249,7 +259,7 @@ func (s *sessionPaths) record(r tunnelRoute, result PathCheckResult) {
 				s.changed = now
 				s.nextBackup = now
 			}
-		} else if r == s.standby && q.failures >= 3 {
+		} else if r == s.standby && q.failures >= cfg.FailureThreshold {
 			s.standby = tunnelRoute{}
 		}
 		return
@@ -265,16 +275,16 @@ func (s *sessionPaths) record(r tunnelRoute, result PathCheckResult) {
 		return
 	}
 	previous := s.samples[s.standby]
-	if previous == nil || previous.failures != 0 || now.Sub(previous.LastSuccess) > 45*time.Second || r == s.standby || (q.symmetric > 0 && (previous.symmetric == 0 || q.cost() < previous.cost())) {
+	if previous == nil || previous.failures != 0 || now.Sub(previous.LastSuccess) > cfg.Freshness || r == s.standby || (q.symmetric > 0 && (previous.symmetric == 0 || q.cost() < previous.cost())) {
 		s.standby = r
 	}
 	cur := s.samples[s.active]
-	if cur == nil || cur.symmetric == 0 || q.symmetric == 0 || now.Sub(cur.measured) > 45*time.Second || cur.cost()-q.cost() < max(15*time.Millisecond, cur.cost()/5) {
+	if cur == nil || cur.symmetric == 0 || q.symmetric == 0 || now.Sub(cur.measured) > cfg.Freshness || cur.cost()-q.cost() < max(cfg.MinImprovement, percentage(cur.cost(), cfg.ImprovementPercent)) {
 		q.wins = 0
 		return
 	}
 	q.wins++
-	if q.wins >= 3 && q.symmetric >= 3 && now.Sub(s.changed) >= 30*time.Second {
+	if q.wins >= cfg.SwitchThreshold && q.symmetric >= cfg.SwitchThreshold && now.Sub(s.changed) >= cfg.HoldTime {
 		s.active, s.standby = r, s.active
 		s.changed = now
 		s.reason = "better quality"

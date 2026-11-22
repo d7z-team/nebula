@@ -1,40 +1,45 @@
 package nebula
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log/slog"
 	"net/netip"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/ratelimit"
 )
 
 const mtu = 9001
 
 type packetEngine struct {
-	paths              pathManager
-	hostMap            *hostMap
-	outside            DatagramTransport
-	port               atomic.Pointer[IPPort]
-	localUnsafe        bart.Lite
-	overlayBroadcasts  map[netip.Addr]struct{}
-	inboundPolicy      InboundPolicy
-	pki                *pkiState
-	connectionManager  *connectionManager
-	handshakeManager   *handshakeManager
-	lightHouse         *lighthouse
-	myVpnAddrs         []netip.Addr
-	myVpnAddrsTable    *bart.Lite
-	myVpnNetworks      []netip.Prefix
-	myVpnNetworksTable *bart.Lite
-	servesRelays       bool
-	rebindEpoch        atomic.Uint32
-	udpTxErrLimiter    *ratelimit.Limiter
-	txOversizeLimiter  *ratelimit.Limiter
-	l                  *slog.Logger
+	paths                pathManager
+	hostMap              *hostMap
+	outside              DatagramTransport
+	datagramMagic        []byte
+	datagramBuffers      sync.Pool
+	port                 atomic.Pointer[IPPort]
+	localUnsafe          bart.Lite
+	overlayBroadcasts    map[netip.Addr]struct{}
+	inboundPolicy        InboundPolicy
+	pki                  *pkiState
+	connectionManager    *connectionManager
+	handshakeManager     *handshakeManager
+	lightHouse           *lighthouse
+	myVpnAddrs           []netip.Addr
+	myVpnAddrsTable      *bart.Lite
+	myVpnNetworks        []netip.Prefix
+	myVpnNetworksTable   *bart.Lite
+	servesRelays         bool
+	roamSuppressInterval time.Duration
+	rebindEpoch          atomic.Uint32
+	udpTxErrLimiter      *ratelimit.Limiter
+	txOversizeLimiter    *ratelimit.Limiter
+	l                    *slog.Logger
 }
 
 func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetEngine {
@@ -47,21 +52,25 @@ func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetE
 		return limiter
 	}
 	cs := pki.getCertState()
-	hosts := newHostMap(logger)
 	f := &packetEngine{
-		l:                  logger,
-		hostMap:            hosts,
-		outside:            opts.Transport,
-		inboundPolicy:      opts.InboundPolicy,
-		pki:                pki,
-		servesRelays:       opts.Relay.Serve,
-		myVpnNetworks:      cs.myVpnNetworks,
-		myVpnNetworksTable: cs.myVpnNetworksTable,
-		myVpnAddrs:         cs.myVpnAddrs,
-		myVpnAddrsTable:    cs.myVpnAddrsTable,
-		overlayBroadcasts:  make(map[netip.Addr]struct{}),
-		udpTxErrLimiter:    newLogLimiter(),
-		txOversizeLimiter:  newLogLimiter(),
+		l:                    logger,
+		hostMap:              newHostMap(logger, opts),
+		outside:              opts.Transport,
+		datagramMagic:        slices.Clone(opts.DatagramMagic),
+		inboundPolicy:        opts.InboundPolicy,
+		pki:                  pki,
+		servesRelays:         opts.Relay.Serve,
+		roamSuppressInterval: positiveOr(opts.Connections.RoamSuppressInterval, 2*time.Second),
+		myVpnNetworks:        cs.myVpnNetworks,
+		myVpnNetworksTable:   cs.myVpnNetworksTable,
+		myVpnAddrs:           cs.myVpnAddrs,
+		myVpnAddrsTable:      cs.myVpnAddrsTable,
+		overlayBroadcasts:    make(map[netip.Addr]struct{}),
+		udpTxErrLimiter:      newLogLimiter(),
+		txOversizeLimiter:    newLogLimiter(),
+	}
+	if len(f.datagramMagic) > 0 {
+		f.datagramBuffers.New = func() any { return new(bytes.Buffer) }
 	}
 	for _, prefix := range cs.myVpnNetworks {
 		if prefix.Addr().Is4() && prefix.Bits() < 31 {
@@ -75,32 +84,6 @@ func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetE
 		f.localUnsafe.Insert(prefix)
 	}
 	return f
-}
-
-type rxContext struct {
-	scratch []byte
-	nb      []byte
-	h       header.H
-	lhh     *lighthouseHandler
-}
-
-func (f *packetEngine) receiveDatagrams() error {
-	rxc := &rxContext{
-		scratch: make([]byte, mtu),
-		nb:      make([]byte, 12),
-		lhh:     f.lightHouse.NewRequestHandler(),
-	}
-	packet := make([]byte, mtu+header.MaxOverhead)
-	for {
-		n, from, err := f.outside.ReadFrom(packet)
-		if err != nil {
-			return err
-		}
-		if n <= 0 || n > len(packet) {
-			continue
-		}
-		f.dispatchDatagram(packetSender{UdpAddr: from}, packet[:n], rxc)
-	}
 }
 
 func (f *packetEngine) GetHostInfo(vpnAddr netip.Addr) *hostInfo {

@@ -1,16 +1,19 @@
 package nebula
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+
+	"github.com/slackhq/nebula/header"
 )
 
-// DatagramTransport carries encrypted Nebula wire packets. Implementations
-// must preserve datagram boundaries. New takes ownership after it returns a
-// Node and closes the transport during shutdown. Close must unblock pending
-// ReadFrom and WriteTo calls. Writes from multiple tunnels may be concurrent.
+// DatagramTransport carries complete outer datagrams, including any prefix
+// configured with Options.DatagramMagic. ReadFrom and WriteTo preserve packet
+// boundaries. Concurrent writes may borrow their input until WriteTo returns.
+// New takes ownership on success. Close must unblock pending reads and writes.
 type DatagramTransport interface {
 	ReadFrom([]byte) (int, netip.AddrPort, error)
 	WriteTo([]byte, netip.AddrPort) error
@@ -75,4 +78,47 @@ func addrPort(addr net.Addr) (netip.AddrPort, error) {
 		}
 		return ap, nil
 	}
+}
+
+type rxContext struct {
+	scratch []byte
+	nb      []byte
+	h       header.H
+	lhh     *lighthouseHandler
+}
+
+func (f *packetEngine) receiveDatagrams() error {
+	rxc := &rxContext{
+		scratch: make([]byte, mtu),
+		nb:      make([]byte, 12),
+		lhh:     f.lightHouse.NewRequestHandler(),
+	}
+	// One spare byte distinguishes an oversized UDP datagram truncated by ReadFrom.
+	packet := make([]byte, len(f.datagramMagic)+mtu+header.MaxOverhead+1)
+	for {
+		n, from, err := f.outside.ReadFrom(packet)
+		if err != nil {
+			return err
+		}
+		if n <= len(f.datagramMagic) || n >= len(packet) {
+			continue
+		}
+		if payload, ok := bytes.CutPrefix(packet[:n], f.datagramMagic); ok {
+			f.dispatchDatagram(packetSender{UdpAddr: from}, payload, rxc)
+		}
+	}
+}
+
+func (f *packetEngine) writeDatagram(packet []byte, to netip.AddrPort) error {
+	if len(f.datagramMagic) == 0 {
+		return f.outside.WriteTo(packet, to)
+	}
+	buf := f.datagramBuffers.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.Grow(len(f.datagramMagic) + len(packet))
+	buf.Write(f.datagramMagic)
+	buf.Write(packet)
+	err := f.outside.WriteTo(buf.Bytes(), to)
+	f.datagramBuffers.Put(buf)
+	return err
 }

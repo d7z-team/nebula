@@ -61,6 +61,7 @@ func newDiscoveryManagementTestNode(
 			StaticHosts:        map[netip.Addr][]netip.AddrPort{lighthouseIdentity.addr: {lighthouseEndpoint}},
 			AdvertiseEndpoints: []netip.AddrPort{netip.MustParseAddrPort("198.51.100.2:4242")},
 			EndpointProvider:   provider,
+			QueryBuffer:        1,
 			UpdateInterval:     -1,
 		},
 		Relay: RelayOptions{
@@ -159,7 +160,6 @@ func TestRefreshPeerReliableQueueAndCancellation(t *testing.T) {
 	require.ErrorIs(t, node.RefreshPeer(t.Context(), local.addr), ErrPeerUnavailable)
 
 	// Refreshing the lighthouse itself is an intentional no-op.
-	node.lighthouse.queryChan = make(chan netip.Addr, 1)
 	node.lighthouse.queryChan <- netip.MustParseAddr("10.42.0.76")
 	require.NoError(t, node.RefreshPeer(t.Context(), lighthouseIdentity.addr))
 
@@ -188,7 +188,6 @@ func TestRefreshPeerConcurrentWaiters(t *testing.T) {
 		node, _, _ := newDiscoveryManagementTestNode(t, nil)
 		markDiscoveryManagementTestNodeStarted(node)
 		lh := node.lighthouse
-		lh.queryChan = make(chan netip.Addr, 1)
 		wire := make(chan discoveryMessage, 3)
 		lh.sender = &discoveryManagementRecordingWriter{certificateState: node.engine.pki.getCertState(), messages: wire}
 		first, second := netip.MustParseAddr("10.42.0.76"), netip.MustParseAddr("10.42.0.77")
@@ -218,7 +217,15 @@ func TestRefreshPeerConcurrentWaiters(t *testing.T) {
 }
 
 func TestLighthouseMixedWireVersions(t *testing.T) {
-	node, local, peer := newDiscoveryManagementTestNode(t, nil)
+	node, local, peer := newDiscoveryManagementTestNode(t, func(context.Context) ([]netip.AddrPort, error) {
+		var endpoints []netip.AddrPort
+		for _, addr := range []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")} {
+			for i := range 1000 {
+				endpoints = append(endpoints, netip.AddrPortFrom(addr, uint16(i+1)))
+			}
+		}
+		return endpoints, nil
+	})
 	markDiscoveryManagementTestNodeStarted(node)
 	_, legacy, _ := newNodeTestIdentitiesFor(t, cert.Version1, local.identity.Certificate.Curve())
 	legacyServer := netip.MustParseAddr("10.42.0.3")
@@ -237,6 +244,7 @@ func TestLighthouseMixedWireVersions(t *testing.T) {
 		require.NotEmpty(t, wire)
 		m := <-wire
 		require.Equal(t, server, m.server)
+		require.LessOrEqual(t, len(m.payload), mtu-header.MaxOverhead)
 		var msg NebulaMeta
 		require.NoError(t, msg.Unmarshal(m.payload))
 		require.Equal(t, kind, msg.Type)
@@ -259,6 +267,10 @@ func TestLighthouseMixedWireVersions(t *testing.T) {
 	require.NoError(t, node.AdvertiseNow(t.Context()))
 	v2 = read(peer.addr, NebulaMeta_HostUpdateNotification)
 	v1 = read(legacyServer, NebulaMeta_HostUpdateNotification)
+	for _, details := range []*NebulaMetaDetails{v1, v2} {
+		require.NotEmpty(t, details.V4AddrPorts)
+		require.Len(t, details.V6AddrPorts, len(details.V4AddrPorts))
+	}
 	require.Nil(t, v2.VpnAddr)
 	require.Zero(t, v2.OldVpnAddr)
 	require.Equal(t, lh.relaysForMe, v2.GetRelays())
@@ -267,6 +279,57 @@ func TestLighthouseMixedWireVersions(t *testing.T) {
 	require.Equal(t, cert.Version1, version)
 	require.Equal(t, local.addr, addr)
 	require.Equal(t, []netip.Addr{peer.addr}, v1.GetRelays())
+}
+
+func TestLighthouseQueryReturnsBoundedPeerRecords(t *testing.T) {
+	node, _, requester := newDiscoveryManagementTestNode(t, nil)
+	lh := node.lighthouse
+	lh.amLighthouse, lh.maxReported = true, 1000
+	wire := make(chan discoveryMessage, 2)
+	lh.sender = &discoveryManagementRecordingWriter{certificateState: node.engine.pki.getCertState(), messages: wire}
+	target := netip.MustParseAddr("10.42.0.77")
+	report := &NebulaMetaDetails{}
+	for i := range lh.maxReported {
+		port := uint16(i + 1)
+		report.V4AddrPorts = append(report.V4AddrPorts, netAddrToProtoV4AddrPort(netip.MustParseAddr("192.0.2.1"), port))
+		report.V6AddrPorts = append(report.V6AddrPorts, netAddrToProtoV6AddrPort(netip.MustParseAddr("2001:db8::1"), port))
+		report.RelayVpnAddrs = append(report.RelayVpnAddrs, netAddrToProtoAddr(target.Next()))
+	}
+	for _, owner := range []netip.Addr{requester.addr, target} {
+		lh.replaceReport([]netip.Addr{owner}, owner, report)
+	}
+	handler := lh.NewRequestHandler()
+	for _, v := range []cert.Version{cert.Version1, cert.Version2} {
+		query := NebulaMeta{Type: NebulaMeta_HostQuery, Details: &NebulaMetaDetails{}}
+		require.NoError(t, query.Details.setVPNAddr(target, v))
+		data, err := query.Marshal()
+		require.NoError(t, err)
+		handler.HandleRequest(netip.AddrPort{}, []netip.Addr{requester.addr}, data)
+		require.Len(t, wire, 2)
+		for _, want := range []struct {
+			kind       NebulaMeta_MessageType
+			to, record netip.Addr
+			version    cert.Version
+		}{
+			{NebulaMeta_HostQueryReply, requester.addr, target, v},
+			{NebulaMeta_HostPunchNotification, target, requester.addr, cert.Version2},
+		} {
+			m := <-wire
+			require.Equal(t, want.to, m.server)
+			require.LessOrEqual(t, len(m.payload), mtu-header.MaxOverhead)
+			var got NebulaMeta
+			require.NoError(t, got.Unmarshal(m.payload))
+			require.Equal(t, want.kind, got.Type)
+			addr, version, err := got.Details.GetVpnAddrAndVersion()
+			require.NoError(t, err)
+			require.Equal(t, want.record, addr)
+			require.Equal(t, want.version, version)
+			kept := len(got.Details.V4AddrPorts)
+			require.Positive(t, kept)
+			require.Len(t, got.Details.V6AddrPorts, kept)
+			require.Len(t, got.Details.GetRelays(), kept)
+		}
+	}
 }
 
 func TestAdvertiseNowProviderErrorsAndCancellation(t *testing.T) {
@@ -505,30 +568,48 @@ func TestDiscoveryDialCandidates(t *testing.T) {
 }
 
 func TestDiscoveryReportFiltersBeforeLimit(t *testing.T) {
-	node, local, peer := newDiscoveryManagementTestNode(t, nil)
-	report := &NebulaMetaDetails{}
-	for i := range maxRemotes + 1 {
-		port := uint16(i + 1)
-		report.V4AddrPorts = append(report.V4AddrPorts, netAddrToProtoV4AddrPort(local.addr, port))
-		report.V6AddrPorts = append(report.V6AddrPorts, netAddrToProtoV6AddrPort(local.addr6, port))
-	}
-	v4, v6 := netip.MustParseAddr("192.0.2.8"), netip.MustParseAddr("2001:db8::8")
-	for i := range maxRemotes + 1 {
-		port := uint16(i + 1)
-		report.V4AddrPorts = append(report.V4AddrPorts, netAddrToProtoV4AddrPort(v4, port))
-		report.V6AddrPorts = append(report.V6AddrPorts, netAddrToProtoV6AddrPort(v6, port))
-	}
+	pool, local, peer := newNodeTestIdentities(t)
 	target := netip.MustParseAddr("10.42.0.99")
-	node.lighthouse.replaceReport([]netip.Addr{target}, peer.addr, report)
-	got, ok := node.PeerDiscovery(target)
-	require.True(t, ok)
-	var want []netip.AddrPort
-	for _, addr := range []netip.Addr{v4, v6} {
-		for i := range maxRemotes {
-			want = append(want, netip.AddrPortFrom(addr, uint16(i+1)))
-		}
+	v4, v6 := netip.MustParseAddr("192.0.2.8"), netip.MustParseAddr("2001:db8::8")
+	for _, tc := range []struct {
+		name        string
+		limit, want int
+	}{{"default", 0, 10}, {"custom", 2, 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			node, err := New(t.Context(), Options{
+				Identities: []Identity{local.identity}, CAPool: pool,
+				Transport:  newMemoryDatagramNetwork(netip.MustParseAddrPort("127.0.0.1:34001"))[0],
+				Lighthouse: LighthouseOptions{MaxReported: tc.limit},
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, node.Close()); require.NoError(t, node.Wait()) })
+			report := &NebulaMetaDetails{}
+			var endpoints []netip.AddrPort
+			var relays []netip.Addr
+			for i := range tc.want + 1 {
+				port := uint16(i + 1)
+				report.V4AddrPorts = append(report.V4AddrPorts, netAddrToProtoV4AddrPort(local.addr, port))
+				report.V6AddrPorts = append(report.V6AddrPorts, netAddrToProtoV6AddrPort(local.addr6, port))
+			}
+			addr := target.Next()
+			for i := range tc.want + 1 {
+				port := uint16(i + 1)
+				report.V4AddrPorts = append(report.V4AddrPorts, netAddrToProtoV4AddrPort(v4, port))
+				report.V6AddrPorts = append(report.V6AddrPorts, netAddrToProtoV6AddrPort(v6, port))
+				report.RelayVpnAddrs = append(report.RelayVpnAddrs, netAddrToProtoAddr(addr))
+				if i < tc.want {
+					endpoints = append(endpoints, netip.AddrPortFrom(v4, port), netip.AddrPortFrom(v6, port))
+					relays = append(relays, addr)
+				}
+				addr = addr.Next()
+			}
+			node.lighthouse.replaceReport([]netip.Addr{target}, peer.addr, report)
+			got, ok := node.PeerDiscovery(target)
+			require.True(t, ok)
+			require.ElementsMatch(t, endpoints, got.Endpoints)
+			require.Equal(t, relays, got.Relays)
+		})
 	}
-	require.Equal(t, want, got.Endpoints)
 }
 
 func BenchmarkPendingLighthouseQuery(b *testing.B) {

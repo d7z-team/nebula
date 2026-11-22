@@ -13,18 +13,13 @@ import (
 
 	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/header"
 )
 
-// maxHostInfosPerVPNAddr is the max number of hostinfos we will track for a given vpn ip
-// 5 allows for an initial handshake and each host pair re-handshaking twice
-const maxHostInfosPerVPNAddr = 5
-
-// roamingSuppressDuration prevents flapping back to a previous endpoint while
-// packets from the old path are still in flight.
-const roamingSuppressDuration = 2 * time.Second
-
 type hostMap struct {
+	maxTunnelsPerAddress int
+	maxRelayMappings     int
+	pendingRelayTimeout  time.Duration
+	relayRequestInterval time.Duration
 	sync.RWMutex
 	Indexes       map[uint32]*hostInfo
 	Relays        map[uint32]*hostInfo // Maps a relay IDX to a relay hostInfo object
@@ -88,9 +83,6 @@ type hostInfo struct {
 	// This is used to avoid an attack where a handshake packet is replayed after some time
 	lastHandshakeTime uint64
 
-	lastRoam       time.Time
-	lastRoamRemote netip.AddrPort
-
 	// lastUsed tracks the last time ConnectionManager checked the tunnel and it was in use.
 	// This value will be behind against actual tunnel utilization in the hot path.
 	// This should only be used by the ConnectionManagers ticker routine.
@@ -111,20 +103,18 @@ func (v packetSender) String() string {
 	return v.UdpAddr.String()
 }
 
-type cachedPacket struct {
-	messageType    header.MessageType
-	messageSubType header.MessageSubType
-	packet         []byte
-}
-
-func newHostMap(l *slog.Logger) *hostMap {
+func newHostMap(l *slog.Logger, opts *Options) *hostMap {
 	return &hostMap{
-		Indexes:       map[uint32]*hostInfo{},
-		Relays:        map[uint32]*hostInfo{},
-		RemoteIndexes: map[uint32]*hostInfo{},
-		Hosts:         map[netip.Addr]*hostInfo{},
-		moreHosts:     map[netip.Addr][]*hostInfo{},
-		l:             l,
+		maxTunnelsPerAddress: positiveOr(opts.Connections.MaxTunnelsPerAddress, 5),
+		maxRelayMappings:     positiveOr(opts.Relay.MaxMappings, 8192),
+		pendingRelayTimeout:  positiveOr(opts.Relay.PendingTimeout, time.Minute),
+		relayRequestInterval: positiveOr(opts.Relay.RequestInterval, 100*time.Millisecond),
+		Indexes:              map[uint32]*hostInfo{},
+		Relays:               map[uint32]*hostInfo{},
+		RemoteIndexes:        map[uint32]*hostInfo{},
+		Hosts:                map[netip.Addr]*hostInfo{},
+		moreHosts:            map[netip.Addr][]*hostInfo{},
+		l:                    l,
 	}
 }
 
@@ -368,7 +358,7 @@ func (hm *hostMap) unlockedAddHostInfo(hostinfo *hostInfo, f *packetEngine) {
 
 	hostinfo.markOut(f.rebindEpoch.Load())
 	if f.paths.checks != nil {
-		f.paths.checks.Add(hostinfo, pathTick)
+		f.paths.checks.Add(hostinfo, f.paths.probes.TickInterval)
 	}
 	if f.connectionManager != nil { // f.connectionManager is only nil in some unit tests
 		f.connectionManager.trafficTimer.Add(hostinfo.localIndexId, f.connectionManager.checkInterval)
@@ -402,7 +392,7 @@ func (hm *hostMap) unlockedAddForAddress(vpnAddr netip.Addr, hostinfo *hostInfo)
 
 	// Enforce the per-address cap by fully retiring the oldest hostinfo once we exceed it.
 	// Deleting it removes it from all of its addresses and the index maps, matching prior behavior.
-	if len(list) > maxHostInfosPerVPNAddr {
+	if len(list) > hm.maxTunnelsPerAddress {
 		hm.unlockedDeleteHostInfo(list[len(list)-1])
 	}
 }

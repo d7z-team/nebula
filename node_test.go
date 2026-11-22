@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/slackhq/nebula/cert"
@@ -261,6 +262,45 @@ func TestNodeLifecycle(t *testing.T) {
 	require.NoError(t, node.Wait())
 	_, err = node.OpenIPPort(func([]byte) {})
 	require.ErrorIs(t, err, ErrNodeClosed)
+}
+
+func TestNodeQueueLimits(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pool, local, peer := newNodeTestIdentities(t)
+		transport := newMemoryDatagramNetwork(netip.MustParseAddrPort("127.0.0.1:34001"))[0]
+		node, err := New(t.Context(), Options{
+			Identities: []Identity{local.identity}, CAPool: pool, Transport: transport,
+			IPPort:    IPPortOptions{PerPeerQueueSize: 2, QueueSize: 3},
+			Handshake: HandshakeOptions{ControlQueueSize: 2},
+			Punchy:    PunchyOptions{QueueSize: 1, Delay: time.Hour},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, node.Close()); require.NoError(t, node.Wait()) })
+		require.NoError(t, node.Start())
+		port, _ := testIPPort(t, node)
+		other := peer.addr.Next()
+		write := func(dst netip.Addr) error {
+			return port.WriteIP(netip.Addr{}, testIPv4(local.addr, dst, "queued"))
+		}
+		require.NoError(t, write(peer.addr))
+		require.NoError(t, write(peer.addr))
+		require.ErrorIs(t, write(peer.addr), ErrQueueFull)
+		require.NoError(t, write(other))
+		require.ErrorIs(t, write(other), ErrQueueFull)
+		require.Equal(t, 2, port.ClearPending(peer.addr))
+		require.NoError(t, write(other))
+
+		for range 4 {
+			node.engine.SendMessageToVpnAddr(header.Test, header.TestRequest, peer.addr, []byte("probe"), nil, nil)
+		}
+		synctest.Wait()
+		hh := node.handshake.queryVpnIp(peer.addr)
+		require.Len(t, hh.controlQueue, 2)
+
+		node.punchy.Schedule(netip.MustParseAddrPort("192.0.2.1:10"), peer.addr)
+		node.punchy.Schedule(netip.MustParseAddrPort("192.0.2.2:20"), other)
+		require.Len(t, node.punchy.queued, 1)
+	})
 }
 
 func TestNodeTimerIntervals(t *testing.T) {

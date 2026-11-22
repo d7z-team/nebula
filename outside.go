@@ -136,7 +136,7 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 				s.mu.Lock()
 				due := !now.Before(s.recoverAfter)
 				if due {
-					s.recoverAfter = now.Add(30 * time.Second)
+					s.recoverAfter = now.Add(f.paths.selection.RecoveryInterval)
 				}
 				s.mu.Unlock()
 				if due {
@@ -254,7 +254,7 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 			return
 		}
 		endpoint := targetHI.GetRemote()
-		if !endpoint.IsValid() || targetHI.paths.failedDirect(endpoint) {
+		if !endpoint.IsValid() || targetHI.paths.failedDirect(endpoint, f.paths.selection.FailureThreshold) {
 			return
 		}
 		if inner.Type != header.Test {
@@ -303,16 +303,16 @@ func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
 	if via.IsRelayed || via.UdpAddr == hostinfo.GetRemote() {
 		return
 	}
-	if via.UdpAddr == hostinfo.lastRoamRemote && time.Since(hostinfo.lastRoam) < roamingSuppressDuration {
-		return
-	}
-	hostinfo.lastRoam, hostinfo.lastRoamRemote = time.Now(), via.UdpAddr
-	hostinfo.remotes.LearnRemote(hostinfo.vpnAddrs[0], via.UdpAddr)
 	s := &hostinfo.paths
 	s.mu.Lock()
-	s.roam = via.UdpAddr
+	defer s.mu.Unlock()
+	now := time.Now()
+	if via.UdpAddr == s.roamCandidate && now.Sub(s.lastRoamProbeRequest) < f.roamSuppressInterval {
+		return
+	}
+	hostinfo.remotes.LearnRemote(hostinfo.vpnAddrs[0], via.UdpAddr)
+	s.roamCandidate, s.lastRoamProbeRequest = via.UdpAddr, now
 	s.nextBackup = time.Time{}
-	s.mu.Unlock()
 }
 
 func (f *packetEngine) deliverIP(hostinfo *hostInfo, packet []byte) {
@@ -341,8 +341,8 @@ func (f *packetEngine) deliverIP(hostinfo *hostInfo, packet []byte) {
 
 func (f *packetEngine) sendRecvError(endpoint netip.AddrPort, index uint32) {
 	b := header.Encode(make([]byte, header.Len), header.Version, header.RecvError, 0, index, 0)
-	if _, ok := f.paths.control.Allow(); ok {
-		_ = f.outside.WriteTo(b, endpoint)
+	if _, ok := f.paths.controlBudget.Allow(); ok {
+		_ = f.writeDatagram(b, endpoint)
 	}
 	if f.l.Enabled(context.Background(), slog.LevelDebug) {
 		f.l.Debug("Recv error sent",

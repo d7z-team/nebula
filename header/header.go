@@ -25,7 +25,7 @@ const (
 	Version uint8 = 1
 	Len           = 16
 
-	// MaxOverhead is the most a payload grows on its way to the underlay.
+	// MaxOverhead is the maximum encapsulation added by the Nebula protocol itself.
 	// A relayed packet has two headers and two AEAD tags, one for the inner tunnel and another for the relay tunnel.
 	// Every supported cipher (today) has a 16 byte tag.
 	MaxOverhead = 2 * (Len + 16)

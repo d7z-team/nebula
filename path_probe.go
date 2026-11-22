@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	mathrand "math/rand/v2"
 	"net/netip"
 	"slices"
@@ -15,7 +16,6 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-const pathTick = 125 * time.Millisecond
 const probePrefix = "NBP\x01"
 const probeSize = len(probePrefix) + 16
 
@@ -53,12 +53,12 @@ func (f *packetEngine) finishReply(h *hostInfo, rx tunnelRoute, data []byte, all
 			s.changed = now
 			s.nextBackup = now
 		}
-	case !p.deadline.IsZero() && now.After(p.deadline):
-		result.Err = ErrPathTimeout
-		s.record(p.route, result)
 	default:
-		s.record(p.route, result)
-		if result.SamePath && p.route.leg == nil && (s.active == p.route || s.active.leg != nil) {
+		if !p.deadline.IsZero() && now.After(p.deadline) {
+			result.Err = ErrPathTimeout
+		}
+		s.record(p.route, result, &f.paths.selection)
+		if result.Err == nil && result.SamePath && p.route.leg == nil && (s.active == p.route || s.active.leg != nil) {
 			h.SetRemote(p.route.Endpoint)
 		}
 	}
@@ -76,7 +76,7 @@ func (n *Node) runPathWork(work func()) bool {
 	return true
 }
 
-func (n *Node) startProbe(h *hostInfo, r tunnelRoute, maintenance bool) (*pathProbe, error) {
+func (n *Node) startProbe(h *hostInfo, r tunnelRoute, useProbeBudget bool) (*pathProbe, error) {
 	f := n.engine
 	if !f.routeLive(h, r) {
 		return nil, ErrPeerUnavailable
@@ -91,8 +91,8 @@ func (n *Node) startProbe(h *hostInfo, r tunnelRoute, maintenance bool) (*pathPr
 		s.mu.Unlock()
 		return p, nil
 	}
-	if maintenance {
-		if _, ok := f.paths.background.Allow(); !ok {
+	if useProbeBudget {
+		if _, ok := f.paths.probeBudget.Allow(); !ok {
 			s.mu.Unlock()
 			return nil, errPathBudget
 		}
@@ -102,10 +102,12 @@ func (n *Node) startProbe(h *hostInfo, r tunnelRoute, maintenance bool) (*pathPr
 	p := &pathProbe{route: r, start: now, policyVersion: s.policyVersion, epoch: s.epoch, done: make(chan struct{})}
 	copy(p.id[:], probePrefix)
 	rand.Read(p.id[len(probePrefix):])
-	rto := time.Second
+	opts := &f.paths.probes
+	rto := opts.InitialTimeout
 	if q := s.samples[r]; q != nil && q.SRTT > 0 {
-		rto = min(5*time.Second, max(300*time.Millisecond, q.SRTT+4*q.deviation))
+		rto = q.SRTT + 4*q.deviation
 	}
+	rto = min(opts.MaxTimeout, max(opts.MinTimeout, rto))
 	s.pending = p
 	s.mu.Unlock()
 	// A transport may block in WriteTo. Other checks and canceled callers must still progress.
@@ -223,7 +225,7 @@ func (n *Node) CheckPeerPath(ctx context.Context, peer netip.Addr, want TunnelPa
 			return PathCheckResult{}, err
 		}
 	}
-	timeout := time.NewTimer(10 * time.Second)
+	timeout := time.NewTimer(n.engine.paths.probes.CheckTimeout)
 	defer timeout.Stop()
 	retry := time.NewTicker(50 * time.Millisecond)
 	defer retry.Stop()
@@ -272,7 +274,8 @@ func (n *Node) CheckPeerPath(ctx context.Context, peer netip.Addr, want TunnelPa
 }
 
 func (n *Node) runPathChecks() {
-	tick := time.NewTicker(pathTick)
+	interval := n.engine.paths.probes.TickInterval
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	var lastSweep time.Time
 	var lastGrant uint32
@@ -284,12 +287,12 @@ func (n *Node) runPathChecks() {
 		case now := <-tick.C:
 			f := n.engine
 			cfg := f.paths.config.Load()
-			if now.Sub(lastSweep) >= 10*time.Second {
+			if now.Sub(lastSweep) >= f.paths.probes.SweepInterval {
 				lastSweep = now
 				f.hostMap.expirePendingRelays(now)
 				for addr, policy := range cfg.Peers {
 					if policy.MonitorInterval > 0 && f.hostMap.QueryVpnAddr(addr) == nil {
-						f.Handshake(addr)
+						f.handshakeManager.GetOrHandshake(addr, nil)
 					}
 				}
 			}
@@ -311,7 +314,7 @@ func (n *Node) runPathChecks() {
 				if n.checkSession(h, now) {
 					lastGrant = h.localIndexId
 				}
-				wheel.Add(h, pathTick)
+				wheel.Add(h, interval)
 			}
 			clear(hosts)
 		}
@@ -338,7 +341,7 @@ func (f *packetEngine) servicePending(h *hostInfo, now time.Time) bool {
 			s.complete(p, result)
 		} else if !p.deadline.IsZero() && !now.Before(p.deadline) {
 			result.Err = ErrPathTimeout
-			s.record(p.route, result)
+			s.record(p.route, result, &f.paths.selection)
 			s.complete(p, result)
 			failedLeg = p.route.leg
 			if s.active.leg == nil && s.active.Endpoint.IsValid() {
@@ -378,7 +381,7 @@ func (n *Node) checkSession(h *hostInfo, now time.Time) bool {
 	if !valid && s.active.Endpoint.IsValid() {
 		s.active = tunnelRoute{}
 		s.reason = "path unavailable"
-		if q := s.samples[alt]; altLive && alt == s.standby && q.readyForFailover(now) {
+		if q := s.samples[alt]; altLive && alt == s.standby && q.readyForFailover(now, f.paths.selection.Freshness) {
 			s.active, s.standby = alt, tunnelRoute{}
 			s.reason = "failover"
 		}
@@ -396,12 +399,12 @@ func (n *Node) checkSession(h *hostInfo, now time.Time) bool {
 		}
 	}
 	active := s.active
-	busy := now.Sub(s.demand) < time.Minute
+	busy := now.Sub(s.demand) < f.paths.probes.IdleTimeout
 	if !busy && policy.MonitorInterval == 0 {
 		s.mu.Unlock()
 		return false
 	}
-	roam := s.roam
+	roam := s.roamCandidate
 	degraded := !active.Endpoint.IsValid() || (s.samples[active] != nil && s.samples[active].Degraded)
 	checkActive := active.Endpoint.IsValid() && !now.Before(s.nextActive)
 	checkBackup := !now.Before(s.nextBackup)
@@ -449,7 +452,7 @@ func (n *Node) checkSession(h *hostInfo, now time.Time) bool {
 	// incompatible return path. A failed shared adjacency is repaired once at R.
 	last := s.last
 	recoverSession := !active.Endpoint.IsValid() && !now.Before(s.recoverAfter) && last.Sent == r.TunnelPath &&
-		(errors.Is(last.Err, ErrPathPolicy) || (q != nil && q.failures >= 3))
+		(errors.Is(last.Err, ErrPathPolicy) || (q != nil && q.failures >= f.paths.selection.FailureThreshold))
 	cooling := q != nil && now.Before(q.RetryAfter)
 	if cooling {
 		s.cursor++
@@ -458,7 +461,7 @@ func (n *Node) checkSession(h *hostInfo, now time.Time) bool {
 	s.mu.Unlock()
 	if recoverSession && (r.leg == nil || errors.Is(last.Err, ErrPathPolicy) || r.leg.verifyNeighbor(last.At, now)) {
 		s.mu.Lock()
-		s.recoverAfter = now.Add(30 * time.Second)
+		s.recoverAfter = now.Add(f.paths.selection.RecoveryInterval)
 		s.mu.Unlock()
 		n.handshake.StartHandshake(h.vpnAddrs[0], nil)
 		return false
@@ -470,21 +473,26 @@ func (n *Node) checkSession(h *hostInfo, now time.Time) bool {
 		return false
 	}
 	s.mu.Lock()
-	period := 10 * time.Second
+	activePeriod, standbyPeriod := f.paths.probes.ActiveInterval, f.paths.probes.StandbyInterval
 	if !busy && policy.MonitorInterval > 0 {
-		period = min(policy.MonitorInterval, time.Duration(1<<61))
+		activePeriod = min(policy.MonitorInterval, time.Duration(1<<61))
+		standbyPeriod = 3 * activePeriod
 	}
 	if checkActive {
-		s.nextActive = now.Add(period - period/10 + mathrand.N(period/5+1))
+		s.nextActive = now.Add(jitterInterval(activePeriod-activePeriod/10, activePeriod/5))
 	} else {
 		s.cursor++
-		s.nextBackup = now.Add(3*period - period/5 + mathrand.N(period/2+1))
+		s.nextBackup = now.Add(jitterInterval(standbyPeriod-standbyPeriod/15, standbyPeriod/6))
 		if !active.Endpoint.IsValid() || degraded {
 			s.nextBackup = now.Add(time.Second)
 		}
 	}
 	s.mu.Unlock()
 	return true
+}
+
+func jitterInterval(low, spread time.Duration) time.Duration {
+	return low + mathrand.N(min(spread, time.Duration(math.MaxInt64)-low)+1)
 }
 
 // backupCandidates preserves configured relay order. Healthy direct endpoints are

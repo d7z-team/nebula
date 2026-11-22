@@ -1,12 +1,12 @@
 # 在 gVisor 栈上连接 Nebula peer
 
-本例在已有 gVisor 栈上挂载一张 Nebula 网卡，从客户端 `10.42.0.1` 拨号到 `10.42.0.254:8080`。请先将库加入应用模块。[安装说明](../README.md#安装)
+本例从客户端 `10.42.0.1` 通过 Nebula 隧道连接对端的 TCP 服务。外层 UDP 由操作系统收发，内层 TCP 连接由应用的 gVisor 栈建立。[安装说明](../README.md#安装)
 
 运行示例需要以下条件。
 
 - `s` 是已启用 `ipv4.NewProtocol` 和 `tcp.NewProtocol` 的 gVisor 栈，`nic` 是其中一个空闲 NIC ID。
 - `identity` 是客户端证书及其原始私钥，证书地址为 `10.42.0.1/24`。`pool` 包含签发本机和对端证书的受信 CA。[加载或签发证书](../cert/README.md)
-- `peerUDP` 是对端可达的外层 IPv4 地址和 UDP 端口。对端已启动 Nebula，并在隧道地址 `10.42.0.254` 的 TCP 8080 端口提供服务。
+- `peerUDP` 是对端实际可达的 IPv4 地址和 UDP 监听端口。对端证书中的 overlay 地址为 `10.42.0.254`，其 TCP 服务监听 `10.42.0.254:8080`。
 
 ```go
 package client

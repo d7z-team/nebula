@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"slices"
 
 	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/logging"
@@ -12,18 +13,16 @@ import (
 
 var errTunnelCounterExhausted = errors.New("tunnel message counter is exhausted")
 
-// Handshake starts a tunnel handshake with an overlay address. It is a no-op
-// when a usable tunnel already exists or a handshake is already in progress.
-func (f *packetEngine) Handshake(vpnAddr netip.Addr) {
-	f.handshakeManager.GetOrHandshake(vpnAddr.Unmap(), nil)
-}
-
 // SendMessageToVpnAddr resolves vpnAddr to a tunnel and sends an encrypted
 // Nebula protocol message. It intentionally accepts overlay addresses only;
 // unsafe routing is used solely for inner IP packets.
 func (f *packetEngine) SendMessageToVpnAddr(t header.MessageType, st header.MessageSubType, vpnAddr netip.Addr, p, nb, out []byte) {
 	hostInfo, ready := f.handshakeManager.GetOrHandshake(vpnAddr.Unmap(), func(hh *handshakeHostInfo) {
-		hh.cacheControlPacket(f.l, t, st, p)
+		if len(hh.controlQueue) >= f.handshakeManager.config.ControlQueueSize {
+			hh.hostinfo.logger(f.l).Debug("handshake control queue full")
+			return
+		}
+		hh.controlQueue = append(hh.controlQueue, queuedControlPacket{t, st, slices.Clone(p)})
 	})
 	if hostInfo == nil || !ready {
 		return

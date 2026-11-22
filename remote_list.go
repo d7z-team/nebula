@@ -9,8 +9,6 @@ import (
 	"github.com/gaissmai/bart"
 )
 
-const maxRemotes = 10
-
 // A discovery record keeps the wire address family and the identity that
 // supplied each endpoint, so a lighthouse can answer on behalf of that peer.
 type discoveryRecord struct {
@@ -24,7 +22,7 @@ type endpointSet[T any] struct {
 	reported []*T
 }
 
-func (s *endpointSet[T]) replaceReported(reported []*T, overlay *bart.Lite, addrPort func(*T) netip.AddrPort) {
+func (s *endpointSet[T]) replaceReported(reported []*T, limit int, overlay *bart.Lite, addrPort func(*T) netip.AddrPort) {
 	clear(s.reported)
 	s.reported = s.reported[:0]
 	for _, v := range reported {
@@ -32,7 +30,7 @@ func (s *endpointSet[T]) replaceReported(reported []*T, overlay *bart.Lite, addr
 			continue
 		}
 		s.reported = append(s.reported, v)
-		if len(s.reported) == maxRemotes {
+		if len(s.reported) == limit {
 			break
 		}
 	}

@@ -19,14 +19,6 @@ import (
 )
 
 const (
-	defaultHandshakeTryInterval   = time.Millisecond * 100
-	defaultHandshakeRetries       = 10
-	defaultHandshakeTriggerBuffer = 64
-
-	// maxCachedPackets is how many unsent packets we'll buffer per pending
-	// handshake before dropping further ones.
-	maxCachedPackets = 100
-
 	// HandshakePacket map keys mirror the IX protocol stage convention:
 	//   stage 0 = the initiator's first message (and what the responder
 	//             receives, stripped of header)
@@ -61,6 +53,12 @@ type handshakeManager struct {
 	trigger chan netip.Addr
 }
 
+type queuedControlPacket struct {
+	messageType    header.MessageType
+	messageSubType header.MessageSubType
+	payload        []byte
+}
+
 type handshakeHostInfo struct {
 	directOnly atomic.Bool
 	sync.Mutex
@@ -71,30 +69,18 @@ type handshakeHostInfo struct {
 	counter                   int              // How many attempts have we made so far
 	lastRemotes               []netip.AddrPort // Remotes that we sent to during the previous attempt
 	lastRelays                []netip.Addr     // Relays we attempted to use during the previous attempt
-	packetStore               []cachedPacket   // A set of packets to be transmitted once the handshake completes
+	controlQueue              []queuedControlPacket
 
 	hostinfo *hostInfo
 	machine  *handshake.Machine // The handshake state machine, set during stage 0 (initiator) or beginHandshake (responder multi-message)
 }
 
-func (hh *handshakeHostInfo) cacheControlPacket(l *slog.Logger, t header.MessageType, st header.MessageSubType, packet []byte) {
-	if len(hh.packetStore) >= maxCachedPackets {
-		hh.hostinfo.logger(l).Debug("handshake control queue full")
-		return
-	}
-	hh.packetStore = append(hh.packetStore, cachedPacket{t, st, slices.Clone(packet)})
-}
-
 func newHandshakeManager(l *slog.Logger, mainHostMap *hostMap, lightHouse *lighthouse, config HandshakeOptions) *handshakeManager {
-	if config.TryInterval <= 0 {
-		config.TryInterval = defaultHandshakeTryInterval
-	}
-	if config.Retries <= 0 {
-		config.Retries = defaultHandshakeRetries
-	}
-	if config.TriggerBuffer <= 0 {
-		config.TriggerBuffer = defaultHandshakeTriggerBuffer
-	}
+	config.TryInterval = positiveOr(config.TryInterval, 100*time.Millisecond)
+	config.Retries = positiveOr(config.Retries, 10)
+	config.TriggerBuffer = positiveOr(config.TriggerBuffer, 64)
+	config.ControlQueueSize = positiveOr(config.ControlQueueSize, 100)
+	config.RefreshAttempt = positiveOr(config.RefreshAttempt, 5)
 	// The longest individual retry delay determines the wheel size.
 	return &handshakeManager{
 		vpnIps:      map[netip.Addr]*handshakeHostInfo{},
@@ -256,7 +242,7 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, generation *handsha
 
 	// IX initiators retransmit their first handshake message.
 	stage0 := hostinfo.HandshakePacket[handshakePacketStage0]
-	if hh.counter == 5 {
+	if hh.counter == hm.config.RefreshAttempt {
 		hm.lightHouse.QueryServer(vpnIp)
 	}
 	// Give direct connectivity the first attempt, then rotate through alternatives.
@@ -688,7 +674,7 @@ func (hm *handshakeManager) beginHandshake(via packetSender, packet []byte, h *h
 	}
 	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
 
-	hostinfo.paths.adopt(receivedRoute(via), time.Now(), "handshake")
+	hostinfo.paths.setHandshakeRoute(receivedRoute(via), time.Now(), f.paths.probes.ActiveInterval)
 	existing, err := hm.CheckAndComplete(hostinfo, handshakePacketStage0, f)
 	if err != nil {
 		hm.handleCheckAndCompleteError(err, existing, hostinfo, via)
@@ -830,8 +816,8 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 		hm.DeleteHostInfo(hostinfo)
 		hm.StartHandshake(hostinfo.vpnAddrs[0], func(newHH *handshakeHostInfo) {
 			newHH.hostinfo.remotes.BlockRemote(via)
-			newHH.packetStore = hh.packetStore
-			hh.packetStore = nil
+			newHH.controlQueue = hh.controlQueue
+			hh.controlQueue = nil
 		})
 		// sendCloseTunnel may take the hostmap lock, so it must not run under the handshake
 		// manager lock that StartHandshake holds around the callback.
@@ -862,25 +848,25 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 		"responderIndex", result.RemoteIndex,
 		"handshake", structuredMap{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
 		"durationNs", duration,
-		"sentCachedPackets", len(hh.packetStore),
+		"sentCachedPackets", len(hh.controlQueue),
 	)
 
 	hostinfo.vpnAddrs = vpnAddrs
 	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
 
-	hostinfo.paths.adopt(receivedRoute(via), time.Now(), "handshake")
+	hostinfo.paths.setHandshakeRoute(receivedRoute(via), time.Now(), f.paths.probes.ActiveInterval)
 	hm.Complete(hostinfo, f)
 
-	if len(hh.packetStore) > 0 {
+	if len(hh.controlQueue) > 0 {
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("Sending stored packets", "count", len(hh.packetStore))
+			hostinfo.logger(f.l).Debug("Sending stored packets", "count", len(hh.controlQueue))
 		}
 		nb := make([]byte, 12, 12)
 		out := make([]byte, mtu)
-		for _, cp := range hh.packetStore {
+		for _, cp := range hh.controlQueue {
 			// The injected transport remains responsible for any write
 			// aggregation it wants to provide.
-			f.SendMessageToHostInfo(cp.messageType, cp.messageSubType, hostinfo, cp.packet, nb, out)
+			f.SendMessageToHostInfo(cp.messageType, cp.messageSubType, hostinfo, cp.payload, nb, out)
 		}
 	}
 

@@ -77,11 +77,11 @@ func TestIPPortAuthorizationAndQueues(t *testing.T) {
 	}
 
 	unknown := netip.MustParseAddr("10.42.0.240")
-	for range maxCachedPackets {
+	for range 100 {
 		require.NoError(t, port.WriteIP(unknown, forwarded))
 	}
 	require.ErrorIs(t, port.WriteIP(unknown, forwarded), ErrQueueFull)
-	require.Equal(t, maxCachedPackets, port.ClearPending(unknown))
+	require.Equal(t, 100, port.ClearPending(unknown))
 	require.Zero(t, port.Stats().Queued)
 	require.Zero(t, port.ClearPending(unknown))
 	port.Close()

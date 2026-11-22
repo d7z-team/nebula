@@ -41,15 +41,9 @@ type connectionManager struct {
 }
 
 func newConnectionManager(l *slog.Logger, hm *hostMap, p *punchManager, cfg ConnectionOptions) *connectionManager {
-	if cfg.CheckInterval <= 0 {
-		cfg.CheckInterval = 5 * time.Second
-	}
-	if cfg.PendingDeletionInterval <= 0 {
-		cfg.PendingDeletionInterval = 10 * time.Second
-	}
-	if cfg.InactivityTimeout <= 0 {
-		cfg.InactivityTimeout = 10 * time.Minute
-	}
+	cfg.CheckInterval = positiveOr(cfg.CheckInterval, 5*time.Second)
+	cfg.PendingDeletionInterval = positiveOr(cfg.PendingDeletionInterval, 10*time.Second)
+	cfg.InactivityTimeout = positiveOr(cfg.InactivityTimeout, 10*time.Minute)
 	minimum := min(500*time.Millisecond, cfg.CheckInterval, cfg.PendingDeletionInterval)
 	maximum := max(cfg.CheckInterval, cfg.PendingDeletionInterval)
 	return &connectionManager{
