@@ -35,6 +35,7 @@ type packetEngine struct {
 	myVpnNetworks        []netip.Prefix
 	myVpnNetworksTable   *bart.Lite
 	servesRelays         bool
+	forwardedDatagrams   atomic.Uint64
 	roamSuppressInterval time.Duration
 	rebindEpoch          atomic.Uint32
 	udpTxErrLimiter      *ratelimit.Limiter

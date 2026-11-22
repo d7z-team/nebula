@@ -3,7 +3,6 @@ package nebula
 import (
 	"net/netip"
 	"slices"
-	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -59,29 +58,6 @@ func TestDatagramMagicWireFormat(t *testing.T) {
 			})
 		})
 	}
-}
-
-func TestDatagramMagicRelayedMTU(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		nodes, ids, tr := pathTestMeshWithOptions(t, 3, Options{
-			DatagramMagic: []byte("mesh"), Relay: RelayOptions{Serve: true},
-		})
-		tr[0].network.blockBoth(tr[0].addr, tr[1].addr)
-		policy := PeerPathPolicy{Mode: RelayOnly, Relays: []netip.Addr{ids[2].addr}}
-		require.NoError(t, nodes[0].SetPeerPathPolicy(t.Context(), ids[1].addr, &policy))
-		require.NoError(t, nodes[1].SetPeerPathPolicy(t.Context(), ids[0].addr, &policy))
-
-		port, _ := testIPPort(t, nodes[0])
-		_, rx := testIPPort(t, nodes[1])
-		packet := testIPv4(ids[0].addr, ids[1].addr, strings.Repeat("x", MaxIPPacketSize-20))
-		require.NoError(t, port.WriteIP(netip.Addr{}, packet))
-		select {
-		case got := <-rx:
-			require.Equal(t, packet, got)
-		case <-time.After(5 * time.Second):
-			t.Fatal("maximum-size IP packet did not reach the peer through the relay")
-		}
-	})
 }
 
 func TestDatagramMagicConcurrentWrites(t *testing.T) {

@@ -3,7 +3,6 @@ package nebula
 import (
 	"math/bits"
 	"net/netip"
-	"slices"
 	"sync"
 	"time"
 )
@@ -193,8 +192,7 @@ func (f *packetEngine) currentRoute(h *hostInfo) tunnelRoute {
 
 func (f *packetEngine) pathSnapshot(h *hostInfo) PeerPathSnapshot {
 	s := &h.paths
-	policy := f.paths.config.Load().policy(h.vpnAddrs, f.hostMap)
-	policy.Relays = slices.Clone(policy.Relays)
+	policy := f.paths.config.Load().effectivePolicy(h.vpnAddrs, f.hostMap).clone()
 	s.mu.Lock()
 	r, alt := s.active, s.standby
 	v := PeerPathSnapshot{Policy: policy, Changed: s.changed, Reason: s.reason, LastCheck: s.last}

@@ -212,8 +212,7 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 		}
 
 		index := len(peers)
-		policy := n.engine.paths.config.Load().policy(addresses, hostMap)
-		policy.Relays = slices.Clone(policy.Relays)
+		policy := n.engine.paths.config.Load().effectivePolicy(addresses, hostMap).clone()
 		peers = append(peers, PeerSnapshot{
 			Addresses:        addresses,
 			State:            PeerStateConnecting,

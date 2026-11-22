@@ -212,7 +212,7 @@ func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Tim
 	if mainHostInfo && unavailable && cm.engine.handshakeManager.queryVpnIp(hostinfo.vpnAddrs[0]) == nil {
 		return deleteTunnel, hostinfo, nil
 	}
-	if mainHostInfo && !inTraffic && !outTraffic && cm.dropInactive && now.Sub(hostinfo.lastUsed) >= cm.inactivityTimeout && cm.engine.paths.config.Load().policy(hostinfo.vpnAddrs, cm.hostMap).MonitorInterval == 0 {
+	if mainHostInfo && !inTraffic && !outTraffic && cm.dropInactive && now.Sub(hostinfo.lastUsed) >= cm.inactivityTimeout && cm.engine.paths.config.Load().effectivePolicy(hostinfo.vpnAddrs, cm.hostMap).MonitorInterval == 0 {
 		return closeTunnel, hostinfo, primary
 	}
 	hostinfo.setPendingDeletion(!mainHostInfo && !inTraffic)

@@ -45,14 +45,12 @@ func (n *Node) Discovery() DiscoverySnapshot {
 	advertisedRelays := cloneAddresses(n.lighthouse.relaysForMe)
 	slices.SortFunc(advertisedRelays, netip.Addr.Compare)
 
-	policy := n.engine.paths.config.Load().Default
-	policy.Relays = slices.Clone(policy.Relays)
 	return DiscoverySnapshot{
 		IsLighthouse:        n.lighthouse.amLighthouse,
 		Lighthouses:         lighthouses,
 		ConfiguredEndpoints: configuredEndpoints,
 		IsRelay:             n.engine.servesRelays,
-		DefaultPathPolicy:   policy,
+		DefaultPathPolicy:   n.engine.paths.config.Load().Default.clone(),
 		AdvertisedRelays:    advertisedRelays,
 	}
 }

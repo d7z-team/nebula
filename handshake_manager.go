@@ -193,7 +193,7 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, generation *handsha
 	if known := hm.mainHostMap.QueryVpnAddr(vpnIp); known != nil {
 		ids = known.vpnAddrs
 	}
-	relays := cfg.policy(ids, hm.mainHostMap).Relays
+	relays := cfg.effectivePolicy(ids, hm.mainHostMap).Relays
 	if len(relays) == 0 {
 		relays = candidates.relays
 	}

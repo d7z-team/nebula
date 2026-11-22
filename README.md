@@ -8,10 +8,10 @@
 
 ## 安装
 
-需要 Go 1.27.3 或更高版本。在应用模块根目录检出 `tools` 分支，并让 Go 使用这个本地副本。
+需要 Go 1.27.3 或更高版本。在应用模块根目录克隆仓库，并让 Go 使用这个本地副本。
 
 ```sh
-git clone --branch tools --single-branch https://code.d7z.net/d7z-team/nebula.git ../nebula
+git clone --single-branch https://code.d7z.net/d7z-team/nebula.git ../nebula
 go mod edit -require=github.com/slackhq/nebula@v0.0.0 -replace=github.com/slackhq/nebula=../nebula
 ```
 
@@ -26,6 +26,7 @@ go mod edit -require=github.com/slackhq/nebula@v0.0.0 -replace=github.com/slackh
 | 从 PEM 加载身份，签发客户端或网关证书 | [证书与信任池](cert/README.md) |
 | 通过网关访问下游子网，设置转发和回程 | [网关转发](docs/nebula-nic.md#经网关访问下游子网) |
 | 指定中转，检查链路质量和切换原因 | [直连、中转与链路健康](docs/paths.md) |
+| 监控端口吞吐量和中转容量 | [节点和流量监控](docs/nebula-nic.md#监控节点和流量) |
 | 与上游 UDP 互通，或为节点配置统一标识 | [数据报前缀](docs/nebula-nic.md#自定义-udp-数据报前缀) |
 | 接入其他三层设备，或调整发送队列 | [IP 数据端口](docs/nebula-nic.md#接入其他三层设备) · [容量参数](docs/nebula-nic.md#调整节点容量) |
 | 刷新节点地址或定位丢包 | [发现与连接](docs/nebula-nic.md#发现与运行时管理) · [排错](docs/nebula-nic.md#排错) |

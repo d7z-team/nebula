@@ -243,7 +243,8 @@ func TestPathPolicySubmissionAndCancel(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("probe wait did not cancel")
 	}
-	require.Equal(t, Auto, n.engine.paths.config.Load().policy([]netip.Addr{b.addr}, n.engine.hostMap).Mode)
+	_, overridden := n.PeerPathPolicy(b.addr)
+	require.False(t, overridden)
 	updated := make(chan error, 1)
 	go func() { updated <- n.SetPeerPathPolicy(t.Context(), b.addr, &p) }()
 	gated.unblock()
@@ -416,6 +417,38 @@ func TestRelayCycleAndPendingExpiry(t *testing.T) {
 		_, ok = leg.relayState.mappingByAddr(target)
 		require.False(t, ok)
 	})
+}
+
+func TestPeerPathPolicyBeforeStart(t *testing.T) {
+	pool, local, remote := newNodeTestIdentities(t)
+	relay := remote.addr.Next()
+	override := PeerPathPolicy{Mode: RelayOnly, Relays: []netip.Addr{relay}}
+	n, err := New(t.Context(), Options{
+		Identities: []Identity{local.identity}, CAPool: pool,
+		Transport: newMemoryDatagramNetwork(netip.MustParseAddrPort("127.0.0.1:30001"))[0],
+		Paths: PathOptions{Default: PeerPathPolicy{Mode: DirectOnly}, Peers: map[netip.Addr]PeerPathPolicy{
+			remote.addr: override,
+		}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, n.Close()); require.NoError(t, n.Wait()) })
+
+	p, ok := n.PeerPathPolicy(netip.AddrFrom16(remote.addr.As16()))
+	require.True(t, ok)
+	require.Equal(t, override, p)
+	p.Relays[0] = local.addr
+	p, ok = n.PeerPathPolicy(remote.addr)
+	require.True(t, ok)
+	require.Equal(t, []netip.Addr{relay}, p.Relays)
+
+	require.NoError(t, n.SetPeerPathPolicy(t.Context(), remote.addr, &PeerPathPolicy{Mode: Auto}))
+	p, ok = n.PeerPathPolicy(remote.addr)
+	require.True(t, ok)
+	require.Equal(t, PeerPathPolicy{Mode: Auto}, p)
+	require.NoError(t, n.SetPeerPathPolicy(t.Context(), remote.addr, nil))
+	_, ok = n.PeerPathPolicy(remote.addr)
+	require.False(t, ok)
+	require.Equal(t, DirectOnly, n.Discovery().DefaultPathPolicy.Mode)
 }
 
 func TestPathPolicyCertificateAliases(t *testing.T) {
@@ -617,13 +650,14 @@ func TestConfiguredPathChecksAndRelayExpiry(t *testing.T) {
 		hm := n.engine.hostMap
 		h := hm.QueryVpnAddr(ids[1].addr)
 		target := ids[1].addr.Next()
-		mapping, err := hm.getOrAddRelay(h, target, 0, relayTypeTerminal, relayRequested)
+		_, err := hm.getOrAddRelay(h, target, 0, relayTypeTerminal, relayRequested)
 		require.NoError(t, err)
+		require.Equal(t, RelayStats{UsedMappings: 1, MaxMappings: 1}, n.RelayStats())
 		_, err = hm.getOrAddRelay(h, target.Next(), 0, relayTypeTerminal, relayRequested)
 		require.ErrorContains(t, err, "relay capacity reached")
 		time.Sleep(160 * time.Millisecond)
 		synctest.Wait()
-		require.Nil(t, hm.QueryRelayIndex(mapping.LocalIndex))
+		require.Equal(t, RelayStats{MaxMappings: 1}, n.RelayStats())
 		_, err = hm.getOrAddRelay(h, target.Next(), 0, relayTypeTerminal, relayRequested)
 		require.NoError(t, err)
 

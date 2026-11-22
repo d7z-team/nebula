@@ -162,7 +162,7 @@ func (n *Node) resolveProbeRoute(h *hostInfo, want TunnelPath) (tunnelRoute, err
 			return route, nil
 		}
 	}
-	known := cfg.policy(h.vpnAddrs, f.hostMap).Relays
+	known := cfg.effectivePolicy(h.vpnAddrs, f.hostMap).Relays
 	if len(known) == 0 {
 		known = h.remotes.candidates().relays
 	}
@@ -212,7 +212,7 @@ func (n *Node) CheckPeerPath(ctx context.Context, peer netip.Addr, want TunnelPa
 	if h == nil && want != (TunnelPath{}) {
 		ids := []netip.Addr{peer}
 		cfg := n.engine.paths.config.Load()
-		policy := cfg.policy(ids, n.engine.hostMap)
+		policy := cfg.effectivePolicy(ids, n.engine.hostMap)
 		if !want.Relay.IsValid() && policy.Mode == RelayOnly || want.Relay.IsValid() && policy.Mode == DirectOnly {
 			return PathCheckResult{}, ErrPathPolicy
 		}
@@ -366,7 +366,7 @@ func (n *Node) checkSession(h *hostInfo, now time.Time) bool {
 	if f.hostMap.QueryVpnAddr(h.vpnAddrs[0]) != h {
 		return false
 	}
-	policy := cfg.policy(h.vpnAddrs, f.hostMap)
+	policy := cfg.effectivePolicy(h.vpnAddrs, f.hostMap)
 	s.mu.Lock()
 	initial, alt := s.active, s.standby
 	s.mu.Unlock()

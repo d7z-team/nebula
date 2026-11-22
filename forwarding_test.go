@@ -175,6 +175,9 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 
 	require.EqualValues(t, ipv4.DefaultTTL-1, observed.ttl4.Load())
 	require.EqualValues(t, ipv6.DefaultTTL-1, observed.ttl6.Load())
+	gatewayStats := epG.Stats()
+	require.Positive(t, gatewayStats.SentBytes)
+	require.Positive(t, gatewayStats.ReceivedBytes)
 	c, accepted := tcpPair(t, h, g, "172.30.0.1", ipv4.ProtocolNumber)
 	require.Nil(t, g.RemoveNIC(vpn))
 	require.False(t, epG.IsAttached())

@@ -33,6 +33,11 @@ type PeerPathPolicy struct {
 	MonitorInterval time.Duration
 }
 
+func (p PeerPathPolicy) clone() PeerPathPolicy {
+	p.Relays = slices.Clone(p.Relays)
+	return p
+}
+
 var (
 	ErrPathPolicy  = errors.New("tunnel path denied by policy")
 	ErrPathTimeout = errors.New("tunnel path probe timed out")
@@ -63,7 +68,7 @@ func (p PeerPathPolicy) validate(n *Node, peer netip.Addr) (PeerPathPolicy, erro
 	if p.Mode > RelayOnly || p.MonitorInterval < 0 || (!peer.IsValid() && p.MonitorInterval != 0) || (p.Mode == DirectOnly && len(p.Relays) > 0) {
 		return p, fmt.Errorf("%w: invalid mode, interval or relay list", ErrPathPolicy)
 	}
-	p.Relays = slices.Clone(p.Relays)
+	p = p.clone()
 	for i, addr := range p.Relays {
 		addr = addr.Unmap()
 		if err := n.validatePeerAddress(addr); err != nil {
@@ -114,6 +119,13 @@ func (p *pathManager) init(n *Node, opts PathOptions) error {
 		return fmt.Errorf("path probe budget: %w", err)
 	}
 	return nil
+}
+
+// PeerPathPolicy returns the explicit override for this overlay address and
+// whether one exists. It can be read before Start, independently of any tunnel.
+func (n *Node) PeerPathPolicy(peer netip.Addr) (PeerPathPolicy, bool) {
+	policy, ok := n.engine.paths.config.Load().Peers[peer.Unmap()]
+	return policy.clone(), ok
 }
 
 // SetPeerPathPolicy replaces an overlay address override. A nil policy restores the default.
@@ -225,7 +237,7 @@ func (hm *hostMap) relayIdentities(addr netip.Addr) []netip.Addr {
 	return nil
 }
 
-func (cfg *pathPolicies) policy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
+func (cfg *pathPolicies) effectivePolicy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
 	var v PeerPathPolicy
 	var constrained, found bool
 	for _, id := range ids {

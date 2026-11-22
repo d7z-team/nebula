@@ -100,6 +100,14 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 | `Relay.MaxMappings`、`Relay.PendingTimeout`、`Relay.RequestInterval` | 8192、1 分钟、100 毫秒 | 节点持有的中转映射总数、半开映射的保留时间、同一映射两次建立请求的最小间隔。到期映射在下一次巡检时回收。 |
 | `Connections.MaxTunnelsPerAddress`、`Connections.RoamSuppressInterval` | 5 条、2 秒 | 同一 overlay 地址可保留的隧道数，以及收到同一漫游候选地址的流量后，再次触发探测的最短间隔。 |
 
+## 监控节点和流量
+
+按实例轮询快照，通过 `node.Context().Done()` 监听停止。节点处于 `NodeStateRunning` 且 `node.Peer(addr)` 找到该 peer 时，用 `peer.PathHealth.Active.Path.Endpoint.IsValid()` 判断当前是否有可用出口。验证往返可达性可调用 `CheckPeerPath`。[路径策略与主动探测](paths.md)
+
+**端口流量**通过 `port.Stats()` 或 gVisor 的 `ep.Stats()` 读取。`Queued` 是等待发送的包数。`SentPackets`、`SentBytes` 在业务包成功提交给本地传输时累计，排队重试的包在最终提交时计一次。`ReceivedPackets`、`ReceivedBytes` 在入站包通过授权、交给端口回调时累计。字节数按完整内层 IP 包计算。对同一端口两次采样的字节差除以时间差，即为平均吞吐率。新打开的端口从零累计。
+
+**中转负载**通过 `node.RelayStats()` 读取。`UsedMappings` 和 `MaxMappings` 分别是本地中转索引的当前占用和生效上限。半开映射和端点映射都占用索引，一条端到端线路可占多个索引。`ForwardedDatagrams` 按节点生命周期累计，每次替其他节点向下一跳成功提交握手、探测或业务数据报时加一。
+
 ## 排错
 
 | 现象 | 检查方法 |

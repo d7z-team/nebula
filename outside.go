@@ -157,12 +157,9 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 	}
 	switch h.Type {
 	case header.Message:
-		switch h.Subtype {
-		case header.MessageNone:
-			f.deliverIP(hostinfo, out)
-		default:
-			hostinfo.logger(f.l).Error("IsValidSubType was true, but unexpected message subtype seen", "from", via, "header", h)
-			return
+		// Relay messages were dispatched before decryption.
+		if port := f.port.Load(); port != nil {
+			port.receiveIP(hostinfo, out)
 		}
 
 	case header.LightHouse:
@@ -267,7 +264,9 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 		}
 		if err != nil {
 			targetHI.logger(f.l).Debug("failed to forward relay datagram", "error", err)
+			return
 		}
+		f.forwardedDatagrams.Add(1)
 	default:
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
 			hostinfo.logger(f.l).Debug("Unexpected relay type", "from", via, "relayType", relay.Type)
@@ -313,30 +312,6 @@ func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
 	hostinfo.remotes.LearnRemote(hostinfo.vpnAddrs[0], via.UdpAddr)
 	s.roamCandidate, s.lastRoamProbeRequest = via.UdpAddr, now
 	s.nextBackup = time.Time{}
-}
-
-func (f *packetEngine) deliverIP(hostinfo *hostInfo, packet []byte) {
-	port := f.port.Load()
-	if port == nil || port.ctx.Err() != nil {
-		return
-	}
-	ip, err := parseInnerPacket(packet)
-	peer := hostinfo.vpnAddrs[0]
-	var reason string
-	switch {
-	case err != nil:
-		reason = "invalid inner IP packet"
-	case !f.authorizesLocal(ip.destination):
-		reason = "local certificate does not authorize destination"
-	case !hostinfo.authorizes(ip.source):
-		reason = "peer certificate does not authorize source"
-	case f.inboundPolicy != nil && !f.inboundPolicy(peer, ip.source, ip.destination):
-		reason = "inbound policy denied packet"
-	default:
-		port.deliver(packet)
-		return
-	}
-	port.recordDrop(true, peer, ip, reason, 1)
 }
 
 func (f *packetEngine) sendRecvError(endpoint netip.AddrPort, index uint32) {

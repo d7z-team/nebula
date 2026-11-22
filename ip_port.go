@@ -39,11 +39,13 @@ type IPPort struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	deliver func([]byte)
-	mu      sync.Mutex
+
+	queueMu sync.Mutex
 	queues  map[netip.Addr]*peerQueue
 	queued  int
 	workers int
-	diagMu  sync.Mutex
+
+	statsMu sync.Mutex
 	stats   PortStats
 }
 
@@ -80,7 +82,7 @@ func (n *Node) OpenIPPort(deliver func([]byte)) (*IPPort, error) {
 // Close releases this port and drops queued frames. A frame already being
 // transmitted or delivered may finish. The outer transport belongs to Node.
 func (p *IPPort) Close() {
-	p.mu.Lock()
+	p.queueMu.Lock()
 	p.cancel()
 	for _, q := range p.queues {
 		q.packets = nil
@@ -88,14 +90,14 @@ func (p *IPPort) Close() {
 	clear(p.queues)
 	p.queued = 0
 	p.node.engine.port.CompareAndSwap(p, nil)
-	p.mu.Unlock()
+	p.queueMu.Unlock()
 }
 
 // ClearPending discards packets still queued for this overlay next hop.
 // An in-flight datagram and the shared Nebula handshake are independent.
 func (p *IPPort) ClearPending(peer netip.Addr) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
 	peer = peer.Unmap()
 	q := p.queues[peer]
 	if q == nil {
@@ -117,17 +119,21 @@ type PacketDrop struct {
 	Reason                    string
 }
 
-// PortStats reports queue depth and observed IP admission and transmit errors.
+// PortStats reports queue depth and cumulative traffic for one IP port.
+// Sent counts successful transport submissions. Received counts delivery to
+// the port callback. Byte counts include the complete inner IP packet.
 // Explicit ClearPending and Close are excluded from the rejection counts.
 type PortStats struct {
 	Queued                            int
+	SentPackets, SentBytes            uint64
+	ReceivedPackets, ReceivedBytes    uint64
 	RejectedInbound, RejectedOutbound uint64
 	LastDrop                          PacketDrop
 }
 
 func (p *IPPort) recordDrop(inbound bool, peer netip.Addr, ip innerPacket, reason string, count int) {
-	p.diagMu.Lock()
-	defer p.diagMu.Unlock()
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
 	if inbound {
 		p.stats.RejectedInbound += uint64(count)
 	} else {
@@ -136,17 +142,46 @@ func (p *IPPort) recordDrop(inbound bool, peer netip.Addr, ip innerPacket, reaso
 	p.stats.LastDrop = PacketDrop{Inbound: inbound, Peer: peer, Source: ip.source, Destination: ip.destination, Reason: reason}
 }
 
+// Stats returns a snapshot of this port's queue and traffic counters.
 func (p *IPPort) Stats() PortStats {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.diagMu.Lock()
-	defer p.diagMu.Unlock()
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
 	stats := p.stats
 	stats.Queued = p.queued
 	return stats
 }
 
-// queueFull is called under p.mu for both initial admission and a route retry.
+func (p *IPPort) receiveIP(hostinfo *hostInfo, packet []byte) {
+	if p.ctx.Err() != nil {
+		return
+	}
+	f := p.node.engine
+	ip, err := parseInnerPacket(packet)
+	peer := hostinfo.vpnAddrs[0]
+	var reason string
+	switch {
+	case err != nil:
+		reason = "invalid inner IP packet"
+	case !f.authorizesLocal(ip.destination):
+		reason = "local certificate does not authorize destination"
+	case !hostinfo.authorizes(ip.source):
+		reason = "peer certificate does not authorize source"
+	case f.inboundPolicy != nil && !f.inboundPolicy(peer, ip.source, ip.destination):
+		reason = "inbound policy denied packet"
+	default:
+		p.statsMu.Lock()
+		p.stats.ReceivedPackets++
+		p.stats.ReceivedBytes += uint64(len(packet))
+		p.statsMu.Unlock()
+		p.deliver(packet)
+		return
+	}
+	p.recordDrop(true, peer, ip, reason, 1)
+}
+
+// queueFull is called under p.queueMu for both initial admission and a route retry.
 func (p *IPPort) queueFull(q *peerQueue) bool {
 	limits := p.node.portOptions
 	return p.queued >= limits.QueueSize || (q != nil && len(q.packets) >= limits.PerPeerQueueSize)
@@ -190,8 +225,8 @@ func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
 		return fmt.Errorf("%w: destination %s via %s", ErrAddressNotCertified, ip.destination, peer)
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
 	if p.ctx.Err() != nil {
 		return ErrPortClosed
 	}
@@ -221,21 +256,9 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 	nonce := make([]byte, 12)
 	var out []byte
 	for {
-		p.mu.Lock()
+		p.queueMu.Lock()
 		if p.queues[peer] != q || len(q.packets) == 0 || ctx.Err() != nil || connectErr != nil {
-			if p.queues[peer] == q {
-				p.queued -= len(q.packets)
-				delete(p.queues, peer)
-				if connectErr != nil && len(q.packets) != 0 && ctx.Err() == nil {
-					p.recordDrop(false, peer, q.packets[0].innerPacket, connectErr.Error(), len(q.packets))
-				}
-			}
-			p.workers--
-			p.mu.Unlock()
-			if connectErr != nil && ctx.Err() == nil {
-				f.l.Debug("IP queue handshake failed", "peer", peer, "error", connectErr)
-			}
-			return
+			break
 		}
 		h := f.hostMap.QueryVpnAddr(peer)
 		var route tunnelRoute
@@ -243,7 +266,7 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 			route = f.currentRoute(h)
 		}
 		if !route.Endpoint.IsValid() {
-			p.mu.Unlock()
+			p.queueMu.Unlock()
 			connectErr = p.node.ConnectPeer(ctx, peer)
 			continue
 		}
@@ -251,7 +274,7 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 		q.packets[0] = queuedIP{}
 		q.packets = q.packets[1:]
 		p.queued--
-		p.mu.Unlock()
+		p.queueMu.Unlock()
 
 		ip := packet.innerPacket
 		if !h.authorizes(ip.destination) {
@@ -262,24 +285,43 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 			out = make([]byte, 0, len(packet.data)+header.MaxOverhead)
 		}
 		path, err := f.sendOnRoute(header.Message, header.MessageNone, h, route, packet.data, nonce, out)
+		if err == nil {
+			p.statsMu.Lock()
+			p.stats.SentPackets++
+			p.stats.SentBytes += uint64(len(packet.data))
+			p.statsMu.Unlock()
+			if last := h.lastDataPath.Load(); last == nil || *last != path {
+				h.lastDataPath.Store(&path)
+			}
+			continue
+		}
+
 		if err == errWritePolicy || (path == (TunnelPath{}) && errors.Is(err, ErrPeerUnavailable)) {
-			// No datagram was submitted. Keep this frame ahead of later packets
-			// if the original queue is still attached and has room.
-			p.mu.Lock()
+			// Retry at the head of the original queue if it is still attached.
+			p.queueMu.Lock()
 			if p.queues[peer] == q && !p.queueFull(q) {
-				q.packets = append(q.packets, queuedIP{})
-				copy(q.packets[1:], q.packets[:len(q.packets)-1])
-				q.packets[0] = packet
+				q.packets = slices.Insert(q.packets, 0, packet)
 				p.queued++
-				p.mu.Unlock()
+				p.queueMu.Unlock()
 				continue
 			}
-			p.mu.Unlock()
+			p.queueMu.Unlock()
 		}
-		if err != nil {
-			p.recordDrop(false, peer, ip, err.Error(), 1)
-		} else if last := h.lastDataPath.Load(); last == nil || *last != path {
-			h.lastDataPath.Store(&path)
+		p.recordDrop(false, peer, ip, err.Error(), 1)
+	}
+
+	// The loop exits with queueMu held so a concurrent writer sees either
+	// the existing worker or a detached queue.
+	if p.queues[peer] == q {
+		delete(p.queues, peer)
+		p.queued -= len(q.packets)
+		if connectErr != nil && len(q.packets) > 0 && ctx.Err() == nil {
+			p.recordDrop(false, peer, q.packets[0].innerPacket, connectErr.Error(), len(q.packets))
 		}
+	}
+	p.workers--
+	p.queueMu.Unlock()
+	if connectErr != nil && ctx.Err() == nil {
+		f.l.Debug("IP queue handshake failed", "peer", peer, "error", connectErr)
 	}
 }

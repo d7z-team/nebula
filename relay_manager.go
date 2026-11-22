@@ -25,6 +25,25 @@ const (
 	relayTypeTerminal
 )
 
+// RelayStats reports local relay index use and cumulative transit traffic.
+type RelayStats struct {
+	UsedMappings       int    // Local indices in use, including pending and terminal mappings.
+	MaxMappings        int    // Effective limit on local relay indices.
+	ForwardedDatagrams uint64 // Datagrams successfully submitted to the next hop for other nodes.
+}
+
+// RelayStats returns this node's relay statistics.
+func (n *Node) RelayStats() RelayStats {
+	hm := n.engine.hostMap
+	hm.RLock()
+	defer hm.RUnlock()
+	return RelayStats{
+		UsedMappings:       len(hm.Relays),
+		MaxMappings:        hm.maxRelayMappings,
+		ForwardedDatagrams: n.engine.forwardedDatagrams.Load(),
+	}
+}
+
 type relay struct {
 	created     time.Time
 	lastRequest time.Time
@@ -326,7 +345,7 @@ func (f *packetEngine) handleRelayControl(h *hostInfo, d []byte) {
 			var remotes *remoteList
 			if end := f.hostMap.QueryVpnAddr(from); end != nil {
 				ids, remotes = end.vpnAddrs, end.remotes
-			} else if f.paths.config.Load().policy(ids, f.hostMap).Mode == RelayOnly {
+			} else if f.paths.config.Load().effectivePolicy(ids, f.hostMap).Mode == RelayOnly {
 				remotes = f.lightHouse.getOrCreateRemotes(ids)
 			}
 			if !f.paths.config.Load().allows(ids, h.vpnAddrs[0], remotes, h.vpnAddrs...) {

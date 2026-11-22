@@ -24,7 +24,10 @@ opts.Paths.Peers = map[netip.Addr]nebula.PeerPathPolicy{
 
 中转节点设置 `Relay.Serve = true` 并与两端直连。它也可以为自己的连接选择其他中转。端点通过 `Relay.AdvertiseVia` 向 lighthouse 发布可以到达自己的中转。使用纯静态配置时，在两端设置对方的中转名单，并为中转提供静态外层地址。
 
-`Paths.Default` 适用于没有单独配置的 peer。运行中调用 `node.SetPeerPathPolicy(ctx, gateway, &policy)` 替换指定地址的策略，传入 `nil` 撤销该地址的覆盖。更新成功后，新提交给传输的数据报使用新策略。同一证书的多个地址在认证后共享路径，各地址的显式限制取交集。如果没有共同路径，快照显示 `PathBlocked`。首次握手也须强制中转时，为应用可能拨号的每个地址设置策略。
+`node.SetPeerPathPolicy(ctx, gateway, &policy)` 替换指定地址的策略，传入 `nil` 撤销该地址的覆盖。更新成功后，新提交给传输的数据报使用新策略。
+
+- 拨号前用 `policy, ok := node.PeerPathPolicy(gateway)` 查询该地址的显式策略。显式设置为 `Auto` 时也返回 `true`，返回的中转列表可由调用方修改。`ok` 为 `false` 表示该地址没有覆盖，节点默认策略见 `node.Discovery().DefaultPathPolicy`。
+- 认证后用 `node.Peer(gateway)` 返回的 `PathHealth.Policy` 查看有效策略。同一证书的多个地址共享路径，各地址的显式限制取交集。没有共同路径时显示 `PathBlocked`。要让首次握手也强制中转，为应用可能拨号的每个地址设置策略。
 
 ## 手动检查去程与回程
 
