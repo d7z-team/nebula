@@ -48,6 +48,8 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 
 ## 网卡与端口生命周期
 
+同一进程可以运行多个 `nebula.Node`。为每个节点提供可独立收包和关闭的 `DatagramTransport`。多个节点可以共享证书对象和预先配置好的 `cert.CAPool`，在使用期间将两者视为只读。信任策略不同的节点应分别建池。
+
 | 操作 | 调用方的职责 |
 | --- | --- |
 | 提供传输 | 普通 UDP 使用 `nebula.WrapPacketConn`。`nebula.New` 成功后节点接管传输，失败时调用方关闭它。自定义 `DatagramTransport` 须保留数据报边界、支持并发写，并在 `Close` 时唤醒阻塞的读写。`WriteTo` 在调用期间借用输入缓冲，异步发送须在返回前复制。 |

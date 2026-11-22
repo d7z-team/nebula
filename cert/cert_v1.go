@@ -226,14 +226,9 @@ func (c *certificateV1) String() string {
 }
 
 func (c *certificateV1) MarshalForHandshakes() ([]byte, error) {
-	pubKey := c.details.publicKey
-	c.details.publicKey = nil
-	rawCertNoKey, err := c.Marshal()
-	if err != nil {
-		return nil, err
-	}
-	c.details.publicKey = pubKey
-	return rawCertNoKey, nil
+	handshakeCert := *c
+	handshakeCert.details.publicKey = nil
+	return handshakeCert.Marshal()
 }
 
 func (c *certificateV1) Marshal() ([]byte, error) {
