@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/slackhq/nebula/cert"
@@ -50,17 +51,18 @@ type handshakeManager struct {
 
 	mainHostMap *hostMap
 	lightHouse  *lighthouse
-	outside     DatagramTransport
-	config      HandshakeOptions
-	retryTimer  *timerWheel[outboundHandshakeTimerItem]
-	f           *packetEngine
-	l           *slog.Logger
+
+	config     HandshakeOptions
+	retryTimer *timerWheel[outboundHandshakeTimerItem]
+	f          *packetEngine
+	l          *slog.Logger
 
 	// can be used to trigger outbound handshake for the given vpnIp
 	trigger chan netip.Addr
 }
 
 type handshakeHostInfo struct {
+	directOnly atomic.Bool
 	sync.Mutex
 
 	startTime                 time.Time        // Time that we first started trying with this handshake
@@ -83,7 +85,7 @@ func (hh *handshakeHostInfo) cacheControlPacket(l *slog.Logger, t header.Message
 	hh.packetStore = append(hh.packetStore, cachedPacket{t, st, slices.Clone(packet)})
 }
 
-func newHandshakeManager(l *slog.Logger, mainHostMap *hostMap, lightHouse *lighthouse, outside DatagramTransport, config HandshakeOptions) *handshakeManager {
+func newHandshakeManager(l *slog.Logger, mainHostMap *hostMap, lightHouse *lighthouse, config HandshakeOptions) *handshakeManager {
 	if config.TryInterval <= 0 {
 		config.TryInterval = defaultHandshakeTryInterval
 	}
@@ -94,17 +96,16 @@ func newHandshakeManager(l *slog.Logger, mainHostMap *hostMap, lightHouse *light
 		config.TriggerBuffer = defaultHandshakeTriggerBuffer
 	}
 	// The longest individual retry delay determines the wheel size.
-
 	return &handshakeManager{
 		vpnIps:      map[netip.Addr]*handshakeHostInfo{},
 		indexes:     map[uint32]*handshakeHostInfo{},
 		mainHostMap: mainHostMap,
 		lightHouse:  lightHouse,
-		outside:     outside,
-		config:      config,
-		trigger:     make(chan netip.Addr, config.TriggerBuffer),
-		retryTimer:  newTimerWheel[outboundHandshakeTimerItem](config.TryInterval, time.Duration(config.Retries)*config.TryInterval),
-		l:           l,
+
+		config:     config,
+		trigger:    make(chan netip.Addr, config.TriggerBuffer),
+		retryTimer: newTimerWheel[outboundHandshakeTimerItem](config.TryInterval, time.Duration(config.Retries)*config.TryInterval),
+		l:          l,
 	}
 }
 
@@ -201,15 +202,28 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, generation *handsha
 	hostinfo := hh.hostinfo
 	candidates := hostinfo.remotes.candidates()
 	remotes := candidates.endpoints
-	remotesHaveChanged := !slices.Equal(remotes, hh.lastRemotes)
-	if lighthouseTriggered && !remotesHaveChanged {
-		// Repeated reports should only spend a retry when they offer a new path.
-		if !hm.f.relayManager.useRelays || slices.Equal(candidates.relays, hh.lastRelays) {
-			return
-		}
+	cfg := hm.f.paths.config.Load()
+	ids := hostinfo.vpnAddrs
+	if known := hm.mainHostMap.QueryVpnAddr(vpnIp); known != nil {
+		ids = known.vpnAddrs
 	}
+	relays := cfg.policy(ids, hm.mainHostMap).Relays
+	if len(relays) == 0 {
+		relays = candidates.relays
+	}
+	if hh.directOnly.Load() {
+		relays = nil
+	}
+	if !cfg.allows(ids, netip.Addr{}, hostinfo.remotes) {
+		remotes = nil
+	}
+	if lighthouseTriggered && slices.Equal(remotes, hh.lastRemotes) && slices.Equal(relays, hh.lastRelays) {
+		return
+	}
+	hh.lastRemotes, hh.lastRelays = remotes, relays
 	// If we are out of time, clean up
-	if hh.counter >= hm.config.Retries {
+	tries := time.Duration(hm.config.Retries)
+	if hh.counter >= hm.config.Retries || time.Since(hh.startTime) > hm.config.TryInterval*(tries+1)*(tries+2)/2+time.Second {
 		fields := []any{
 			"udpAddrs", remotes,
 			"initiatorIndex", hh.hostinfo.localIndexId,
@@ -242,60 +256,28 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, generation *handsha
 
 	// IX initiators retransmit their first handshake message.
 	stage0 := hostinfo.HandshakePacket[handshakePacketStage0]
-	hsFields := structuredMap{
-		"stage": uint64(hh.machine.MessageIndex()),
-		"style": header.SubTypeName(header.Handshake, hh.machine.Subtype()),
-	}
-
-	hh.lastRemotes = remotes
-
-	// This will generate a load of queries for hosts with only 1 ip
-	// (such as ones registered to the lighthouse with only a private IP)
-	// So we only do it one time after attempting 5 handshakes already.
-	if len(remotes) <= 1 && hh.counter == 5 {
-		// If we only have 1 remote it is highly likely our query raced with the other host registered within the lighthouse
-		// Our vpnIp here has a tunnel with a lighthouse but has yet to send a host update packet there so we only know about
-		// the learned public ip for them. Query again to short circuit the promotion counter
+	if hh.counter == 5 {
 		hm.lightHouse.QueryServer(vpnIp)
 	}
-
-	// Send the handshake to all known ips, stage 2 takes care of assigning the hostinfo.remote based on the first to reply
-	var sentTo []netip.AddrPort
-	for _, addr := range remotes {
-		err := hm.outside.WriteTo(stage0, addr)
-		if err != nil {
-			// These repeat every attempt, so match the success log below and only shout when the remotes changed
-			level := slog.LevelDebug
-			if remotesHaveChanged {
-				level = slog.LevelError
+	// Give direct connectivity the first attempt, then rotate through alternatives.
+	if len(remotes) > 0 {
+		endpoint := remotes[(hh.counter-1)%len(remotes)]
+		err := hm.f.writePath(hostinfo, tunnelRoute{TunnelPath: TunnelPath{Endpoint: endpoint}}, stage0, true, nil)
+		if errors.Is(err, errPathBudget) {
+			hh.counter--
+			if !lighthouseTriggered {
+				hm.retryTimer.Add(outboundHandshakeTimerItem{vpnAddr: vpnIp, generation: hh}, hm.config.TryInterval)
 			}
-
-			hostinfo.logger(hm.l).Log(context.Background(), level, "Failed to send handshake message",
-				"udpAddr", addr,
-				"initiatorIndex", hostinfo.localIndexId,
-				"handshake", hsFields,
-				"error", err,
-			)
-
-		} else {
-			sentTo = append(sentTo, addr)
+			return
 		}
 	}
-
-	level := slog.LevelDebug
-	if remotesHaveChanged {
-		level = slog.LevelInfo
+	if len(relays) > 0 && (len(remotes) == 0 || hh.counter > 1) {
+		// Allow several attempts for the neighbor handshake and CreateRelay round trip.
+		relayAddr := relays[((hh.counter-1)/3)%len(relays)]
+		if route, ok := hm.f.ensureRelay(hostinfo, relayAddr); ok {
+			hm.f.sendVia(hostinfo, route, stage0, make([]byte, 12), make([]byte, mtu), false, true)
+		}
 	}
-	if hm.l.Enabled(context.Background(), level) {
-		hostinfo.logger(hm.l).Log(context.Background(), level, "Handshake message sent",
-			"udpAddrs", sentTo,
-			"initiatorIndex", hostinfo.localIndexId,
-			"handshake", hsFields,
-		)
-	}
-
-	hm.f.relayManager.StartRelays(hm.f, vpnIp, hh, stage0, candidates.relays)
-
 	// If a lighthouse triggered this attempt then we are still in the timer wheel and do not need to re-add
 	if !lighthouseTriggered {
 		hm.retryTimer.Add(outboundHandshakeTimerItem{vpnAddr: vpnIp, generation: hh}, hm.config.TryInterval*time.Duration(hh.counter))
@@ -310,10 +292,6 @@ func (hm *handshakeManager) GetOrHandshake(vpnIp netip.Addr, cacheCb func(*hands
 	hm.mainHostMap.RUnlock()
 
 	if ok {
-		// Do not attempt promotion if you are a lighthouse
-		if !hm.lightHouse.amLighthouse {
-			h.TryPromoteBest(hm.f)
-		}
 		return h, true
 	}
 
@@ -322,9 +300,16 @@ func (hm *handshakeManager) GetOrHandshake(vpnIp netip.Addr, cacheCb func(*hands
 
 // StartHandshake will ensure a handshake is currently being attempted for the provided vpn ip
 func (hm *handshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*handshakeHostInfo)) *hostInfo {
+	return hm.startHandshake(vpnAddr, cacheCb, false)
+}
+
+func (hm *handshakeManager) startHandshake(vpnAddr netip.Addr, cacheCb func(*handshakeHostInfo), directOnly bool) *hostInfo {
 	hm.Lock()
 
 	if hh, ok := hm.vpnIps[vpnAddr]; ok {
+		if !directOnly {
+			hh.directOnly.Store(false)
+		}
 		// We are already trying to handshake with this vpn ip
 		if cacheCb != nil {
 			cacheCb(hh)
@@ -338,17 +323,13 @@ func (hm *handshakeManager) StartHandshake(vpnAddr netip.Addr, cacheCb func(*han
 		HandshakePacket: make(map[uint8][]byte, 0),
 		// A pending tunnel can learn an endpoint before its first handshake attempt.
 		remotes: hm.lightHouse.getOrCreateRemotes([]netip.Addr{vpnAddr}),
-		relayState: relayState{
-			relays:         nil,
-			relayForByAddr: map[netip.Addr]*relay{},
-			relayForByIdx:  map[uint32]*relay{},
-		},
 	}
 
 	hh := &handshakeHostInfo{
 		hostinfo:  hostinfo,
 		startTime: time.Now(),
 	}
+	hh.directOnly.Store(directOnly)
 	hm.vpnIps[vpnAddr] = hh
 	hm.retryTimer.Add(outboundHandshakeTimerItem{vpnAddr: vpnAddr, generation: hh}, hm.config.TryInterval)
 
@@ -657,6 +638,10 @@ func (hm *handshakeManager) beginHandshake(via packetSender, packet []byte, h *h
 		return
 	}
 
+	remotes := f.lightHouse.getOrCreateRemotes(vpnAddrs)
+	if !f.handshakeAllowed(vpnAddrs, via, remotes) {
+		return
+	}
 	connState, err := newConnectionStateFromResult(result)
 	if err != nil {
 		f.l.Error("Discarding handshake with an invalid message index", "error", err, "vpnAddrs", vpnAddrs)
@@ -670,11 +655,6 @@ func (hm *handshakeManager) beginHandshake(via packetSender, packet []byte, h *h
 		vpnAddrs:          vpnAddrs,
 		HandshakePacket:   make(map[uint8][]byte, 0),
 		lastHandshakeTime: result.HandshakeTime,
-		relayState: relayState{
-			relays:         nil,
-			relayForByAddr: map[netip.Addr]*relay{},
-			relayForByIdx:  map[uint32]*relay{},
-		},
 	}
 
 	msg := "Handshake message received"
@@ -702,12 +682,13 @@ func (hm *handshakeManager) beginHandshake(via packetSender, packet []byte, h *h
 		hostinfo.HandshakePacket[handshakePacketStage2] = response
 	}
 
-	hostinfo.remotes = f.lightHouse.getOrCreateRemotes(vpnAddrs)
+	hostinfo.remotes = remotes
 	if !via.IsRelayed {
 		hostinfo.SetRemote(via.UdpAddr)
 	}
 	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
 
+	hostinfo.paths.adopt(receivedRoute(via), time.Now(), "handshake")
 	existing, err := hm.CheckAndComplete(hostinfo, handshakePacketStage0, f)
 	if err != nil {
 		hm.handleCheckAndCompleteError(err, existing, hostinfo, via)
@@ -744,6 +725,9 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 
 	hostinfo := hh.hostinfo
 
+	if (hh.directOnly.Load() && via.IsRelayed) || !f.handshakeAllowed(hostinfo.vpnAddrs, via, hostinfo.remotes) {
+		return
+	}
 	machine := hh.machine
 	if machine == nil {
 		f.l.Error("No handshake machine available for continuation",
@@ -795,12 +779,6 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 	hostinfo.remoteIndexId = result.RemoteIndex
 	hostinfo.lastHandshakeTime = result.HandshakeTime
 
-	if !via.IsRelayed {
-		hostinfo.SetRemote(via.UdpAddr)
-	} else {
-		hostinfo.relayState.InsertRelayTo(via.relayHI.vpnAddrs[0])
-	}
-
 	// Verify correct host responded (initiator check)
 	vpnAddrs := make([]netip.Addr, len(vpnNetworks))
 	correctHostResponded := false
@@ -833,6 +811,10 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 		}
 	}
 
+	if !f.handshakeAllowed(vpnAddrs, via, hostinfo.remotes) {
+		hm.DeleteHostInfo(hostinfo)
+		return
+	}
 	if !correctHostResponded {
 		f.l.Info("Incorrect host responded to handshake",
 			"intendedVpnAddrs", hostinfo.vpnAddrs,
@@ -858,6 +840,12 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 		return
 	}
 
+	if !via.IsRelayed {
+		hostinfo.SetRemote(via.UdpAddr)
+	} else {
+		hostinfo.relayState.addRelayAddress(via.relayHI.vpnAddrs[0])
+	}
+
 	duration := time.Since(hh.startTime).Nanoseconds()
 	msg := "Handshake message received"
 	if !anyVpnAddrsInCommon {
@@ -880,6 +868,7 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 	hostinfo.vpnAddrs = vpnAddrs
 	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
 
+	hostinfo.paths.adopt(receivedRoute(via), time.Now(), "handshake")
 	hm.Complete(hostinfo, f)
 
 	if len(hh.packetStore) > 0 {
@@ -974,26 +963,21 @@ func (hm *handshakeManager) sendHandshakeResponse(via packetSender, msg []byte, 
 		)
 	}
 
-	if !via.IsRelayed {
-		fields := append(logFields, "from", via)
-		err := f.outside.WriteTo(msg, via.UdpAddr)
-		if err != nil {
-			f.l.Error("Failed to send handshake message", append(fields, "error", err)...)
-		} else {
-			f.l.Info("Handshake message sent", fields...)
-		}
+	var err error
+	path := receivedRoute(via)
+	if via.IsRelayed {
+		hostinfo.relayState.addRelayAddress(path.Relay)
+		via.relayHI.relayState.setStateByIndex(path.local, relayEstablished)
+		_, err = f.sendVia(hostinfo, path, msg, make([]byte, 12), make([]byte, mtu), false, true)
 	} else {
-		if via.relay == nil {
-			f.l.Error("Handshake send failed: both addr and via.relay are nil.")
-			return
-		}
-		hostinfo.relayState.InsertRelayTo(via.relayHI.vpnAddrs[0])
-		// We received a valid handshake on this relay, so make sure the relay
-		// state reflects that, in case it had been marked disestablished.
-		via.relayHI.relayState.UpdateRelayForByIdxState(via.relay.LocalIndex, relayEstablished)
-		f.sendVia(via.relayHI, via.relay, msg, make([]byte, 12), make([]byte, mtu), false)
-		f.l.Info("Handshake message sent", append(logFields, "relay", via.relayHI.vpnAddrs[0])...)
+		err = f.writePath(hostinfo, path, msg, true, nil)
 	}
+	fields := append(logFields, "path", path.TunnelPath)
+	if err != nil {
+		f.l.Debug("Handshake response not sent", append(fields, "error", err)...)
+		return
+	}
+	f.l.Info("Handshake message sent", fields...)
 }
 
 // handleCheckAndCompleteError handles errors from CheckAndComplete.
@@ -1007,9 +991,6 @@ func (hm *handshakeManager) handleCheckAndCompleteError(err error, existing, hos
 
 	switch err {
 	case errAlreadySeen:
-		if existing.SetRemoteIfPreferred(via) {
-			f.SendMessageToVpnAddr(header.Test, header.TestRequest, hostinfo.vpnAddrs[0], []byte(""), make([]byte, 12, 12), make([]byte, mtu))
-		}
 		// Resend the original response. The peer is committed to that response's
 		// ephemeral keys; a freshly-built one would have different keys and break
 		// the tunnel even though both sides "completed" the handshake.

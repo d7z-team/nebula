@@ -352,10 +352,6 @@ func TestNodeDisconnectPeerClosesEveryTunnelOnce(t *testing.T) {
 		remotes:         original.remotes,
 		vpnAddrs:        slices.Clone(original.vpnAddrs),
 		networks:        original.networks,
-		relayState: relayState{
-			relayForByAddr: map[netip.Addr]*relay{},
-			relayForByIdx:  map[uint32]*relay{},
-		},
 		HandshakePacket: map[uint8][]byte{},
 	}
 	older.remote.Store(&remote)

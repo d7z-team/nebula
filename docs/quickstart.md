@@ -1,12 +1,12 @@
 # 在 gVisor 栈上连接 Nebula peer
 
-本例从客户端 `10.42.0.1` 连接对端的 `10.42.0.254:8080`。调用方提供以下参数。
+本例在已有 gVisor 栈上挂载一张 Nebula 网卡，从客户端 `10.42.0.1` 拨号到 `10.42.0.254:8080`。请先将库加入应用模块。[安装说明](../README.md#安装)
+
+运行示例需要以下条件。
 
 - `s` 是已启用 `ipv4.NewProtocol` 和 `tcp.NewProtocol` 的 gVisor 栈，`nic` 是其中一个空闲 NIC ID。
 - `identity` 是客户端证书及其原始私钥，证书地址为 `10.42.0.1/24`。`pool` 包含签发本机和对端证书的受信 CA。[加载或签发证书](../cert/README.md)
 - `peerUDP` 是对端可达的外层 IPv4 地址和 UDP 端口。对端已启动 Nebula，并在隧道地址 `10.42.0.254` 的 TCP 8080 端口提供服务。
-
-在调用方模块中引入本分支后，即可使用下面的客户端函数。[安装说明](../README.md#安装)
 
 ```go
 package client
@@ -59,8 +59,10 @@ func CheckPeer(ctx context.Context, s *stack.Stack, nic tcpip.NICID,
 	}
 	defer s.RemoveNIC(nic)
 
+	prefix := identity.Certificate.Networks()[0]
 	local := tcpip.AddressWithPrefix{
-		Address: tcpip.AddrFrom4([4]byte{10, 42, 0, 1}), PrefixLen: 24,
+		Address:   tcpip.AddrFromSlice(prefix.Addr().AsSlice()),
+		PrefixLen: prefix.Bits(),
 	}
 	if e := s.AddProtocolAddress(nic, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber, AddressWithPrefix: local,
@@ -84,4 +86,4 @@ func CheckPeer(ctx context.Context, s *stack.Stack, nic tcpip.NICID,
 }
 ```
 
-第一次拨号会触发隧道握手。长期运行的服务可复用同一个节点和 NIC，在服务退出时卸载 NIC、关闭节点并等待退出。遇到连接超时或丢包时，可分别检查外层 UDP 候选、实际路径和端口拒绝原因。[排错指南](nebula-nic.md#排错)
+此函数在 TCP 连接建立后关闭连接并卸载网卡。长期运行的服务可在多次拨号间复用节点和 NIC，在退出时统一清理。若拨号超时，可先核对 peer 的 UDP 候选地址和实际路径。[排错指南](nebula-nic.md#排错)

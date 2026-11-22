@@ -1,6 +1,7 @@
 package nebula_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -110,7 +111,7 @@ func (lan *observedLAN) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Er
 }
 
 func TestNodeGVisorForwardingAndDetach(t *testing.T) {
-	client, gateway := nebula.NewTestNICNodes(t)
+	client, gateway, switchPath := nebula.NewTestRelayNICNodes(t)
 	a, g, h := newStack(t), newStack(t), newStack(t)
 	epA, err := nebulagvisor.NewEndpoint(client, nebulagvisor.Options{})
 	require.NoError(t, err)
@@ -145,6 +146,10 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 		c, accepted := tcpPair(t, a, h, tc.host, tc.proto)
 		require.Equal(t, tc.client, accepted.RemoteAddr().(*net.TCPAddr).IP.String())
 		roundTrip(t, c, accepted)
+		if tc.proto == ipv4.ProtocolNumber {
+			switchPath()
+			roundTrip(t, c, accepted)
+		}
 		// Also originate a new flow on the independent downstream host.
 		server, err := gonet.DialUDP(a, &tcpip.FullAddress{Addr: addr(tc.client), Port: 7010}, nil, tc.proto)
 		require.NoError(t, err)
@@ -155,9 +160,9 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 		deadline := time.Now().Add(3 * time.Second)
 		require.NoError(t, server.SetDeadline(deadline))
 		require.NoError(t, downstream.SetDeadline(deadline))
-		_, err = downstream.Write([]byte("from LAN"))
+		_, err = downstream.Write(bytes.Repeat([]byte("x"), 1200))
 		require.NoError(t, err)
-		buf := make([]byte, 100)
+		buf := make([]byte, 1300)
 		n, remote, err := server.ReadFrom(buf)
 		require.NoError(t, err)
 		require.Equal(t, tc.host, remote.(*net.UDPAddr).IP.String())
@@ -165,7 +170,7 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 		require.NoError(t, err)
 		n, err = downstream.Read(buf)
 		require.NoError(t, err)
-		require.Equal(t, "from LAN", string(buf[:n]))
+		require.Equal(t, bytes.Repeat([]byte("x"), 1200), buf[:n])
 	}
 
 	require.EqualValues(t, ipv4.DefaultTTL-1, observed.ttl4.Load())

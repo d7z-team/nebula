@@ -7,27 +7,37 @@ import (
 	"slices"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/header"
 	"github.com/stretchr/testify/require"
 )
 
+type discoveryMessage struct {
+	server  netip.Addr
+	payload []byte
+}
+
 type discoveryManagementRecordingWriter struct {
+	hosts            map[netip.Addr]*hostInfo
 	certificateState *certificateState
-	messages         chan []byte
+	messages         chan discoveryMessage
 }
 
 func (w *discoveryManagementRecordingWriter) SendMessageToVpnAddr(
 	_ header.MessageType,
 	_ header.MessageSubType,
-	_ netip.Addr,
+	server netip.Addr,
 	payload, _, _ []byte,
 ) {
-	w.messages <- slices.Clone(payload)
+	w.messages <- discoveryMessage{server, slices.Clone(payload)}
 }
 
-func (w *discoveryManagementRecordingWriter) GetHostInfo(netip.Addr) *hostInfo { return nil }
+func (w *discoveryManagementRecordingWriter) GetHostInfo(addr netip.Addr) *hostInfo {
+	return w.hosts[addr]
+}
 
 func (w *discoveryManagementRecordingWriter) GetCertState() *certificateState {
 	return w.certificateState
@@ -54,8 +64,7 @@ func newDiscoveryManagementTestNode(
 			UpdateInterval:     -1,
 		},
 		Relay: RelayOptions{
-			UseRelays: true,
-			Relays:    []netip.Addr{lighthouseIdentity.addr},
+			AdvertiseVia: []netip.Addr{lighthouseIdentity.addr},
 		},
 	})
 	require.NoError(t, err)
@@ -84,7 +93,7 @@ func TestDiscoverySnapshot(t *testing.T) {
 	snapshot := node.Discovery()
 	require.False(t, snapshot.IsLighthouse)
 	require.False(t, snapshot.IsRelay)
-	require.True(t, snapshot.UsesRelays)
+	require.Equal(t, Auto, snapshot.DefaultPathPolicy.Mode)
 	require.Equal(t, []netip.Addr{lighthouseIdentity.addr}, snapshot.Lighthouses)
 	require.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("198.51.100.2:4242")}, snapshot.ConfiguredEndpoints)
 	require.Equal(t, []netip.Addr{lighthouseIdentity.addr}, snapshot.AdvertisedRelays)
@@ -160,13 +169,104 @@ func TestRefreshPeerReliableQueueAndCancellation(t *testing.T) {
 
 	require.Equal(t, netip.MustParseAddr("10.42.0.76"), <-node.lighthouse.queryChan)
 	require.NoError(t, node.RefreshPeer(t.Context(), target))
+	for range 1000 {
+		node.lighthouse.QueryServer(target)
+	}
+	require.NoError(t, node.RefreshPeer(t.Context(), target))
+	require.Len(t, node.lighthouse.queryChan, 1)
 	require.Equal(t, target, <-node.lighthouse.queryChan)
 
 	node.lighthouse.queryChan <- netip.MustParseAddr("10.42.0.75")
 	result := make(chan error, 1)
-	go func() { result <- node.RefreshPeer(context.Background(), target) }()
+	go func() { result <- node.RefreshPeer(context.Background(), netip.MustParseAddr("10.42.0.78")) }()
 	require.NoError(t, node.Close())
 	require.ErrorIs(t, <-result, ErrNodeClosed)
+}
+
+func TestRefreshPeerConcurrentWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		node, _, _ := newDiscoveryManagementTestNode(t, nil)
+		markDiscoveryManagementTestNodeStarted(node)
+		lh := node.lighthouse
+		lh.queryChan = make(chan netip.Addr, 1)
+		wire := make(chan discoveryMessage, 3)
+		lh.sender = &discoveryManagementRecordingWriter{certificateState: node.engine.pki.getCertState(), messages: wire}
+		first, second := netip.MustParseAddr("10.42.0.76"), netip.MustParseAddr("10.42.0.77")
+		require.NoError(t, node.RefreshPeer(t.Context(), first))
+		results := make(chan error, 2)
+		for range 2 {
+			go func() { results <- node.RefreshPeer(t.Context(), second) }()
+		}
+		synctest.Wait()
+		require.Empty(t, results)
+
+		node.workers.Go(lh.runQueryWorker)
+		synctest.Wait()
+		require.Len(t, results, 2)
+		require.NoError(t, <-results)
+		require.NoError(t, <-results)
+		require.Len(t, wire, 2)
+		for _, want := range []netip.Addr{first, second} {
+			var query NebulaMeta
+			require.NoError(t, query.Unmarshal((<-wire).payload))
+			require.Equal(t, NebulaMeta_HostQuery, query.Type)
+			addr, _, err := query.Details.GetVpnAddrAndVersion()
+			require.NoError(t, err)
+			require.Equal(t, want, addr)
+		}
+	})
+}
+
+func TestLighthouseMixedWireVersions(t *testing.T) {
+	node, local, peer := newDiscoveryManagementTestNode(t, nil)
+	markDiscoveryManagementTestNodeStarted(node)
+	_, legacy, _ := newNodeTestIdentitiesFor(t, cert.Version1, local.identity.Certificate.Curve())
+	legacyServer := netip.MustParseAddr("10.42.0.3")
+	lh := node.lighthouse
+	lh.lighthouses = []netip.Addr{peer.addr, legacyServer}
+	lh.relaysForMe = []netip.Addr{peer.addr, peer.addr6}
+	wire := make(chan discoveryMessage, 4)
+	lh.sender = &discoveryManagementRecordingWriter{
+		certificateState: node.engine.pki.getCertState(),
+		hosts:            map[netip.Addr]*hostInfo{legacyServer: {connectionState: &connectionState{myCert: legacy.identity.Certificate}}},
+		messages:         wire,
+	}
+
+	read := func(server netip.Addr, kind NebulaMeta_MessageType) *NebulaMetaDetails {
+		t.Helper()
+		require.NotEmpty(t, wire)
+		m := <-wire
+		require.Equal(t, server, m.server)
+		var msg NebulaMeta
+		require.NoError(t, msg.Unmarshal(m.payload))
+		require.Equal(t, kind, msg.Type)
+		require.NotNil(t, msg.Details)
+		return msg.Details
+	}
+
+	target := netip.MustParseAddr("10.42.0.77")
+	require.NoError(t, lh.sendToLighthouses(t.Context(), NebulaMeta_HostQuery, target, nil, nil, nil))
+	v2 := read(peer.addr, NebulaMeta_HostQuery)
+	v1 := read(legacyServer, NebulaMeta_HostQuery)
+	require.Equal(t, netAddrToProtoAddr(target), v2.VpnAddr)
+	require.Zero(t, v2.OldVpnAddr)
+	require.Nil(t, v1.VpnAddr)
+	addr, version, err := v1.GetVpnAddrAndVersion()
+	require.NoError(t, err)
+	require.Equal(t, cert.Version1, version)
+	require.Equal(t, target, addr)
+
+	require.NoError(t, node.AdvertiseNow(t.Context()))
+	v2 = read(peer.addr, NebulaMeta_HostUpdateNotification)
+	v1 = read(legacyServer, NebulaMeta_HostUpdateNotification)
+	require.Nil(t, v2.VpnAddr)
+	require.Zero(t, v2.OldVpnAddr)
+	require.Equal(t, lh.relaysForMe, v2.GetRelays())
+	addr, version, err = v1.GetVpnAddrAndVersion()
+	require.NoError(t, err)
+	require.Equal(t, cert.Version1, version)
+	require.Equal(t, local.addr, addr)
+	require.Equal(t, []netip.Addr{peer.addr}, v1.GetRelays())
 }
 
 func TestAdvertiseNowProviderErrorsAndCancellation(t *testing.T) {
@@ -192,13 +292,13 @@ func TestAdvertiseNowProviderErrorsAndCancellation(t *testing.T) {
 		})
 		writer := &discoveryManagementRecordingWriter{
 			certificateState: node.engine.pki.getCertState(),
-			messages:         make(chan []byte, 1),
+			messages:         make(chan discoveryMessage, 1),
 		}
 		node.lighthouse.sender = writer
 		markDiscoveryManagementTestNodeStarted(node)
 		require.ErrorIs(t, node.AdvertiseNow(t.Context()), sentinel)
 		var update NebulaMeta
-		require.NoError(t, update.Unmarshal(<-writer.messages))
+		require.NoError(t, update.Unmarshal((<-writer.messages).payload))
 		require.Equal(t, NebulaMeta_HostUpdateNotification, update.Type)
 		require.Len(t, update.Details.V4AddrPorts, 1, "fixed endpoints must still be advertised when the provider fails")
 		require.Equal(t, netip.MustParseAddrPort("198.51.100.2:4242"), protoV4AddrPortToNetAddrPort(update.Details.V4AddrPorts[0]))
@@ -429,4 +529,14 @@ func TestDiscoveryReportFiltersBeforeLimit(t *testing.T) {
 		}
 	}
 	require.Equal(t, want, got.Endpoints)
+}
+
+func BenchmarkPendingLighthouseQuery(b *testing.B) {
+	node, _, _ := newDiscoveryManagementTestNode(b, nil)
+	peer := netip.MustParseAddr("10.42.0.77")
+	node.lighthouse.QueryServer(peer)
+	b.ReportAllocs()
+	for b.Loop() {
+		node.lighthouse.QueryServer(peer)
+	}
 }

@@ -9,6 +9,7 @@ require (
 	github.com/gogo/protobuf v1.3.2
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/crypto v0.58.0
+	golang.org/x/sync v0.23.0
 	google.golang.org/protobuf v1.36.12
 	gvisor.dev/gvisor v0.0.0-20261014193016-04d31b385980
 )

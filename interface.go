@@ -15,26 +15,26 @@ import (
 const mtu = 9001
 
 type packetEngine struct {
-	hostMap              *hostMap
-	outside              DatagramTransport
-	port                 atomic.Pointer[IPPort]
-	localUnsafe          bart.Lite
-	overlayBroadcasts    map[netip.Addr]struct{}
-	inboundPolicy        InboundPolicy
-	pki                  *pkiState
-	connectionManager    *connectionManager
-	handshakeManager     *handshakeManager
-	lightHouse           *lighthouse
-	myVpnAddrs           []netip.Addr
-	myVpnAddrsTable      *bart.Lite
-	myVpnNetworks        []netip.Prefix
-	myVpnNetworksTable   *bart.Lite
-	relayManager         *relayManager
-	rebindEpoch          atomic.Uint32
-	udpTxErrLimiter      *ratelimit.Limiter
-	udpRelayTxErrLimiter *ratelimit.Limiter
-	txOversizeLimiter    *ratelimit.Limiter
-	l                    *slog.Logger
+	paths              pathManager
+	hostMap            *hostMap
+	outside            DatagramTransport
+	port               atomic.Pointer[IPPort]
+	localUnsafe        bart.Lite
+	overlayBroadcasts  map[netip.Addr]struct{}
+	inboundPolicy      InboundPolicy
+	pki                *pkiState
+	connectionManager  *connectionManager
+	handshakeManager   *handshakeManager
+	lightHouse         *lighthouse
+	myVpnAddrs         []netip.Addr
+	myVpnAddrsTable    *bart.Lite
+	myVpnNetworks      []netip.Prefix
+	myVpnNetworksTable *bart.Lite
+	servesRelays       bool
+	rebindEpoch        atomic.Uint32
+	udpTxErrLimiter    *ratelimit.Limiter
+	txOversizeLimiter  *ratelimit.Limiter
+	l                  *slog.Logger
 }
 
 func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetEngine {
@@ -49,23 +49,19 @@ func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetE
 	cs := pki.getCertState()
 	hosts := newHostMap(logger)
 	f := &packetEngine{
-		l:             logger,
-		hostMap:       hosts,
-		outside:       opts.Transport,
-		inboundPolicy: opts.InboundPolicy,
-		pki:           pki,
-		relayManager: &relayManager{
-			l: logger, hostmap: hosts,
-			amRelay: opts.Relay.AmRelay, useRelays: opts.Relay.UseRelays && !opts.Relay.AmRelay,
-		},
-		myVpnNetworks:        cs.myVpnNetworks,
-		myVpnNetworksTable:   cs.myVpnNetworksTable,
-		myVpnAddrs:           cs.myVpnAddrs,
-		myVpnAddrsTable:      cs.myVpnAddrsTable,
-		overlayBroadcasts:    make(map[netip.Addr]struct{}),
-		udpTxErrLimiter:      newLogLimiter(),
-		udpRelayTxErrLimiter: newLogLimiter(),
-		txOversizeLimiter:    newLogLimiter(),
+		l:                  logger,
+		hostMap:            hosts,
+		outside:            opts.Transport,
+		inboundPolicy:      opts.InboundPolicy,
+		pki:                pki,
+		servesRelays:       opts.Relay.Serve,
+		myVpnNetworks:      cs.myVpnNetworks,
+		myVpnNetworksTable: cs.myVpnNetworksTable,
+		myVpnAddrs:         cs.myVpnAddrs,
+		myVpnAddrsTable:    cs.myVpnAddrsTable,
+		overlayBroadcasts:  make(map[netip.Addr]struct{}),
+		udpTxErrLimiter:    newLogLimiter(),
+		txOversizeLimiter:  newLogLimiter(),
 	}
 	for _, prefix := range cs.myVpnNetworks {
 		if prefix.Addr().Is4() && prefix.Bits() < 31 {

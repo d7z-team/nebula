@@ -14,7 +14,7 @@ type DiscoverySnapshot struct {
 	Lighthouses         []netip.Addr
 	ConfiguredEndpoints []netip.AddrPort
 	IsRelay             bool
-	UsesRelays          bool
+	DefaultPathPolicy   PeerPathPolicy
 	AdvertisedRelays    []netip.Addr
 }
 
@@ -45,12 +45,14 @@ func (n *Node) Discovery() DiscoverySnapshot {
 	advertisedRelays := cloneAddresses(n.lighthouse.relaysForMe)
 	slices.SortFunc(advertisedRelays, netip.Addr.Compare)
 
+	policy := n.engine.paths.config.Load().Default
+	policy.Relays = slices.Clone(policy.Relays)
 	return DiscoverySnapshot{
 		IsLighthouse:        n.lighthouse.amLighthouse,
 		Lighthouses:         lighthouses,
 		ConfiguredEndpoints: configuredEndpoints,
-		IsRelay:             n.engine.relayManager.amRelay,
-		UsesRelays:          n.engine.relayManager.useRelays,
+		IsRelay:             n.engine.servesRelays,
+		DefaultPathPolicy:   policy,
 		AdvertisedRelays:    advertisedRelays,
 	}
 }

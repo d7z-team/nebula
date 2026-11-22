@@ -49,6 +49,11 @@ func TestMachineIXHappyPath(t *testing.T) {
 	assert.Equal(t, []byte("world"), pt2)
 }
 
+func TestMachineUnknownSubtype(t *testing.T) {
+	_, err := NewMachine(cert.Version2, nil, nil, nil, true, 99)
+	require.ErrorIs(t, err, ErrUnknownSubtype)
+}
+
 func TestMachineInitiateErrors(t *testing.T) {
 	ca, _, caKey, _ := ct.NewTestCaCert(
 		cert.Version2, cert.Curve_CURVE25519, time.Time{}, time.Time{}, nil, nil, nil,
@@ -422,7 +427,17 @@ func TestMachineMsgIndexTracking(t *testing.T) {
 }
 
 func TestMachineThreeMessagePattern(t *testing.T) {
-	registerTestXXInfo(t)
+	subtypeInfos[header.HandshakeXXPSK0] = subtypeInfo{
+		pattern: noise.HandshakeXX,
+		msgs: []msgFlags{
+			{expectsPayload: true, expectsCert: false},
+			{expectsPayload: true, expectsCert: true},
+			{expectsPayload: false, expectsCert: true},
+		},
+	}
+	t.Cleanup(func() {
+		delete(subtypeInfos, header.HandshakeXXPSK0)
+	})
 
 	// Use HandshakeXX (3 messages) to verify the Machine handles multi-message
 	// patterns correctly. XX flow:
@@ -490,11 +505,6 @@ func TestMachineThreeMessagePattern(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("three messages"), pt1)
 }
-
-// NOTE: ErrIncompleteHandshake is tested implicitly. It can't be triggered with
-// IX since the cert is always in the payload. A 3-message pattern test (HybridIX)
-// should exercise the case where cert arrives in msg3 and verify that completing
-// without it fails.
 
 func TestMachineExpiredCert(t *testing.T) {
 	ca, _, caKey, _ := ct.NewTestCaCert(

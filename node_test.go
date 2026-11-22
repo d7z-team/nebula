@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/slackhq/nebula/cert"
+	"github.com/slackhq/nebula/header"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,6 +29,7 @@ type memoryDatagramNetwork struct {
 	mu        sync.RWMutex
 	endpoints map[netip.AddrPort]*memoryDatagramTransport
 	blocked   map[memoryDatagramPath]struct{}
+	writes    map[memoryDatagramPath]datagramCounts
 }
 
 type memoryDatagramPath struct {
@@ -49,6 +51,7 @@ func newMemoryDatagramNetwork(addrs ...netip.AddrPort) []*memoryDatagramTranspor
 	network := &memoryDatagramNetwork{
 		endpoints: make(map[netip.AddrPort]*memoryDatagramTransport, len(addrs)),
 		blocked:   make(map[memoryDatagramPath]struct{}),
+		writes:    make(map[memoryDatagramPath]datagramCounts),
 	}
 	transports := make([]*memoryDatagramTransport, len(addrs))
 	for i, addr := range addrs {
@@ -60,6 +63,14 @@ func newMemoryDatagramNetwork(addrs ...netip.AddrPort) []*memoryDatagramTranspor
 		network.endpoints[addr] = transport
 	}
 	return transports
+}
+
+type datagramCounts struct{ total, relayedIP int }
+
+func (n *memoryDatagramNetwork) writesTo(from, to netip.AddrPort) datagramCounts {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.writes[memoryDatagramPath{from: from, to: to}]
 }
 
 func (n *memoryDatagramNetwork) blockBoth(a, b netip.AddrPort) {
@@ -84,10 +95,18 @@ func (t *memoryDatagramTransport) ReadFrom(buffer []byte) (int, netip.AddrPort, 
 }
 
 func (t *memoryDatagramTransport) WriteTo(packet []byte, destination netip.AddrPort) error {
-	t.network.mu.RLock()
+	t.network.mu.Lock()
+	key := memoryDatagramPath{from: t.addr, to: destination}
+	counts := t.network.writes[key]
+	counts.total++
+	var outer, inner header.H
+	if outer.Parse(packet) == nil && outer.Type == header.Message && outer.Subtype == header.MessageRelay && inner.Parse(packet[header.Len:]) == nil && inner.Type == header.Message && inner.Subtype == header.MessageNone {
+		counts.relayedIP++
+	}
+	t.network.writes[key] = counts
 	peer := t.network.endpoints[destination]
 	_, blocked := t.network.blocked[memoryDatagramPath{from: t.addr, to: destination}]
-	t.network.mu.RUnlock()
+	t.network.mu.Unlock()
 	if peer == nil {
 		return errors.New("unknown in-memory datagram destination")
 	}
@@ -363,7 +382,7 @@ func TestNodeLighthousePunchAndRelay(t *testing.T) {
 	relayNode, err := New(t.Context(), Options{
 		Identities: []Identity{relayIdentity}, CAPool: pool, Transport: transports[0], Logger: logger,
 		Lighthouse: LighthouseOptions{AmLighthouse: true},
-		Relay:      RelayOptions{AmRelay: true},
+		Relay:      RelayOptions{Serve: true},
 	})
 	require.NoError(t, err)
 	peerOptions := func(identity Identity, transport DatagramTransport, advertised netip.AddrPort) Options {
@@ -376,7 +395,7 @@ func TestNodeLighthousePunchAndRelay(t *testing.T) {
 				UpdateInterval:     time.Hour,
 			},
 			Punchy: PunchyOptions{Punch: true, Respond: true, Delay: time.Millisecond, RespondDelay: time.Millisecond},
-			Relay:  RelayOptions{UseRelays: true, Relays: []netip.Addr{relayAddr}},
+			Relay:  RelayOptions{AdvertiseVia: []netip.Addr{relayAddr}},
 		}
 	}
 	nodeA, err := New(t.Context(), peerOptions(a.identity, transports[1], underlayA))

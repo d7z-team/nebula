@@ -229,7 +229,11 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 			return
 		}
 		h := f.hostMap.QueryVpnAddr(peer)
-		if h == nil {
+		var route tunnelRoute
+		if h != nil {
+			route = f.currentRoute(h)
+		}
+		if !route.Endpoint.IsValid() {
 			p.mu.Unlock()
 			connectErr = p.node.ConnectPeer(ctx, peer)
 			continue
@@ -245,13 +249,24 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 			p.recordDrop(false, peer, ip, "peer certificate does not authorize destination", 1)
 			continue
 		}
-		if !f.lightHouse.amLighthouse {
-			h.TryPromoteBest(f)
-		}
 		if cap(out) < len(packet.data)+header.MaxOverhead {
 			out = make([]byte, 0, len(packet.data)+header.MaxOverhead)
 		}
-		path, err := f.sendTo(header.Message, header.MessageNone, h.connectionState, h, netip.AddrPort{}, packet.data, nonce, out)
+		path, err := f.sendOnRoute(header.Message, header.MessageNone, h, route, packet.data, nonce, out)
+		if err == errWritePolicy || (path == (TunnelPath{}) && errors.Is(err, ErrPeerUnavailable)) {
+			// No datagram was submitted. Keep this frame ahead of later packets
+			// if the original queue is still attached and has room.
+			p.mu.Lock()
+			if p.queues[peer] == q && len(q.packets) < maxCachedPackets && p.queued < maxQueuedIPPackets {
+				q.packets = append(q.packets, queuedIP{})
+				copy(q.packets[1:], q.packets[:len(q.packets)-1])
+				q.packets[0] = packet
+				p.queued++
+				p.mu.Unlock()
+				continue
+			}
+			p.mu.Unlock()
+		}
 		if err != nil {
 			p.recordDrop(false, peer, ip, err.Error(), 1)
 		} else if last := h.lastDataPath.Load(); last == nil || *last != path {

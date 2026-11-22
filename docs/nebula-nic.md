@@ -26,7 +26,9 @@ s.AddRoute(tcpip.Route{
 })
 ```
 
-此时应用拨号的目的地址为 `192.168.50.20`。`PacketBuffer.EgressRoute.NextHop` 提供网关的 overlay 地址，`StaticHosts` 或 lighthouse 提供该网关的外层 UDP 地址。内层 IP 目的地址一直是下游主机。网关侧通过以下调用启用双向转发，`vpnNIC` 和 `lanNIC` 为其宿主栈中的接口 ID。
+应用拨号时使用下游地址 `192.168.50.20`。gVisor 在 `PacketBuffer.EgressRoute.NextHop` 中传入网关地址 `10.42.0.254`，Nebula 通过静态配置或 lighthouse 找到网关的外层地址。
+
+在网关上，为 Nebula 和 LAN 两张网卡启用转发。`vpnNIC` 和 `lanNIC` 是它们在网关栈中的 NIC ID。
 
 ```go
 for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
@@ -53,15 +55,28 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 | 选择 MTU | 默认 1300，构造时接受 1280 至 9001，运行时 `SetMTU` 将值限制在该范围。外层传输还要容纳 Nebula 封装开销。 |
 | 停止服务 | 宿主管理 socket 的关闭或 deadline。`node.Close()` 取消数据端口并关闭外层传输，`node.Wait()` 等待节点任务退出并报告致命传输错误。其他 NIC 和整个栈继续由宿主管理。 |
 
-直接集成其他三层设备时，使用 `node.OpenIPPort(deliver)`。回调在接收线程上借用只读 IP 包，异步处理应先复制并尽快返回。发送完整的单播 IP 包使用 `port.WriteIP(nextHop, packet)`，直达 overlay 时可传零值 `netip.Addr{}`，发往下游子网时传网关的 overlay 地址。返回成功表示端口已接收包副本并安排发送。用完后调用 `port.Close()`。
+### 接入其他三层设备
+
+调用 `node.OpenIPPort(deliver)` 取得端口。回调在接收线程上借用只读 IP 包，异步处理时先复制再返回。用 `port.WriteIP(nextHop, packet)` 提交完整的单播 IP 包。直达 overlay 地址时，下一跳可传零值 `netip.Addr{}`。访问下游子网时，传网关的 overlay 地址。返回成功表示包副本已入队，用完端口后调用 `port.Close()`。
 
 ## 发现与运行时管理
 
-- **配置发现。** 已知 peer 可直接填入 `Lighthouse.StaticHosts`。提供发现服务的节点设置 `Lighthouse.AmLighthouse`。客户端在 `Lighthouse.Hosts` 填入其 overlay 地址，并为每个 lighthouse 提供静态外层 endpoint。通过 `AdvertiseEndpoints` 或 `EndpointProvider` 提供本机可通告的地址。动态回调串行执行，应响应 context 取消，重新通告或重绑安排在回调返回后。
-- **选择路径。** 每个报告来源分别保留最多 10 个 IPv4 endpoint、10 个 IPv6 endpoint 和 10 个 relay。overlay 地址先从报告的外层 endpoint 中滤除。每次握手向去重后的直连候选发送请求，先使用 `Options.PreferredRanges` 内的地址，各组内按 IPv6、非私有 IPv4、私有 IPv4 排序，同级按地址和端口排序。收到错误身份的地址会被暂时跳过，成功握手后可重新参与选路。
-- **使用 relay。** 中继节点设置 `Relay.AmRelay`，目标节点在 `Relay.Relays` 填入可用中继的 overlay 地址并向 lighthouse 通告，拨号端启用 `Relay.UseRelays`。经过中继时，gVisor 路由的下一跳仍指向承载内层流量的目标 peer。
-- **更新地址。** `SetPeerEndpoints` 替换指定 peer 的静态候选，已学习的地址和现有隧道各自独立。`RefreshPeer` 向 lighthouse 排队查询，`AdvertiseNow` 立即通告本机地址。实现 `RebindableTransport` 的传输可以调用 `node.Rebind()` 切换底层地址并重新通告。
-- **管理连接。** `ConnectPeer(ctx, addr)` 等待隧道建立，取消 context 结束本次等待，共享握手可继续。`DisconnectPeer` 和 `DisconnectAll` 拆除隧道，后续流量可以重新触发握手。
+已知外层地址时，在 `Lighthouse.StaticHosts` 中将 peer 的 overlay 地址映射到 UDP endpoint。使用 lighthouse 时，服务端设置 `Lighthouse.AmLighthouse`，客户端把服务端的 overlay 地址加入 `Lighthouse.Hosts`，并为每个 lighthouse 配置静态 endpoint。
+
+本机通过 `AdvertiseEndpoints` 通告固定地址，通过 `EndpointProvider` 提供动态地址。节点串行调用 provider。回调应响应 context 取消，在回调返回后再发起新的通告或重绑。
+
+| 操作 | API 与结果 |
+| --- | --- |
+| 查找或刷新 peer | `PeerDiscovery(addr)` 返回已缓存的地址和中转。`RefreshPeer(ctx, addr)` 向 lighthouse 排队查询，同一地址共享在途请求。队列满时可通过 context 取消等待。配置的 lighthouse 地址和无需发现的节点会直接返回。 |
+| 更新静态候选 | `SetPeerEndpoints(addr, endpoints)` 替换该 peer 的静态地址，已学习的地址和已建立的隧道继续可用。 |
+| 通告本机地址 | `AdvertiseNow(ctx)` 获取动态地址并向 lighthouse 发送更新。底层传输实现 `RebindableTransport` 时，可用 `node.Rebind()` 重绑并重新通告。 |
+| 建立或关闭连接 | `ConnectPeer(ctx, addr)` 等待经过认证且具有可用出口的隧道。取消 context 结束本次等待，共享握手可继续。`DisconnectPeer` 和 `DisconnectAll` 拆除隧道，后续流量可重新触发握手。 |
+
+每个报告来源最多保留 10 个 IPv4 endpoint、10 个 IPv6 endpoint 和 10 个 relay。直连握手轮换候选，先尝试 `Options.PreferredRanges` 中的地址，组内依次优先 IPv6、非私有 IPv4 和私有 IPv4。
+
+## 直连、中转与链路健康
+
+客户端访问下游子网时，gVisor 的路由选定网关，Nebula 的路径策略决定如何到达该网关。要指定中转或调查线路抖动，按网关的 overlay 地址配置策略并检查探测的去程和回程。[路径配置与健康检查](paths.md)
 
 ## 排错
 

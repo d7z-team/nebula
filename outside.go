@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/slackhq/nebula/header"
@@ -59,7 +60,9 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 		return
 
 	case header.RecvError:
-		f.handleRecvError(via.UdpAddr, h)
+		if !via.IsRelayed {
+			f.handleRecvError(via.UdpAddr, h)
+		}
 		return
 	}
 
@@ -111,10 +114,47 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 		return
 	}
 
-	// Roam before we respond
-	f.handleHostRoaming(hostinfo, via)
-	hostinfo.markIn()
-
+	path := receivedRoute(via)
+	if via.IsRelayed && !slices.Contains(hostinfo.vpnAddrs, via.relay.PeerAddr) {
+		return
+	}
+	permitted := f.allowed(hostinfo, path)
+	probe := h.Type == header.Test && isPathProbe(out)
+	if probe && h.Subtype == header.TestReply {
+		f.finishReply(hostinfo, path, out, permitted)
+		return
+	}
+	if !permitted {
+		// A peer can echo Test on the incoming relay while still sending IP over
+		// its former direct exit. Re-establish over our verified relay so that
+		// it also selects the permitted return path for ordinary traffic.
+		if !via.IsRelayed && h.Type == header.Message && h.Subtype == header.MessageNone {
+			active := f.currentRoute(hostinfo)
+			if active.leg != nil {
+				now := time.Now()
+				s := &hostinfo.paths
+				s.mu.Lock()
+				due := !now.Before(s.recoverAfter)
+				if due {
+					s.recoverAfter = now.Add(30 * time.Second)
+				}
+				s.mu.Unlock()
+				if due {
+					f.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
+				}
+			}
+		}
+		return
+	}
+	if via.IsRelayed {
+		hostinfo.relayState.addRelayAddress(via.relayHI.vpnAddrs[0])
+	}
+	if !probe {
+		f.handleHostRoaming(hostinfo, via)
+		if h.Type != header.Test {
+			hostinfo.markIn()
+		}
+	}
 	switch h.Type {
 	case header.Message:
 		switch h.Subtype {
@@ -126,7 +166,6 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 		}
 
 	case header.LightHouse:
-		//TODO: assert via is not relayed
 		rxc.lhh.HandleRequest(via.UdpAddr, hostinfo.vpnAddrs, out)
 
 	case header.Test:
@@ -141,7 +180,7 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 				}
 				return
 			}
-			f.send(header.Test, header.TestReply, hostinfo.connectionState, hostinfo, out, rxc.nb, rxc.scratch[:0])
+			f.sendOnRoute(header.Test, header.TestReply, hostinfo, path, out, rxc.nb, rxc.scratch[:0])
 		default:
 			hostinfo.logger(f.l).Error("IsValidSubType was true, but unexpected test subtype seen", "from", via, "header", h)
 			return
@@ -152,7 +191,9 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 		f.closeTunnel(hostinfo)
 
 	case header.Control:
-		f.relayManager.HandleControlMsg(hostinfo, out, f)
+		if !via.IsRelayed {
+			f.handleRelayControl(hostinfo, out)
+		}
 
 	default:
 		hostinfo.logger(f.l).Error("IsValidSubType was true, but unexpected message type seen", "from", via, "header", h)
@@ -161,15 +202,20 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 
 func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSender, packet []byte, rxc *rxContext) {
 	h := &rxc.h
-	// Successfully validated the thing. Get rid of the relay header and the AEAD tag
+	// The outer header and authentication tag surround the inner Nebula datagram.
 	signedPayload := packet[header.Len : len(packet)-hostinfo.connectionState.dKey.Overhead()]
-	// Pull the Roaming parts up here, and return in all call paths.
+	var inner header.H
+	if via.IsRelayed || !f.allowed(hostinfo, receivedRoute(via)) || inner.Parse(signedPayload) != nil || (inner.Type == header.Message && inner.Subtype == header.MessageRelay) {
+		return
+	}
 	f.handleHostRoaming(hostinfo, via)
 	// Track usage of both the hostInfo and the relay for the received & authenticated packet
-	hostinfo.markIn()
-	f.connectionManager.recordRelayUse(h.RemoteIndex)
+	if inner.Type != header.Test {
+		hostinfo.markIn()
+		f.connectionManager.recordRelayUse(h.RemoteIndex)
+	}
 
-	relay, ok := hostinfo.relayState.QueryRelayForByIdx(h.RemoteIndex)
+	relay, ok := hostinfo.relayState.mappingByIndex(h.RemoteIndex)
 	if !ok {
 		// The only way this happens is if hostmap has an index to the correct hostInfo, but the hostInfo is missing
 		// its internal mapping. This should never happen.
@@ -179,6 +225,9 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 
 	switch relay.Type {
 	case relayTypeTerminal:
+		if relay.State != relayEstablished && inner.Type != header.Handshake {
+			return
+		}
 		// If I am the target of this relay, process the unwrapped packet
 		// From this recursive point, all these variables are 'burned'. We shouldn't rely on them again.
 		via = packetSender{
@@ -200,35 +249,24 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 			return
 		}
 
-		// If that relay is established, forward the payload through it.
-		if targetRelay.State == relayEstablished {
-			switch targetRelay.Type {
-			case relayTypeForwarding:
-				// Forward this packet through the relay tunnel, rebuilding it in place.
-				// Encode overwrites the old outer header, and the new AEAD tag lands where the old one was
-				fwdBuf := packet[:0]
-				out, err := f.prepareSendVia(targetHI, targetRelay, signedPayload, rxc.nb, fwdBuf, true)
-				if err == nil {
-					if err := f.outside.WriteTo(out, targetHI.GetRemote()); err != nil {
-						targetHI.logger(f.l).Debug("failed to forward relay datagram", "error", err)
-					}
-				}
-			case relayTypeTerminal:
-				hostinfo.logger(f.l).Error("Unexpected relay Type of Terminal")
-				return
-			default:
-				if f.l.Enabled(context.Background(), slog.LevelDebug) {
-					hostinfo.logger(f.l).Debug("Unexpected targetRelay Type", "from", via, "relayType", targetRelay.Type)
-				}
-				return
-			}
-		} else {
-			hostinfo.logger(f.l).Info("Unexpected target relay state",
-				"relayTo", relay.PeerAddr,
-				"relayFrom", hostinfo.vpnAddrs[0],
-				"targetRelayState", targetRelay.State,
-			)
+		if relay.State != relayEstablished || targetRelay.State != relayEstablished || targetRelay.Type != relayTypeForwarding {
+			hostinfo.logger(f.l).Debug("relay mapping unavailable", "relayTo", relay.PeerAddr, "state", relay.State, "targetState", targetRelay.State, "targetType", targetRelay.Type)
 			return
+		}
+		endpoint := targetHI.GetRemote()
+		if !endpoint.IsValid() || targetHI.paths.failedDirect(endpoint) {
+			return
+		}
+		if inner.Type != header.Test {
+			targetHI.markOutOnly()
+		}
+		// Reuse the authenticated frame's outer header and tag space.
+		out, err := f.prepareSendVia(targetHI, targetRelay, signedPayload, rxc.nb, packet[:0], true)
+		if err == nil {
+			err = f.writePath(targetHI, tunnelRoute{TunnelPath: TunnelPath{Endpoint: endpoint}}, out, false, hostinfo)
+		}
+		if err != nil {
+			targetHI.logger(f.l).Debug("failed to forward relay datagram", "error", err)
 		}
 	default:
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -258,39 +296,23 @@ func (f *packetEngine) closeTunnel(hostInfo *hostInfo) bool {
 
 // sendCloseTunnel is a helper function to send a proper close tunnel packet to a remote
 func (f *packetEngine) sendCloseTunnel(h *hostInfo) {
-	f.send(header.CloseTunnel, 0, h.connectionState, h, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
-}
-
-// sendCloseTunnelWithRoute uses a route captured before local tunnel removal.
-// Removal may disestablish the relay maps, but the immutable relay value and
-// hostInfo remain safe for this final best-effort protocol notification.
-func (f *packetEngine) sendCloseTunnelWithRoute(h *hostInfo, remote netip.AddrPort, relayHostInfo *hostInfo, relayRoute *relay) {
-	f.sendEncryptedWithRoute(header.CloseTunnel, 0, h.connectionState, h, remote, relayHostInfo, relayRoute, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
+	f.SendMessageToHostInfo(header.CloseTunnel, 0, h, nil, make([]byte, 12), make([]byte, mtu))
 }
 
 func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
-	curRemote := hostinfo.GetRemote()
-	if !via.IsRelayed && curRemote != via.UdpAddr {
-		if !hostinfo.lastRoam.IsZero() && via.UdpAddr == hostinfo.lastRoamRemote && time.Since(hostinfo.lastRoam) < roamingSuppressDuration {
-			if f.l.Enabled(context.Background(), slog.LevelDebug) {
-				hostinfo.logger(f.l).Debug("Suppressing roam back to previous remote",
-					"suppressDuration", roamingSuppressDuration,
-					"udpAddr", curRemote,
-					"newAddr", via.UdpAddr,
-				)
-			}
-			return
-		}
-
-		hostinfo.logger(f.l).Info("Host roamed to new udp ip/port.",
-			"udpAddr", curRemote,
-			"newAddr", via.UdpAddr,
-		)
-		hostinfo.lastRoam = time.Now()
-		hostinfo.lastRoamRemote = curRemote
-		hostinfo.SetRemote(via.UdpAddr)
+	if via.IsRelayed || via.UdpAddr == hostinfo.GetRemote() {
+		return
 	}
-
+	if via.UdpAddr == hostinfo.lastRoamRemote && time.Since(hostinfo.lastRoam) < roamingSuppressDuration {
+		return
+	}
+	hostinfo.lastRoam, hostinfo.lastRoamRemote = time.Now(), via.UdpAddr
+	hostinfo.remotes.LearnRemote(hostinfo.vpnAddrs[0], via.UdpAddr)
+	s := &hostinfo.paths
+	s.mu.Lock()
+	s.roam = via.UdpAddr
+	s.nextBackup = time.Time{}
+	s.mu.Unlock()
 }
 
 func (f *packetEngine) deliverIP(hostinfo *hostInfo, packet []byte) {
@@ -319,7 +341,9 @@ func (f *packetEngine) deliverIP(hostinfo *hostInfo, packet []byte) {
 
 func (f *packetEngine) sendRecvError(endpoint netip.AddrPort, index uint32) {
 	b := header.Encode(make([]byte, header.Len), header.Version, header.RecvError, 0, index, 0)
-	_ = f.outside.WriteTo(b, endpoint)
+	if _, ok := f.paths.control.Allow(); ok {
+		_ = f.outside.WriteTo(b, endpoint)
+	}
 	if f.l.Enabled(context.Background(), slog.LevelDebug) {
 		f.l.Debug("Recv error sent",
 			"index", index,
@@ -351,7 +375,9 @@ func (f *packetEngine) handleRecvError(addr netip.AddrPort, h *header.H) {
 		return
 	}
 
-	f.closeTunnel(hostinfo)
-	// We also delete it from pending hostmap to allow for fast reconnect.
-	f.handshakeManager.DeleteHostInfo(hostinfo)
+	// RecvError is unauthenticated. Confirm the tunnel before retiring it.
+	hostinfo.paths.mu.Lock()
+	hostinfo.paths.nextActive = time.Time{}
+	hostinfo.paths.demand = time.Now()
+	hostinfo.paths.mu.Unlock()
 }

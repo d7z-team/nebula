@@ -54,9 +54,8 @@ type LighthouseOptions struct {
 }
 
 type RelayOptions struct {
-	AmRelay   bool
-	UseRelays bool
-	Relays    []netip.Addr
+	Serve        bool
+	AdvertiseVia []netip.Addr
 }
 
 // Options configures the Nebula tunnel and its caller-supplied transport.
@@ -70,6 +69,7 @@ type Options struct {
 	Lighthouse      LighthouseOptions
 	Punchy          PunchyOptions
 	Relay           RelayOptions
+	Paths           PathOptions
 	Handshake       HandshakeOptions
 	Connections     ConnectionOptions
 	PreferredRanges []netip.Prefix
@@ -112,13 +112,13 @@ func New(parent context.Context, options Options) (*Node, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	engine := newPacketEngine(pki, &options, logger)
-	punchy := newPunchManager(logger, options.Transport, options.Punchy)
+	punchy := newPunchManager(logger, options.Punchy)
 	lighthouse, err := newLighthouse(ctx, logger, pki.getCertState(), punchy, &options)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	handshake := newHandshakeManager(logger, engine.hostMap, lighthouse, options.Transport, options.Handshake)
+	handshake := newHandshakeManager(logger, engine.hostMap, lighthouse, options.Handshake)
 	connections := newConnectionManager(logger, engine.hostMap, punchy, options.Connections)
 	engine.handshakeManager = handshake
 	engine.connectionManager = connections
@@ -135,6 +135,16 @@ func New(parent context.Context, options Options) (*Node, error) {
 		engine: engine, handshake: handshake, connections: connections,
 		punchy: punchy, lighthouse: lighthouse,
 		transportAddr: unmapAddrPort(transportAddr),
+	}
+	for _, relay := range lighthouse.relaysForMe {
+		if err := n.validatePeerAddress(relay); err != nil {
+			cancel()
+			return nil, fmt.Errorf("advertised relay: %w", err)
+		}
+	}
+	if err := engine.paths.init(n, options.Paths); err != nil {
+		cancel()
+		return nil, err
 	}
 	// Keep Wait blocked through shutdown, including when it is called before Start.
 	n.workers.Add(1)
@@ -163,6 +173,7 @@ func (n *Node) Start() error {
 	n.punchy.ctx = n.ctx
 	n.workers.Go(func() { n.handshake.Run(n.ctx) })
 	n.workers.Go(func() { n.punchy.run(n.ctx) })
+	n.workers.Go(n.runPathChecks)
 	n.workers.Go(func() { n.connections.Start(n.ctx) })
 	n.workers.Go(n.lighthouse.runQueryWorker)
 	n.workers.Go(n.lighthouse.runUpdateWorker)

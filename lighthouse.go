@@ -25,8 +25,7 @@ type discoverySender interface {
 }
 
 type lighthouse struct {
-	//TODO: We need a timer wheel to kick out vpnAddrs that haven't reported in a long time
-	sync.RWMutex //Because we concurrently read and write to our maps
+	sync.RWMutex
 	ctx          context.Context
 	amLighthouse bool
 
@@ -61,6 +60,7 @@ type lighthouse struct {
 
 	updateTrigger chan struct{}
 	queryChan     chan netip.Addr
+	queuedQueries sync.Map // overlay address to *pendingQuery, while enqueueing or sending
 	updateGate    chan struct{}
 
 	l *slog.Logger
@@ -91,7 +91,7 @@ func newLighthouse(ctx context.Context, l *slog.Logger, cs *certificateState, p 
 		updateGate:         make(chan struct{}, 1),
 		lighthouses:        cloneAddresses(cfg.Hosts),
 		advertiseAddrs:     slices.Clone(cfg.AdvertiseEndpoints),
-		relaysForMe:        cloneAddresses(opts.Relay.Relays),
+		relaysForMe:        cloneAddresses(opts.Relay.AdvertiseVia),
 		preferredRanges:    slices.Clone(opts.PreferredRanges),
 		updateInterval:     interval,
 		staticList:         make(map[netip.Addr]struct{}, len(cfg.StaticHosts)),
@@ -161,43 +161,72 @@ func (lh *lighthouse) setStaticEndpoints(addr netip.Addr, endpoints []netip.Addr
 	return nil
 }
 
-// QueryServer is asynchronous and non-blocking, no reply should be expected.
-// If the query channel is full, the query is dropped.
-func (lh *lighthouse) QueryServer(vpnAddr netip.Addr) {
-	vpnAddr = vpnAddr.Unmap()
-	// Don't put lighthouse addrs in the query channel because we can't query lighthouses about lighthouses
-	if lh.amLighthouse || lh.IsLighthouseAddr(vpnAddr) {
-		return
-	}
-
-	select {
-	case lh.queryChan <- vpnAddr:
-	default:
-	}
+type pendingQuery struct {
+	ready chan struct{}
+	sent  bool
 }
 
-// queryServerContext queues a query without the best-effort dropping used by
-// the data path. It returns once the query is queued; it does not wait for a
-// lighthouse response.
-func (lh *lighthouse) queryServerContext(ctx context.Context, vpnAddr netip.Addr) error {
-	vpnAddr = vpnAddr.Unmap()
-	if lh.amLighthouse || lh.IsLighthouseAddr(vpnAddr) || len(lh.lighthouses) == 0 {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if lh.ctx.Err() != nil {
-		return ErrNodeClosed
-	}
+// QueryServer schedules a best-effort discovery query. Identical pending queries share one send.
+func (lh *lighthouse) QueryServer(addr netip.Addr) { _ = lh.queryServerContext(nil, addr) }
 
-	select {
-	case lh.queryChan <- vpnAddr:
+// A non-nil context requests reliable enqueueing, including when the queue is full.
+func (lh *lighthouse) queryServerContext(ctx context.Context, addr netip.Addr) error {
+	addr = addr.Unmap()
+	if lh.amLighthouse || len(lh.lighthouses) == 0 || lh.IsLighthouseAddr(addr) {
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-lh.ctx.Done():
-		return ErrNodeClosed
+	}
+	for {
+		if lh.ctx.Err() != nil {
+			return ErrNodeClosed
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var request *pendingQuery
+		existing, joined := lh.queuedQueries.Load(addr)
+		if !joined {
+			request = &pendingQuery{ready: make(chan struct{})}
+			existing, joined = lh.queuedQueries.LoadOrStore(addr, request)
+		}
+		if joined {
+			if ctx == nil {
+				return nil
+			}
+			other := existing.(*pendingQuery)
+			select {
+			case <-other.ready:
+				if other.sent {
+					return nil
+				}
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-lh.ctx.Done():
+				return ErrNodeClosed
+			}
+		}
+		var err error
+		if ctx == nil {
+			select {
+			case lh.queryChan <- addr:
+				request.sent = true
+			default:
+			}
+		} else {
+			select {
+			case lh.queryChan <- addr:
+				request.sent = true
+			case <-ctx.Done():
+				err = ctx.Err()
+			case <-lh.ctx.Done():
+				err = ErrNodeClosed
+			}
+		}
+		if !request.sent {
+			lh.queuedQueries.Delete(addr)
+		}
+		close(request.ready)
+		return err
 	}
 }
 
@@ -321,7 +350,7 @@ func (lh *lighthouse) runQueryWorker() {
 		return
 	}
 
-	nb := make([]byte, 12, 12)
+	nb := make([]byte, 12)
 	out := make([]byte, mtu)
 
 	for {
@@ -329,89 +358,61 @@ func (lh *lighthouse) runQueryWorker() {
 		case <-lh.ctx.Done():
 			return
 		case addr := <-lh.queryChan:
-			lh.innerQueryServer(addr, nb, out)
+			_ = lh.sendToLighthouses(lh.ctx, NebulaMeta_HostQuery, addr, nil, nb, out)
+			lh.queuedQueries.Delete(addr)
 		}
 	}
 }
 
-func (lh *lighthouse) innerQueryServer(addr netip.Addr, nb, out []byte) {
-	if lh.IsLighthouseAddr(addr) {
-		return
-	}
-
-	msg := &NebulaMeta{
-		Type:    NebulaMeta_HostQuery,
-		Details: &NebulaMetaDetails{},
-	}
-
-	var v1Query, v2Query []byte
-	var err error
-	var v cert.Version
-	lighthouses := lh.lighthouses
-
-	for _, lhVpnAddr := range lighthouses {
-		hi := lh.sender.GetHostInfo(lhVpnAddr)
-		if hi != nil {
-			v = hi.connectionState.myCert.Version()
+// sendToLighthouses encodes a query or self-advertisement once per wire version.
+func (lh *lighthouse) sendToLighthouses(ctx context.Context, kind NebulaMeta_MessageType, addr netip.Addr, record *discoveryRecord, nonce, out []byte) error {
+	var encoded [cert.Version2 + 1][]byte
+	for _, server := range lh.lighthouses {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if lh.ctx.Err() != nil {
+			return ErrNodeClosed
+		}
+		var v cert.Version
+		if h := lh.sender.GetHostInfo(server); h != nil {
+			v = h.connectionState.myCert.Version()
 		} else {
 			v = lh.sender.GetCertState().initiatingVersion
 		}
-
-		if v == cert.Version1 {
-			if !addr.Is4() {
-				lh.l.Error("Can't query lighthouse for v6 address using a v1 protocol",
-					"queryVpnAddr", addr,
-					"lighthouseAddr", lhVpnAddr,
-				)
-				continue
-			}
-
-			if v1Query == nil {
-				b := addr.As4()
-				msg.Details.VpnAddr = nil
-				msg.Details.OldVpnAddr = binary.BigEndian.Uint32(b[:])
-
-				v1Query, err = msg.Marshal()
-				if err != nil {
-					lh.l.Error("Failed to marshal lighthouse v1 query payload",
-						"error", err,
-						"queryVpnAddr", addr,
-						"lighthouseAddr", lhVpnAddr,
-					)
-					continue
-				}
-			}
-
-			lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v1Query, nb, out)
-
-		} else if v == cert.Version2 {
-			if v2Query == nil {
-				msg.Details.OldVpnAddr = 0
-				msg.Details.VpnAddr = netAddrToProtoAddr(addr)
-
-				v2Query, err = msg.Marshal()
-				if err != nil {
-					lh.l.Error("Failed to marshal lighthouse v2 query payload",
-						"error", err,
-						"queryVpnAddr", addr,
-						"lighthouseAddr", lhVpnAddr,
-					)
-					continue
-				}
-			}
-
-			lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v2Query, nb, out)
-
-		} else {
-			lh.l.Debug("unsupported protocol version",
-				"op", "query",
-				"queryVpnAddr", addr,
-				"version", v,
-			)
+		if v != cert.Version1 && v != cert.Version2 {
+			lh.l.Debug("unsupported lighthouse wire version", "version", v)
 			continue
 		}
+		if encoded[v] == nil {
+			details := &NebulaMetaDetails{}
+			// A v2 update identifies its sender through the authenticated session.
+			if kind == NebulaMeta_HostQuery || v == cert.Version1 {
+				if err := details.setVPNAddr(addr, v); err != nil {
+					lh.l.Debug("invalid lighthouse message address", "addr", addr, "error", err)
+					continue
+				}
+			}
+			if record != nil {
+				record.appendTo(details, v)
+			}
+			msg := NebulaMeta{Type: kind, Details: details}
+			data, err := msg.Marshal()
+			if err != nil {
+				lh.l.Error("failed to marshal lighthouse message", "type", kind, "error", err)
+				continue
+			}
+			encoded[v] = data
+		}
+		lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, server, encoded[v], nonce, out)
 	}
-
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lh.ctx.Err() != nil {
+		return ErrNodeClosed
+	}
+	return nil
 }
 
 func (lh *lighthouse) runUpdateWorker() {
@@ -475,21 +476,22 @@ func (lh *lighthouse) sendUpdateContext(ctx context.Context) error {
 	}
 	defer func() { lh.updateGate <- struct{}{} }()
 
-	var v4 []*V4AddrPort
-	var v6 []*V6AddrPort
-	var providerErr error
-
-	for _, e := range lh.advertiseAddrs {
-		if !e.IsValid() {
-			continue
-		}
-		addr := e.Addr().Unmap()
-		if addr.Is4() {
-			v4 = append(v4, netAddrToProtoV4AddrPort(addr, e.Port()))
-		} else {
-			v6 = append(v6, netAddrToProtoV6AddrPort(addr, e.Port()))
+	record := discoveryRecord{relays: lh.relaysForMe}
+	addEndpoints := func(endpoints []netip.AddrPort, learned bool) {
+		for _, ep := range endpoints {
+			addr := ep.Addr().Unmap()
+			if !addr.IsValid() || (learned && lh.myVpnNetworksTable.Contains(addr)) {
+				continue
+			}
+			if addr.Is4() {
+				record.v4.reported = append(record.v4.reported, netAddrToProtoV4AddrPort(addr, ep.Port()))
+			} else {
+				record.v6.reported = append(record.v6.reported, netAddrToProtoV6AddrPort(addr, ep.Port()))
+			}
 		}
 	}
+	addEndpoints(lh.advertiseAddrs, false)
+	var providerErr error
 
 	if lh.endpointProvider != nil {
 		providerCtx, cancel := context.WithCancel(ctx)
@@ -506,131 +508,11 @@ func (lh *lighthouse) sendUpdateContext(ctx context.Context) error {
 			}
 			providerErr = fmt.Errorf("get advertised endpoints: %w", err)
 		} else {
-			for _, endpoint := range endpoints {
-				if !endpoint.IsValid() {
-					continue
-				}
-				addr := endpoint.Addr().Unmap()
-				if lh.myVpnNetworksTable.Contains(addr) {
-					continue
-				}
-				if addr.Is4() {
-					v4 = append(v4, netAddrToProtoV4AddrPort(addr, endpoint.Port()))
-				} else {
-					v6 = append(v6, netAddrToProtoV6AddrPort(addr, endpoint.Port()))
-				}
-			}
+			addEndpoints(endpoints, true)
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := lh.sendToLighthouses(ctx, NebulaMeta_HostUpdateNotification, lh.myVpnNetworks[0].Addr(), &record, make([]byte, 12), make([]byte, mtu)); err != nil {
 		return err
-	}
-	if lh.ctx.Err() != nil {
-		return ErrNodeClosed
-	}
-
-	nb := make([]byte, 12, 12)
-	out := make([]byte, mtu)
-
-	var v1Update, v2Update []byte
-	var err error
-	lighthouses := lh.lighthouses
-
-	for _, lhVpnAddr := range lighthouses {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if lh.ctx.Err() != nil {
-			return ErrNodeClosed
-		}
-		var v cert.Version
-		hi := lh.sender.GetHostInfo(lhVpnAddr)
-		if hi != nil {
-			v = hi.connectionState.myCert.Version()
-		} else {
-			v = lh.sender.GetCertState().initiatingVersion
-		}
-		if v == cert.Version1 {
-			if v1Update == nil {
-				if !lh.myVpnNetworks[0].Addr().Is4() {
-					lh.l.Warn("cannot update lighthouse using v1 protocol without an IPv4 address",
-						"lighthouseAddr", lhVpnAddr,
-					)
-					continue
-				}
-				var relays []uint32
-				for _, r := range lh.relaysForMe {
-					if !r.Is4() {
-						continue
-					}
-					b := r.As4()
-					relays = append(relays, binary.BigEndian.Uint32(b[:]))
-				}
-				b := lh.myVpnNetworks[0].Addr().As4()
-				msg := NebulaMeta{
-					Type: NebulaMeta_HostUpdateNotification,
-					Details: &NebulaMetaDetails{
-						V4AddrPorts:      v4,
-						V6AddrPorts:      v6,
-						OldRelayVpnAddrs: relays,
-						OldVpnAddr:       binary.BigEndian.Uint32(b[:]),
-					},
-				}
-
-				v1Update, err = msg.Marshal()
-				if err != nil {
-					lh.l.Error("Error while marshaling for lighthouse v1 update",
-						"error", err,
-						"lighthouseAddr", lhVpnAddr,
-					)
-					continue
-				}
-			}
-
-			lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v1Update, nb, out)
-
-		} else if v == cert.Version2 {
-			if v2Update == nil {
-				var relays []*Addr
-				for _, r := range lh.relaysForMe {
-					relays = append(relays, netAddrToProtoAddr(r))
-				}
-
-				msg := NebulaMeta{
-					Type: NebulaMeta_HostUpdateNotification,
-					Details: &NebulaMetaDetails{
-						V4AddrPorts:   v4,
-						V6AddrPorts:   v6,
-						RelayVpnAddrs: relays,
-					},
-				}
-
-				v2Update, err = msg.Marshal()
-				if err != nil {
-					lh.l.Error("Error while marshaling for lighthouse v2 update",
-						"error", err,
-						"lighthouseAddr", lhVpnAddr,
-					)
-					continue
-				}
-			}
-
-			lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, lhVpnAddr, v2Update, nb, out)
-
-		} else {
-			lh.l.Debug("unsupported protocol version",
-				"op", "update",
-				"version", v,
-			)
-			continue
-		}
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if lh.ctx.Err() != nil {
-		return ErrNodeClosed
 	}
 	return providerErr
 }
@@ -645,19 +527,14 @@ type lighthouseHandler struct {
 }
 
 func (lh *lighthouse) NewRequestHandler() *lighthouseHandler {
-	lhh := &lighthouseHandler{
-		lh:  lh,
-		nb:  make([]byte, 12, 12),
-		out: make([]byte, mtu),
-		l:   lh.l,
-		pb:  make([]byte, mtu),
-
-		meta: &NebulaMeta{
-			Details: &NebulaMetaDetails{},
-		},
+	return &lighthouseHandler{
+		lh:   lh,
+		nb:   make([]byte, 12),
+		out:  make([]byte, mtu),
+		l:    lh.l,
+		pb:   make([]byte, mtu),
+		meta: &NebulaMeta{Details: &NebulaMetaDetails{}},
 	}
-
-	return lhh
 }
 
 // This method is similar to Reset(), but it re-uses the pointer structs
@@ -708,12 +585,9 @@ func (lhh *lighthouseHandler) HandleRequest(rAddr netip.AddrPort, fromVpnAddrs [
 	case NebulaMeta_HostUpdateNotification:
 		lhh.handleHostUpdateNotification(n, fromVpnAddrs)
 
-	case NebulaMeta_HostMovedNotification:
 	case NebulaMeta_HostPunchNotification:
 		lhh.handleHostPunchNotification(n, fromVpnAddrs)
 
-	case NebulaMeta_HostUpdateNotificationAck:
-		// noop
 	}
 }
 
@@ -736,17 +610,6 @@ func (lhh *lighthouseHandler) handleHostQuery(n *NebulaMeta, fromVpnAddrs []neti
 		}
 		return
 	}
-	if useVersion == cert.Version1 && queryVpnAddr.Is6() {
-		// this case really shouldn't be possible to represent, but reject it anyway.
-		if lhh.l.Enabled(context.Background(), slog.LevelDebug) {
-			lhh.l.Debug("invalid vpn addr for v1 handleHostQuery",
-				"vpnAddrs", fromVpnAddrs,
-				"queryVpnAddr", queryVpnAddr,
-			)
-		}
-		return
-	}
-
 	// Don't respond to requests for us.
 	if lhh.lh.myVpnAddrsTable.Contains(queryVpnAddr) {
 		if lhh.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -761,15 +624,10 @@ func (lhh *lighthouseHandler) handleHostQuery(n *NebulaMeta, fromVpnAddrs []neti
 	found, ln, err := lhh.lh.withPeerRecord(queryVpnAddr, func(c *discoveryRecord) (int, error) {
 		n = lhh.resetMeta()
 		n.Type = NebulaMeta_HostQueryReply
-		if useVersion == cert.Version1 {
-			b := queryVpnAddr.As4()
-			n.Details.OldVpnAddr = binary.BigEndian.Uint32(b[:])
-		} else {
-			n.Details.VpnAddr = netAddrToProtoAddr(queryVpnAddr)
+		if err := n.Details.setVPNAddr(queryVpnAddr, useVersion); err != nil {
+			return 0, err
 		}
-
-		lhh.coalesceAnswers(useVersion, c, n)
-
+		c.appendTo(n.Details, useVersion)
 		return n.MarshalTo(lhh.pb)
 	})
 
@@ -819,19 +677,10 @@ func (lhh *lighthouseHandler) sendHostPunchNotification(fromVpnAddrs []netip.Add
 			}
 		}
 
-		if useVersion == cert.Version1 {
-			if !whereToPunch.Is4() {
-				return 0, fmt.Errorf("invalid vpn addr for v1 handleHostQuery")
-			}
-			b := whereToPunch.As4()
-			n.Details.OldVpnAddr = binary.BigEndian.Uint32(b[:])
-		} else if useVersion == cert.Version2 {
-			n.Details.VpnAddr = netAddrToProtoAddr(whereToPunch)
-		} else {
-			return 0, errors.New("unsupported version")
+		if err := n.Details.setVPNAddr(whereToPunch, useVersion); err != nil {
+			return 0, err
 		}
-		lhh.coalesceAnswers(useVersion, c, n)
-
+		c.appendTo(n.Details, useVersion)
 		return n.MarshalTo(lhh.pb)
 	})
 
@@ -850,23 +699,21 @@ func (lhh *lighthouseHandler) sendHostPunchNotification(fromVpnAddrs []netip.Add
 	lhh.lh.sender.SendMessageToVpnAddr(header.LightHouse, 0, punchNotifDest, lhh.pb[:ln], lhh.nb, lhh.out[:0])
 }
 
-func (lhh *lighthouseHandler) coalesceAnswers(v cert.Version, c *discoveryRecord, n *NebulaMeta) {
-	n.Details.V4AddrPorts = c.v4.appendWire(n.Details.V4AddrPorts)
-	n.Details.V6AddrPorts = c.v6.appendWire(n.Details.V6AddrPorts)
+func (c *discoveryRecord) appendTo(d *NebulaMetaDetails, v cert.Version) {
+	d.V4AddrPorts = c.v4.appendWire(d.V4AddrPorts)
+	d.V6AddrPorts = c.v6.appendWire(d.V6AddrPorts)
 	switch v {
 	case cert.Version1:
 		for _, addr := range c.relays {
 			if addr.Is4() {
 				b := addr.As4()
-				n.Details.OldRelayVpnAddrs = append(n.Details.OldRelayVpnAddrs, binary.BigEndian.Uint32(b[:]))
+				d.OldRelayVpnAddrs = append(d.OldRelayVpnAddrs, binary.BigEndian.Uint32(b[:]))
 			}
 		}
 	case cert.Version2:
 		for _, addr := range c.relays {
-			n.Details.RelayVpnAddrs = append(n.Details.RelayVpnAddrs, netAddrToProtoAddr(addr))
+			d.RelayVpnAddrs = append(d.RelayVpnAddrs, netAddrToProtoAddr(addr))
 		}
-	default:
-		lhh.l.Debug("unsupported protocol version", "op", "coalesceAnswers", "version", v)
 	}
 }
 
@@ -902,24 +749,11 @@ func (lhh *lighthouseHandler) handleHostUpdateNotification(n *NebulaMeta, fromVp
 		return
 	}
 
-	// not using GetVpnAddrAndVersion because we don't want to error on a blank detailsVpnAddr
-	var detailsVpnAddr netip.Addr
-	var useVersion cert.Version
-	if n.Details.OldVpnAddr != 0 { //v1 always sets this field
-		b := [4]byte{}
-		binary.BigEndian.PutUint32(b[:], n.Details.OldVpnAddr)
-		detailsVpnAddr = netip.AddrFrom4(b)
-		useVersion = cert.Version1
-	} else if n.Details.VpnAddr != nil { //this field is "optional" in v2, but if it's set, we should enforce it
-		detailsVpnAddr = protoAddrToNetAddr(n.Details.VpnAddr)
+	detailsVpnAddr, useVersion, err := n.Details.GetVpnAddrAndVersion()
+	if err != nil {
+		// A v2 update may identify its sender solely through the authenticated session.
 		useVersion = cert.Version2
-	} else {
-		detailsVpnAddr = netip.Addr{}
-		useVersion = cert.Version2
-	}
-
-	//Simple check that the host sent this not someone else, if detailsVpnAddr is filled
-	if detailsVpnAddr.IsValid() && !slices.Contains(fromVpnAddrs, detailsVpnAddr) {
+	} else if !slices.Contains(fromVpnAddrs, detailsVpnAddr) {
 		if lhh.l.Enabled(context.Background(), slog.LevelDebug) {
 			lhh.l.Debug("Host sent invalid update",
 				"vpnAddrs", fromVpnAddrs,
@@ -933,21 +767,11 @@ func (lhh *lighthouseHandler) handleHostUpdateNotification(n *NebulaMeta, fromVp
 
 	n = lhh.resetMeta()
 	n.Type = NebulaMeta_HostUpdateNotificationAck
-	switch useVersion {
-	case cert.Version1:
-		if !fromVpnAddrs[0].Is4() {
-			lhh.l.Error("Can not send HostUpdateNotificationAck for a ipv6 vpn ip in a v1 message",
-				"vpnAddrs", fromVpnAddrs,
-			)
+	if useVersion == cert.Version1 {
+		if err := n.Details.setVPNAddr(fromVpnAddrs[0], useVersion); err != nil {
+			lhh.l.Error("invalid lighthouse acknowledgement address", "error", err)
 			return
 		}
-		vpnAddrB := fromVpnAddrs[0].As4()
-		n.Details.OldVpnAddr = binary.BigEndian.Uint32(vpnAddrB[:])
-	case cert.Version2:
-		// do nothing, we want to send a blank message
-	default:
-		lhh.l.Error("invalid protocol version", "useVersion", useVersion)
-		return
 	}
 
 	ln, err := n.MarshalTo(lhh.pb)
@@ -1077,6 +901,22 @@ func findNetworkUnion(prefixes []netip.Prefix, addrs []netip.Addr) (netip.Addr, 
 		}
 	}
 	return netip.Addr{}, false
+}
+
+func (d *NebulaMetaDetails) setVPNAddr(addr netip.Addr, v cert.Version) error {
+	switch v {
+	case cert.Version1:
+		if !addr.Is4() {
+			return fmt.Errorf("v1 lighthouse message requires IPv4, got %v", addr)
+		}
+		b := addr.As4()
+		d.OldVpnAddr = binary.BigEndian.Uint32(b[:])
+	case cert.Version2:
+		d.VpnAddr = netAddrToProtoAddr(addr)
+	default:
+		return fmt.Errorf("unknown certificate version %d", v)
+	}
+	return nil
 }
 
 func (d *NebulaMetaDetails) GetVpnAddrAndVersion() (netip.Addr, cert.Version, error) {

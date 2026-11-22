@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/slackhq/nebula/header"
@@ -29,8 +30,9 @@ type punchManager struct {
 	respondDelay    time.Duration
 	punchEverything bool
 
-	sched     *scheduler[holepunchJob]
-	punchConn DatagramTransport
+	sched  *scheduler[holepunchJob]
+	mu     sync.Mutex
+	queued map[holepunchJob]bool
 
 	ctx    context.Context
 	engine *packetEngine
@@ -39,7 +41,7 @@ type punchManager struct {
 	l *slog.Logger
 }
 
-func newPunchManager(l *slog.Logger, transport DatagramTransport, cfg PunchyOptions) *punchManager {
+func newPunchManager(l *slog.Logger, cfg PunchyOptions) *punchManager {
 	if cfg.Delay <= 0 {
 		cfg.Delay = time.Second
 	}
@@ -47,7 +49,7 @@ func newPunchManager(l *slog.Logger, transport DatagramTransport, cfg PunchyOpti
 		cfg.RespondDelay = 5 * time.Second
 	}
 	return &punchManager{
-		l: l, punchConn: transport,
+		l: l, queued: make(map[holepunchJob]bool),
 		sched: newScheduler[holepunchJob](holepunchQueueSize),
 		punch: cfg.Punch, respond: cfg.Respond,
 		delay: cfg.Delay, respondDelay: cfg.RespondDelay,
@@ -62,7 +64,7 @@ func (p *punchManager) Schedule(target netip.AddrPort, vpnAddr netip.Addr) {
 	if !target.IsValid() || p.ctx == nil {
 		return
 	}
-	p.sched.Schedule(p.ctx, holepunchJob{target: target, vpnAddr: vpnAddr}, p.delay)
+	p.queue(holepunchJob{target: target, vpnAddr: vpnAddr}, p.delay)
 }
 
 // ScheduleRespond queues a punchback test packet to vpnAddr after the configured respond delay,
@@ -71,7 +73,21 @@ func (p *punchManager) ScheduleRespond(vpnAddr netip.Addr) {
 	if !p.respond || p.ctx == nil {
 		return
 	}
-	p.sched.Schedule(p.ctx, holepunchJob{vpnAddr: vpnAddr}, p.respondDelay)
+	p.queue(holepunchJob{vpnAddr: vpnAddr}, p.respondDelay)
+}
+
+func (p *punchManager) queue(job holepunchJob, delay time.Duration) {
+	if !p.engine.paths.config.Load().allows([]netip.Addr{job.vpnAddr}, netip.Addr{}, nil) {
+		return
+	}
+	p.mu.Lock()
+	if p.queued[job] || len(p.queued) >= holepunchQueueSize {
+		p.mu.Unlock()
+		return
+	}
+	p.queued[job] = true
+	p.mu.Unlock()
+	p.sched.Schedule(p.ctx, job, delay)
 }
 
 // SendPunch sends an immediate keepalive punch for an idle hostinfo.
@@ -88,7 +104,7 @@ func (p *punchManager) SendPunch(hostinfo *hostInfo) {
 	if p.punchEverything {
 		p.sendPunchToAllRemotes(hostinfo)
 	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
-		p.punchConn.WriteTo(punchPacket, hr)
+		p.engine.writePath(hostinfo, tunnelRoute{TunnelPath: TunnelPath{Endpoint: hr}}, punchPacket, true, nil)
 	}
 }
 
@@ -105,7 +121,7 @@ func (p *punchManager) SendPunchToAll(hostinfo *hostInfo) {
 
 func (p *punchManager) sendPunchToAllRemotes(hostinfo *hostInfo) {
 	for _, addr := range hostinfo.remotes.candidates().endpoints {
-		p.punchConn.WriteTo(punchPacket, addr)
+		p.engine.writePath(hostinfo, tunnelRoute{TunnelPath: TunnelPath{Endpoint: addr}}, punchPacket, true, nil)
 	}
 }
 
@@ -116,12 +132,22 @@ func (p *punchManager) run(ctx context.Context) {
 	empty := []byte{0}
 
 	p.sched.Run(ctx, func(job holepunchJob) {
+		p.mu.Lock()
+		delete(p.queued, job)
+		p.mu.Unlock()
+		h := p.engine.hostMap.QueryVpnAddr(job.vpnAddr)
+		if h == nil {
+			h = &hostInfo{vpnAddrs: []netip.Addr{job.vpnAddr}}
+		}
+		if !p.engine.allowed(h, tunnelRoute{}) {
+			return
+		}
 		switch {
 		case job.target.IsValid():
 			if p.l.Enabled(context.Background(), slog.LevelDebug) {
 				p.l.Debug("Punching", "target", job.target, "vpnAddr", job.vpnAddr)
 			}
-			p.punchConn.WriteTo(empty, job.target)
+			p.engine.writePath(h, tunnelRoute{TunnelPath: TunnelPath{Endpoint: job.target}}, empty, true, nil)
 		case job.vpnAddr.IsValid():
 			// A nebula test packet to the host trying to contact us.
 			// In the case of a double nat or other difficult scenario, this may help establish a tunnel.

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/slackhq/nebula/cert"
+	"github.com/slackhq/nebula/header"
 )
 
 // ErrPeerUnavailable reports an invalid remote overlay address or an outbound
@@ -89,6 +90,7 @@ type PeerSnapshot struct {
 	State            PeerState
 	HandshakePending bool
 	CurrentEndpoint  netip.AddrPort
+	PathHealth       PeerPathSnapshot
 	LastDataPath     TunnelPath // Last successful IP datagram write to the transport.
 	KnownEndpoints   []netip.AddrPort
 	RelayCandidates  []netip.Addr
@@ -112,22 +114,15 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 		capacity = 1
 	}
 	established := make([]*hostInfo, 0, capacity)
-	seenEstablished := make(map[*hostInfo]struct{}, capacity)
 	if filter.IsValid() {
 		if h := hostMap.Hosts[filter]; h != nil {
-			seenEstablished[h] = struct{}{}
 			established = append(established, h)
 		}
 	} else {
-		for _, h := range hostMap.Hosts {
-			if len(h.vpnAddrs) == 0 || hostMap.Hosts[h.vpnAddrs[0]] != h {
-				continue
+		for addr, h := range hostMap.Hosts {
+			if len(h.vpnAddrs) > 0 && addr == h.vpnAddrs[0] {
+				established = append(established, h)
 			}
-			if _, ok := seenEstablished[h]; ok {
-				continue
-			}
-			seenEstablished[h] = struct{}{}
-			established = append(established, h)
 		}
 	}
 	n.handshake.RLock()
@@ -135,29 +130,20 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 	if filter.IsValid() {
 		capacity = 1
 	}
-	pending := make([]*handshakeHostInfo, 0, capacity)
-	seenPending := make(map[*handshakeHostInfo]struct{}, capacity)
+	pending := make(map[*handshakeHostInfo]struct{}, capacity)
 	if filter.IsValid() {
-		if hh := n.handshake.vpnIps[filter]; hh != nil {
-			seenPending[hh] = struct{}{}
-			pending = append(pending, hh)
+		addrs := []netip.Addr{filter}
+		if len(established) > 0 {
+			addrs = established[0].vpnAddrs
 		}
-		for h := range seenEstablished {
-			for _, addr := range h.vpnAddrs {
-				if hh := n.handshake.vpnIps[addr]; hh != nil {
-					if _, ok := seenPending[hh]; !ok {
-						seenPending[hh] = struct{}{}
-						pending = append(pending, hh)
-					}
-				}
+		for _, addr := range addrs {
+			if hh := n.handshake.vpnIps[addr]; hh != nil {
+				pending[hh] = struct{}{}
 			}
 		}
 	} else {
 		for _, hh := range n.handshake.vpnIps {
-			if _, ok := seenPending[hh]; !ok {
-				seenPending[hh] = struct{}{}
-				pending = append(pending, hh)
-			}
+			pending[hh] = struct{}{}
 		}
 	}
 	n.handshake.RUnlock()
@@ -170,6 +156,7 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 		slices.SortFunc(addresses, netip.Addr.Compare)
 		known, relays := h.remotes.candidates().copyPaths()
 		peer := PeerSnapshot{
+			PathHealth:      n.engine.pathSnapshot(h),
 			Addresses:       addresses,
 			State:           PeerStateEstablished,
 			CurrentEndpoint: unmapAddrPort(h.GetRemote()),
@@ -192,7 +179,7 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 		}
 	}
 
-	for _, hh := range pending {
+	for hh := range pending {
 		hh.Lock()
 		n.handshake.RLock()
 		tracked := false
@@ -225,9 +212,12 @@ func (n *Node) snapshotPeers(filter netip.Addr) []PeerSnapshot {
 		}
 
 		index := len(peers)
+		policy := n.engine.paths.config.Load().policy(addresses, hostMap)
+		policy.Relays = slices.Clone(policy.Relays)
 		peers = append(peers, PeerSnapshot{
 			Addresses:        addresses,
 			State:            PeerStateConnecting,
+			PathHealth:       PeerPathSnapshot{Policy: policy},
 			HandshakePending: true,
 			KnownEndpoints:   known,
 			RelayCandidates:  relays,
@@ -268,7 +258,7 @@ func (n *Node) Peer(addr netip.Addr) (PeerSnapshot, bool) {
 }
 
 // ConnectPeer starts or joins an outbound handshake and waits until the peer
-// is established. Canceling ctx does not cancel a shared handshake.
+// has an established session with a usable exit. Canceling ctx ends this wait.
 func (n *Node) ConnectPeer(ctx context.Context, addr netip.Addr) error {
 	if err := n.requireStarted(); err != nil {
 		return err
@@ -285,18 +275,22 @@ func (n *Node) ConnectPeer(ctx context.Context, addr netip.Addr) error {
 	// takes hostMap -> handshake, so this closes the window where another
 	// handshake could become established between our check and insertion and
 	// leave an unnecessary rehandshake behind.
-	n.engine.hostMap.RLock()
-	if n.engine.hostMap.Hosts[addr] != nil {
-		n.engine.hostMap.RUnlock()
+	hosts := n.engine.hostMap
+	hosts.RLock()
+	existing := hosts.Hosts[addr]
+	if existing == nil && ctx.Err() == nil {
+		n.handshake.StartHandshake(addr, nil)
+	}
+	hosts.RUnlock()
+	if existing != nil && n.engine.currentRoute(existing).Endpoint.IsValid() {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
-		n.engine.hostMap.RUnlock()
 		return err
 	}
-	n.handshake.StartHandshake(addr, nil)
-	n.engine.hostMap.RUnlock()
-
+	tries := time.Duration(n.handshake.config.Retries)
+	deadline := time.NewTimer(n.handshake.config.TryInterval*(tries+1)*(tries+2)/2 + time.Second)
+	defer deadline.Stop()
 	interval := n.handshake.config.TryInterval / 4
 	if interval <= 0 || interval > 25*time.Millisecond {
 		interval = 25 * time.Millisecond
@@ -304,11 +298,20 @@ func (n *Node) ConnectPeer(ctx context.Context, addr netip.Addr) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		established, pending := n.peerConnectionState(addr)
-		if established {
-			return nil
-		}
-		if !pending {
+		hosts.RLock()
+		n.handshake.RLock()
+		h := hosts.Hosts[addr]
+		pending := n.handshake.vpnIps[addr] != nil
+		n.handshake.RUnlock()
+		hosts.RUnlock()
+		if h != nil {
+			if n.engine.currentRoute(h).Endpoint.IsValid() {
+				return nil
+			}
+			h.paths.mu.Lock()
+			h.paths.demand = time.Now()
+			h.paths.mu.Unlock()
+		} else if !pending {
 			return fmt.Errorf("%w: handshake with %s failed", ErrPeerUnavailable, addr)
 		}
 
@@ -320,6 +323,8 @@ func (n *Node) ConnectPeer(ctx context.Context, addr netip.Addr) error {
 				return err
 			}
 			return ErrNodeClosed
+		case <-deadline.C:
+			return fmt.Errorf("%w: no usable path to %s", ErrPeerUnavailable, addr)
 		case <-ticker.C:
 		}
 	}
@@ -459,31 +464,16 @@ func (n *Node) validatePeerAddress(addr netip.Addr) error {
 	return nil
 }
 
-func (n *Node) peerConnectionState(addr netip.Addr) (established, pending bool) {
-	hostMap := n.engine.hostMap
-	hostMap.RLock()
-	n.handshake.RLock()
-	established = hostMap.Hosts[addr] != nil
-	pending = n.handshake.vpnIps[addr] != nil
-	n.handshake.RUnlock()
-	hostMap.RUnlock()
-	return
-}
-
 func (n *Node) cancelPendingHandshakes(include func([]netip.Addr) bool) int {
 	n.handshake.RLock()
-	pending := make([]*handshakeHostInfo, 0, len(n.handshake.vpnIps))
-	seen := make(map[*handshakeHostInfo]struct{}, len(n.handshake.vpnIps))
+	pending := make(map[*handshakeHostInfo]struct{}, len(n.handshake.vpnIps))
 	for _, hh := range n.handshake.vpnIps {
-		if _, ok := seen[hh]; !ok {
-			seen[hh] = struct{}{}
-			pending = append(pending, hh)
-		}
+		pending[hh] = struct{}{}
 	}
 	n.handshake.RUnlock()
 
 	canceled := 0
-	for _, hh := range pending {
+	for hh := range pending {
 		hh.Lock()
 		n.handshake.Lock()
 		tracked := false
@@ -504,26 +494,12 @@ func (n *Node) cancelPendingHandshakes(include func([]netip.Addr) bool) int {
 }
 
 func (n *Node) disconnectTunnel(h *hostInfo, localOnly bool) bool {
-	var remote netip.AddrPort
-	var relayHostInfo *hostInfo
-	var relayRoute *relay
-	if !localOnly && h.connectionState != nil {
-		remote = h.GetRemote()
-		if !remote.IsValid() {
-			for _, relayAddr := range h.relayState.CopyRelayIps() {
-				var err error
-				relayHostInfo, relayRoute, err = n.engine.hostMap.QueryVpnAddrsRelayFor(h.vpnAddrs, relayAddr)
-				if err == nil {
-					break
-				}
-			}
-		}
-	}
+	route := n.engine.currentRoute(h)
 	if !n.engine.closeTunnel(h) {
 		return false
 	}
 	if !localOnly && h.connectionState != nil {
-		n.engine.sendCloseTunnelWithRoute(h, remote, relayHostInfo, relayRoute)
+		n.engine.sendOnRoute(header.CloseTunnel, 0, h, route, nil, make([]byte, 12), make([]byte, mtu))
 	}
 	return true
 }

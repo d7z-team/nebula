@@ -4,7 +4,7 @@
 
 ## 加载已有 PEM
 
-下面的函数接受一个主机证书 PEM、对应的主机私钥 PEM 和一个可含多个 CA 的 PEM 文件内容。返回值可直接传给[挂载示例](../docs/quickstart.md)。
+将主机证书、对应私钥和 CA 证书包的 PEM 文件内容传给 `LoadIdentity`，再用返回的身份和信任池创建节点。CA 证书包可以包含多个 CA。[挂载示例](../docs/quickstart.md)
 
 ```go
 package client
@@ -54,12 +54,12 @@ if err != nil {
 return nebula.Identity{Certificate: host, PrivateKey: key}, nil
 ```
 
-签发客户端时，将 `Name` 设为 `client`，`Networks` 设为 `10.42.0.1/24`，`UnsafeNetworks` 留空。主机前缀保留主机位，后面的 `/24` 描述它所在的 overlay 网段。网关证书赋予承载下游流量的权限，实际路由和转发在宿主 gVisor 栈配置。[网关配置](../docs/nebula-nic.md#经网关访问下游子网)
+签发客户端时，将 `Name` 设为 `client`，在 `Networks` 中填写 `10.42.0.1/24`，`UnsafeNetworks` 留空。前缀中的 `10.42.0.1` 是节点身份，`/24` 指定 overlay 网段。签发网关证书后，在客户端添加下游路由，在网关的 gVisor 栈上启用转发。[网关配置](../docs/nebula-nic.md#经网关访问下游子网)
 
 如需由节点自行保管私钥，在节点上用 `cert.GenerateKeyAgreementKey` 生成密钥对，仅将公钥交给签发端填入 `CertificateOptions.PublicKey`。这种用法下，`IssueCertificate` 的私钥返回值为 nil。保存证书使用 `host.MarshalPEM()`，保存主机私钥使用 `cert.MarshalPrivateKeyToPEM`。
 
 ## 格式与互通
 
-v2 证书支持 IPv4 和 IPv6，v1 证书使用 IPv4。一个节点可各配置一份 v1 和 v2 身份，两者须使用相同的密钥、曲线、overlay 前缀和 unsafe 前缀。FIPS 140-only 部署使用 P256 和 AES。[v2 ASN.1 定义](cert_v2.asn1) · [v1 Protobuf 定义](cert_v1.proto)
+v2 证书支持 IPv4 和 IPv6，v1 证书使用 IPv4。一个节点可各配置一份 v1 和 v2 身份，两者须使用相同的密钥和曲线，`Networks` 和 `UnsafeNetworks` 的内容及顺序也要一致。FIPS 140-only 部署使用 P256 和 AES。[v2 ASN.1 定义](cert_v2.asn1) · [v1 Protobuf 定义](cert_v1.proto)
 
 修改 v1 的 protobuf 定义后，在装有 `protoc` 的环境从仓库根目录运行 `make -C cert proto` 重新生成 Go 绑定。

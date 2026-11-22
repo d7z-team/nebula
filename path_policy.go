@@ -1,0 +1,340 @@
+package nebula
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"net/netip"
+	"slices"
+	"sync/atomic"
+	"time"
+
+	"github.com/slackhq/nebula/ratelimit"
+	"golang.org/x/sync/semaphore"
+)
+
+// PathMode constrains both directions of a peer's tunnel.
+type PathMode uint8
+
+const (
+	Auto PathMode = iota
+	DirectOnly
+	RelayOnly
+	// PathBlocked appears in snapshots when certificate address overrides have no common path.
+	PathBlocked
+)
+
+// PeerPathPolicy limits both ingress and egress. Relays are ordered overlay identities.
+type PeerPathPolicy struct {
+	Mode            PathMode
+	Relays          []netip.Addr
+	MonitorInterval time.Duration
+}
+
+// PathOptions selects a default policy and optional per-identity overrides.
+type PathOptions struct {
+	Default PeerPathPolicy
+	Peers   map[netip.Addr]PeerPathPolicy
+}
+
+var (
+	ErrPathPolicy  = errors.New("tunnel path denied by policy")
+	ErrPathTimeout = errors.New("tunnel path probe timed out")
+	errWritePolicy = fmt.Errorf("%w: route invalid at submission", ErrPathPolicy)
+	ErrPathChanged = errors.New("tunnel path changed")
+	errPathBudget  = errors.New("path control budget exhausted")
+)
+
+type pathManager struct {
+	config atomic.Pointer[PathOptions]
+	checks *timerWheel[*hostInfo]
+	// Writers hold a shared permit across the final policy check and UDP submission.
+	// Policy readers elsewhere use the immutable config without taking this lock.
+	ctx                 context.Context
+	submit              *semaphore.Weighted
+	control, background *ratelimit.Limiter
+}
+
+func (p PeerPathPolicy) validate(n *Node, peer netip.Addr) (PeerPathPolicy, error) {
+	if p.Mode > RelayOnly || p.MonitorInterval < 0 || (!peer.IsValid() && p.MonitorInterval != 0) || (p.Mode == DirectOnly && len(p.Relays) > 0) {
+		return p, fmt.Errorf("%w: invalid mode, interval or relay list", ErrPathPolicy)
+	}
+	p.Relays = slices.Clone(p.Relays)
+	for i, addr := range p.Relays {
+		addr = addr.Unmap()
+		if err := n.validatePeerAddress(addr); err != nil {
+			return p, err
+		}
+		if addr == peer || slices.Contains(p.Relays[:i], addr) {
+			return p, fmt.Errorf("%w: invalid relay %v for %v", ErrPathPolicy, addr, peer)
+		}
+		p.Relays[i] = addr
+	}
+	return p, nil
+}
+
+func (p *pathManager) init(n *Node, opts PathOptions) error {
+	d, err := opts.Default.validate(n, netip.Addr{})
+	if err != nil {
+		return err
+	}
+	cfg := PathOptions{Default: d, Peers: make(map[netip.Addr]PeerPathPolicy, len(opts.Peers))}
+	for addr, v := range opts.Peers {
+		addr = addr.Unmap()
+		if err := n.validatePeerAddress(addr); err != nil {
+			return err
+		}
+		if _, ok := cfg.Peers[addr]; ok {
+			return fmt.Errorf("%w: duplicate peer %v", ErrPathPolicy, addr)
+		}
+		v, err = v.validate(n, addr)
+		if err != nil {
+			return err
+		}
+		cfg.Peers[addr] = v
+	}
+	p.ctx, p.submit = n.ctx, semaphore.NewWeighted(math.MaxInt64)
+	p.checks = newTimerWheel[*hostInfo](pathTick, time.Second)
+	p.config.Store(&cfg)
+	p.control, _ = ratelimit.New(40, 10*time.Millisecond)
+	p.background, _ = ratelimit.New(10, 50*time.Millisecond)
+	return nil
+}
+
+// SetPeerPathPolicy replaces an overlay address override. A nil policy restores the default.
+func (n *Node) SetPeerPathPolicy(ctx context.Context, peer netip.Addr, policy *PeerPathPolicy) error {
+	peer = peer.Unmap()
+	if err := n.validatePeerAddress(peer); err != nil {
+		return err
+	}
+	var v PeerPathPolicy
+	var err error
+	if policy != nil {
+		v, err = policy.validate(n, peer)
+		if err != nil {
+			return err
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pm := &n.engine.paths
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(n.ctx, cancel)
+	defer cancel()
+	defer stop()
+	if err := pm.submit.Acquire(ctx, math.MaxInt64); err != nil {
+		if n.ctx.Err() != nil {
+			return ErrNodeClosed
+		}
+		return err
+	}
+	defer pm.submit.Release(math.MaxInt64)
+	if n.ctx.Err() != nil {
+		return ErrNodeClosed
+	}
+	cfg := *pm.config.Load()
+	cfg.Peers = maps.Clone(cfg.Peers)
+	if policy == nil {
+		delete(cfg.Peers, peer)
+	} else {
+		cfg.Peers[peer] = v
+	}
+	pm.config.Store(&cfg)
+	if h := n.engine.hostMap.QueryVpnAddr(peer); h != nil {
+		h.paths.mu.Lock()
+		// Let an established end-to-end session verify a newly permitted exit first.
+		h.paths.policyVersion++
+		h.paths.samples = nil
+		h.paths.standby = tunnelRoute{}
+		h.paths.nextActive, h.paths.nextBackup = time.Time{}, time.Time{}
+		h.paths.buildUntil = time.Time{}
+		now := time.Now()
+		h.paths.demand = now
+		h.paths.recoverAfter = time.Time{}
+		h.paths.mu.Unlock()
+	}
+	return nil
+}
+
+// matchesIdentity accepts any authenticated address of the same overlay peer.
+func matchesIdentity(list []netip.Addr, addr netip.Addr, aliases []netip.Addr) bool {
+	if slices.Contains(list, addr) {
+		return true
+	}
+	for _, alias := range aliases {
+		if slices.Contains(list, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// Every explicit alias constraint applies. The default applies only without an override.
+func (cfg *PathOptions) allows(ids []netip.Addr, relay netip.Addr, remotes *remoteList, aliases ...netip.Addr) bool {
+	match := func(v PeerPathPolicy) bool {
+		if !relay.IsValid() {
+			return v.Mode != RelayOnly
+		}
+		if v.Mode == DirectOnly || matchesIdentity(ids, relay, aliases) {
+			return false
+		}
+		if len(v.Relays) > 0 {
+			return matchesIdentity(v.Relays, relay, aliases)
+		}
+		if v.Mode != RelayOnly {
+			return true
+		}
+		return remotes != nil && matchesIdentity(remotes.candidates().relays, relay, aliases)
+	}
+	override := false
+	for _, id := range ids {
+		if v, ok := cfg.Peers[id]; ok {
+			override = true
+			if !match(v) {
+				return false
+			}
+		}
+	}
+	return override || match(cfg.Default)
+}
+
+// relayIdentities includes alternate certificate addresses once the adjacency is authenticated.
+func (hm *hostMap) relayIdentities(addr netip.Addr) []netip.Addr {
+	if !addr.IsValid() {
+		return nil
+	}
+	if leg := hm.QueryVpnAddr(addr); leg != nil {
+		return leg.vpnAddrs
+	}
+	return nil
+}
+
+func (cfg *PathOptions) policy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
+	var v PeerPathPolicy
+	var constrained, found bool
+	for _, id := range ids {
+		next, ok := cfg.Peers[id]
+		if !ok {
+			continue
+		}
+		found = true
+		if next.Mode != Auto {
+			if v.Mode == Auto {
+				v.Mode = next.Mode
+			} else if v.Mode != next.Mode {
+				v.Mode = PathBlocked
+			}
+		}
+		if len(next.Relays) > 0 {
+			if !constrained {
+				v.Relays, constrained = next.Relays, true
+			} else {
+				v.Relays = slices.DeleteFunc(slices.Clone(v.Relays), func(addr netip.Addr) bool {
+					return !matchesIdentity(next.Relays, addr, hm.relayIdentities(addr))
+				})
+			}
+		}
+		if next.MonitorInterval > 0 && (v.MonitorInterval == 0 || next.MonitorInterval < v.MonitorInterval) {
+			v.MonitorInterval = next.MonitorInterval
+		}
+	}
+	if !found {
+		return cfg.Default
+	}
+	if constrained && len(v.Relays) == 0 {
+		if v.Mode == RelayOnly {
+			v.Mode = PathBlocked
+		} else if v.Mode == Auto {
+			v.Mode = DirectOnly
+		}
+	}
+	return v
+}
+
+type tunnelRoute struct {
+	TunnelPath
+	leg           *hostInfo
+	relayFor      netip.Addr // Terminal peer named by a direct CreateRelay control message.
+	local, remote uint32
+}
+
+func receivedRoute(v packetSender) tunnelRoute {
+	r := tunnelRoute{TunnelPath: TunnelPath{Endpoint: v.UdpAddr}}
+	if v.IsRelayed {
+		r.leg = v.relayHI
+		r.Relay = r.leg.vpnAddrs[0]
+		r.local, r.remote = v.relay.LocalIndex, v.relay.RemoteIndex
+	}
+	return r
+}
+
+func (f *packetEngine) allowed(h *hostInfo, r tunnelRoute) bool {
+	cfg := f.paths.config.Load()
+	if r.relayFor.IsValid() {
+		ids := []netip.Addr{r.relayFor}
+		var remotes *remoteList
+		if end := f.hostMap.QueryVpnAddr(r.relayFor); end != nil {
+			ids, remotes = end.vpnAddrs, end.remotes
+		} else {
+			f.lightHouse.RLock()
+			remotes = f.lightHouse.addrMap[r.relayFor]
+			f.lightHouse.RUnlock()
+		}
+		if !cfg.allows(ids, h.vpnAddrs[0], remotes, h.vpnAddrs...) {
+			return false
+		}
+	}
+	var aliases []netip.Addr
+	if r.leg != nil {
+		aliases = r.leg.vpnAddrs
+		if !cfg.allows(aliases, netip.Addr{}, r.leg.remotes) {
+			return false
+		}
+	}
+	if h.connectionState == nil && len(h.vpnAddrs) == 1 {
+		if known := f.hostMap.QueryVpnAddr(h.vpnAddrs[0]); known != nil {
+			h = known
+		}
+	}
+	return cfg.allows(h.vpnAddrs, r.Relay, h.remotes, aliases...)
+}
+
+func (f *packetEngine) routeLive(h *hostInfo, r tunnelRoute) bool {
+	if !r.Endpoint.IsValid() || !f.allowed(h, r) {
+		return false
+	}
+	if r.leg == nil {
+		return true
+	}
+	if r.leg.GetRemote() != r.Endpoint || f.hostMap.QueryRelayIndex(r.local) != r.leg {
+		return false
+	}
+	entry, ok := r.leg.relayState.mappingByIndex(r.local)
+	return ok && entry.State == relayEstablished && entry.Type == relayTypeTerminal && entry.RemoteIndex == r.remote && slices.Contains(h.vpnAddrs, entry.PeerAddr) && !r.leg.paths.failedDirect(r.Endpoint)
+}
+
+func (f *packetEngine) writePath(h *hostInfo, r tunnelRoute, packet []byte, control bool, ingress *hostInfo) error {
+	if err := f.paths.submit.Acquire(f.paths.ctx, 1); err != nil {
+		return ErrNodeClosed
+	}
+	defer f.paths.submit.Release(1)
+	if (r.leg != nil && !f.routeLive(h, r)) || (r.leg == nil && !f.allowed(h, r)) || (ingress != nil && !f.allowed(ingress, tunnelRoute{})) {
+		return errWritePolicy
+	}
+	if control {
+		if _, ok := f.paths.control.Allow(); !ok {
+			return errPathBudget
+		}
+	}
+	return f.outside.WriteTo(packet, r.Endpoint)
+}
+
+func (f *packetEngine) handshakeAllowed(ids []netip.Addr, v packetSender, remotes *remoteList) bool {
+	if v.IsRelayed && !slices.Contains(ids, v.relay.PeerAddr) {
+		return false
+	}
+	return f.allowed(&hostInfo{vpnAddrs: ids, remotes: remotes}, receivedRoute(v))
+}

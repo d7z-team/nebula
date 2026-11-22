@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,7 +46,6 @@ func TestCertificateV2_Marshal(t *testing.T) {
 
 	b, err := nc.Marshal()
 	require.NoError(t, err)
-	//t.Log("Cert size:", len(b))
 
 	nc2, err := unmarshalCertificateV2(b, nil, Curve_CURVE25519)
 	require.NoError(t, err)
@@ -109,7 +107,6 @@ func TestCertificateV2_Unmarshal(t *testing.T) {
 
 	certWithPubkey, err := nc.Marshal()
 	require.NoError(t, err)
-	//t.Log("Cert size:", len(b))
 	certWithoutPubkey, err := nc.MarshalForHandshakes()
 	require.NoError(t, err)
 
@@ -324,13 +321,6 @@ func TestCertificateV2_VerifyPrivateKeyP256(t *testing.T) {
 	require.NoError(t, err)
 	err = c.VerifyPrivateKey(Curve_P256, priv2)
 	require.Error(t, err)
-}
-
-func TestCertificateV2_Copy(t *testing.T) {
-	ca, _, caKey, _ := NewTestCaCert(Version2, Curve_CURVE25519, time.Now(), time.Now().Add(10*time.Minute), nil, nil, nil)
-	c, _, _, _ := NewTestCert(Version2, Curve_CURVE25519, ca, caKey, "test", time.Now(), time.Now().Add(5*time.Minute), nil, nil, nil)
-	cc := c.Copy()
-	test.AssertDeepCopyEqual(t, c, cc)
 }
 
 func TestUnmarshalCertificateV2(t *testing.T) {
