@@ -244,6 +244,42 @@ func TestNodeLifecycle(t *testing.T) {
 	require.ErrorIs(t, err, ErrNodeClosed)
 }
 
+func TestNodeTimerIntervals(t *testing.T) {
+	type intervals struct{ check, pendingDeletion, handshakeRetry time.Duration }
+	defaults := intervals{5 * time.Second, 10 * time.Second, 100 * time.Millisecond}
+	custom := intervals{2 * time.Second, 3 * time.Second, 40 * time.Millisecond}
+	pool, local, _ := newNodeTestIdentities(t)
+	for _, tc := range []struct {
+		name      string
+		set, want intervals
+	}{
+		{"zero", intervals{}, defaults},
+		{"negative", intervals{-time.Second, -time.Second, -time.Second}, defaults},
+		{"custom", custom, custom},
+		{"mixed", intervals{custom.check, 0, custom.handshakeRetry}, intervals{custom.check, defaults.pendingDeletion, custom.handshakeRetry}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := newMemoryDatagramNetwork(netip.MustParseAddrPort("127.0.0.1:22001"))[0]
+			node, err := New(t.Context(), Options{
+				Identities:  []Identity{local.identity},
+				CAPool:      pool,
+				Transport:   transport,
+				Connections: ConnectionOptions{CheckInterval: tc.set.check, PendingDeletionInterval: tc.set.pendingDeletion},
+				Handshake:   HandshakeOptions{TryInterval: tc.set.handshakeRetry},
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, node.Close())
+				require.NoError(t, node.Wait())
+			})
+			require.NoError(t, node.Start())
+			require.Equal(t, tc.want.check, node.connections.checkInterval)
+			require.Equal(t, tc.want.pendingDeletion, node.connections.pendingDeletionInterval)
+			require.Equal(t, tc.want.handshakeRetry, node.handshake.config.TryInterval)
+		})
+	}
+}
+
 func TestNodeRejectsUntrustedIdentity(t *testing.T) {
 	_, a, _ := newNodeTestIdentities(t)
 	untrustedPool, _, _ := newNodeTestIdentities(t)
