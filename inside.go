@@ -156,8 +156,8 @@ func (f *packetEngine) sendOnRoute(t header.MessageType, st header.MessageSubTyp
 	}
 	err = f.writePath(hostinfo, path, out, t != header.Message, nil)
 	if err != nil && !errors.Is(err, errPathBudget) {
-		if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
-			hostinfo.logger(l).Debug("datagram write failed", "endpoint", path.Endpoint, "error", err)
+		if l, ok := logging.RateLimited(f.l, f.txErrLimiter); ok {
+			hostinfo.logger(l).Debug("path write failed", "path", path.TunnelPath, "error", err)
 		}
 	}
 	return path.TunnelPath, err

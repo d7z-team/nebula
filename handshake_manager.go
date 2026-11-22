@@ -65,7 +65,7 @@ type handshakeHostInfo struct {
 
 	startTime                 time.Time        // Time that we first started trying with this handshake
 	ready                     bool             // Is the handshake ready
-	initiatingVersionOverride cert.Version     // Should we use a non-default cert version for this handshake?
+	initiatingVersionOverride cert.Version     // Protected by handshakeManager while the handshake is pending.
 	counter                   int              // How many attempts have we made so far
 	lastRemotes               []netip.AddrPort // Remotes that we sent to during the previous attempt
 	lastRelays                []netip.Addr     // Relays we attempted to use during the previous attempt
@@ -403,10 +403,9 @@ func (hm *handshakeManager) CheckAndComplete(hostinfo *hostInfo, handshakePacket
 	return existingHostInfo, nil
 }
 
-// Complete is a simpler version of CheckAndComplete when we already know we
-// won't have a localIndexId collision because we already have an entry in the
-// pendingHostMap. An existing hostinfo is returned if there was one.
-func (hm *handshakeManager) Complete(hostinfo *hostInfo, f *packetEngine) {
+// completeOutbound replaces the pending dial target with the certified addresses
+// and publishes the authenticated session.
+func (hm *handshakeManager) completeOutbound(hostinfo *hostInfo, vpnAddrs []netip.Addr) {
 	hm.mainHostMap.Lock()
 	defer hm.mainHostMap.Unlock()
 	hm.Lock()
@@ -421,9 +420,9 @@ func (hm *handshakeManager) Complete(hostinfo *hostInfo, f *packetEngine) {
 		)
 	}
 
-	// We need to remove from the pending hostmap first to avoid undoing work when after to the main hostmap.
 	hm.unlockedDeleteHostInfo(hostinfo)
-	hm.mainHostMap.unlockedAddHostInfo(hostinfo, f)
+	hostinfo.vpnAddrs = vpnAddrs
+	hm.mainHostMap.unlockedAddHostInfo(hostinfo, hm.f)
 }
 
 // allocateIndex generates a unique localIndexId for this hostInfo
@@ -521,8 +520,11 @@ func generateIndex(l *slog.Logger) (uint32, error) {
 func (hm *handshakeManager) buildStage0Packet(hh *handshakeHostInfo) bool {
 	cs := hm.f.pki.getCertState()
 	v := cs.DefaultVersion()
-	if hh.initiatingVersionOverride != cert.VersionPre1 {
-		v = hh.initiatingVersionOverride
+	hm.RLock()
+	override := hh.initiatingVersionOverride
+	hm.RUnlock()
+	if override != cert.VersionPre1 {
+		v = override
 	} else if v < cert.Version2 {
 		for _, a := range hh.hostinfo.vpnAddrs {
 			if a.Is6() {
@@ -682,12 +684,7 @@ func (hm *handshakeManager) beginHandshake(via packetSender, packet []byte, h *h
 	}
 
 	hm.sendHandshakeResponse(via, response, hostinfo, false)
-	hostinfo.remotes.RefreshFromHandshake(vpnAddrs)
-
-	// Don't wait for UpdateWorker
-	if f.lightHouse.IsAnyLighthouseAddr(vpnAddrs) {
-		f.lightHouse.TriggerUpdate()
-	}
+	f.lightHouse.refreshAfterHandshake(hostinfo)
 }
 
 // continueHandshake feeds an incoming packet to an existing pending handshake Machine.
@@ -848,33 +845,25 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 		"responderIndex", result.RemoteIndex,
 		"handshake", structuredMap{"stage": uint64(machine.MessageIndex()), "style": header.SubTypeName(header.Handshake, machine.Subtype())},
 		"durationNs", duration,
-		"sentCachedPackets", len(hh.controlQueue),
 	)
 
-	hostinfo.vpnAddrs = vpnAddrs
 	hostinfo.buildNetworks(f.myVpnNetworksTable, remoteCert.Certificate)
 
 	hostinfo.paths.setHandshakeRoute(receivedRoute(via), time.Now(), f.paths.probes.ActiveInterval)
-	hm.Complete(hostinfo, f)
-
-	if len(hh.controlQueue) > 0 {
-		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("Sending stored packets", "count", len(hh.controlQueue))
-		}
-		nb := make([]byte, 12, 12)
-		out := make([]byte, mtu)
-		for _, cp := range hh.controlQueue {
-			// The injected transport remains responsible for any write
-			// aggregation it wants to provide.
-			f.SendMessageToHostInfo(cp.messageType, cp.messageSubType, hostinfo, cp.payload, nb, out)
-		}
+	target := hostinfo.vpnAddrs[0]
+	hm.completeOutbound(hostinfo, vpnAddrs)
+	f.lightHouse.refreshAfterHandshake(hostinfo)
+	if len(hh.controlQueue) == 0 {
+		return
 	}
-
-	hostinfo.remotes.RefreshFromHandshake(vpnAddrs)
-
-	// Don't wait for UpdateWorker
-	if f.lightHouse.IsAnyLighthouseAddr(vpnAddrs) {
-		f.lightHouse.TriggerUpdate()
+	peer := hm.mainHostMap.QueryVpnAddr(target)
+	if peer == nil {
+		return
+	}
+	peer.logger(f.l).Debug("Sending stored packets", "count", len(hh.controlQueue))
+	nonce, out := make([]byte, 12), make([]byte, mtu)
+	for _, p := range hh.controlQueue {
+		f.SendMessageToHostInfo(p.messageType, p.messageSubType, peer, p.payload, nonce, out)
 	}
 }
 

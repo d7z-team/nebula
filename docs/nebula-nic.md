@@ -74,18 +74,18 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 
 ## 发现与运行时管理
 
-已知外层地址时，在 `Lighthouse.StaticHosts` 中将 peer 的 overlay 地址映射到 UDP endpoint。使用 lighthouse 时，服务端设置 `Lighthouse.AmLighthouse = true`，客户端把服务端的 overlay 地址加入 `Lighthouse.Hosts`，并为每个 lighthouse 配置静态 endpoint。
+已知 UDP 端点时，在 `Lighthouse.StaticHosts` 中将 peer 的 overlay 地址映射到该端点。使用 lighthouse 发现 UDP 路径时，服务端设置 `Lighthouse.AmLighthouse = true`，客户端将其 overlay 地址加入 `Lighthouse.Hosts` 并配置静态 UDP 端点。
 
 本机通过 `AdvertiseEndpoints` 通告固定地址，通过 `EndpointProvider` 提供动态地址。节点串行调用 provider。回调应响应 context 取消，在回调返回后再发起新的通告或重绑。
 
 | 操作 | API 与结果 |
 | --- | --- |
 | 查找或刷新 peer | `PeerDiscovery(addr)` 读取缓存。客户端用 `RefreshPeer(ctx, addr)` 将查询排队，同一地址共享在途请求，队列满时可用 context 取消等待。要等待可用隧道，调用 `ConnectPeer`。 |
-| 更新静态候选 | `SetPeerEndpoints(addr, endpoints)` 替换该 peer 的静态地址，已学习的地址和已建立的隧道继续可用。 |
-| 通告本机地址 | `AdvertiseNow(ctx)` 获取动态地址并向 lighthouse 发送更新。底层传输实现 `RebindableTransport` 时，可用 `node.Rebind()` 重绑并重新通告。 |
-| 建立或关闭连接 | `ConnectPeer(ctx, addr)` 等待经过认证且具有可用出口的隧道。取消 context 结束本次等待，共享握手可继续。`DisconnectPeer` 和 `DisconnectAll` 拆除隧道，后续流量可重新触发握手。 |
+| 更新静态候选 | `SetPeerEndpoints(addr, endpoints)` 替换该 peer 的静态 UDP 地址，已学习的地址和已建立的隧道继续可用。 |
+| 通告本机地址 | `AdvertiseNow(ctx)` 获取动态地址并向 lighthouse 发送更新。底层传输实现 `RebindableTransport` 时，`node.Rebind()` 重绑 UDP 并重新通告。 |
+| 建立或关闭连接 | `ConnectPeer(ctx, addr)` 等待经过认证且具有可用出口的隧道。取消 context 结束本次等待，共享握手可继续。`DisconnectPeer` 和 `DisconnectAll` 撤销所选 peer 的在途握手并关闭隧道，后续流量可重新触发握手。 |
 
-接收端按 `Lighthouse.MaxReported` 分别限制每个来源的 IPv4 endpoint、IPv6 endpoint 和 relay 数量。主动通告、查询回复和打洞通知超出单包容量时，发送端按相同的条数上限裁剪各类候选，保留各列表的原始顺序。直连握手先尝试 `Options.PreferredRanges` 中的地址，组内依次优先 IPv6、非私有 IPv4 和私有 IPv4。
+接收端按 `Lighthouse.MaxReported` 分别限制每个来源的 IPv4 endpoint、IPv6 endpoint 和 relay 数量。主动通告、查询回复和打洞通知超出单包容量时，发送端按相同的条数上限裁剪各类候选，保留各列表的原始顺序。UDP 直连握手先尝试 `Options.PreferredRanges` 中的地址，组内依次优先 IPv6、非私有 IPv4 和私有 IPv4。
 
 ## 调整节点容量
 
@@ -113,7 +113,7 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 | 现象 | 检查方法 |
 | --- | --- |
 | 节点启动后连不上 peer | 用 `node.Snapshot()` 核对本机状态、证书地址和外层监听地址，用 `node.Discovery()` 核对 lighthouse 配置。`node.PeerDiscovery(addr)` 返回缓存中已知的 endpoint 与 relay，供核对 UDP 可达性。`node.Err()` 可读取导致节点停机的传输错误。 |
-| 想知道 IP 包实际走了哪条路 | 在 `node.Peer(addr)` 返回的快照中，`CurrentEndpoint` 是当前直连地址，`LastDataPath` 记录最近一次成功提交给外层传输的 IP 包路径。其中 `Relay` 为空表示直连。 |
+| 想知道 IP 包实际走了哪条路 | 在 `node.Peer(addr)` 返回的快照中，`CurrentEndpoint` 是该会话已知的直连 UDP 地址，`LastDataPath` 记录最近一次成功提交给外层传输的 IP 包路径。其中 `Endpoint` 是外层 UDP 端点，`Relay` 为空表示直连。 |
 | peer 能连通，下游主机不通 | 核对下游路由的 `Gateway`、网关证书、两侧 NIC 转发开关和回程路由。直接使用 IPPort 时，缺少网关会返回 `ErrMissingGateway`，证书拒绝可通过 `errors.Is(err, nebula.ErrAddressNotCertified)` 判断。 |
 | 包已入队，稍后发送失败 | 查看 `ep.Stats()` 或 `port.Stats()` 的 `Queued`、`RejectedInbound`、`RejectedOutbound` 和 `LastDrop`。最后一项记录最近一次端口拒绝的原因和可取得的地址。适配器自身的 MTU 检查直接返回 gVisor 的 `ErrMessageTooLong`。 |
 | 队列满或正在更换网关 | `ErrQueueFull` 对应 gVisor 的 `ErrNoBufferSpace`。检查端口总容量与下一跳容量。更换网关后可用 `ClearPending(oldPeer)` 撤销旧下一跳的积压包，返回值为撤销数量。已交给传输的包仍可能完成发送。 |

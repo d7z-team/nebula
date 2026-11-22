@@ -101,11 +101,8 @@ func TestNodeUpstreamInterop(t *testing.T) {
 					newLocal := func(id nodeTestIdentity, i int, serve bool) *Node {
 						hosts := maps.Clone(static)
 						delete(hosts, id.addr)
-						n, err := New(t.Context(), Options{Identities: []Identity{id.identity}, CAPool: pool, Transport: WrapPacketConn(sockets[i]), InitiatingVersion: version, Relay: RelayOptions{Serve: serve}, Lighthouse: LighthouseOptions{AmLighthouse: !initiator && i == 0, StaticHosts: hosts}})
-						require.NoError(t, err)
-						require.NoError(t, n.Start())
-						t.Cleanup(func() { _ = n.Close(); _ = n.Wait() })
-						return n
+						opts := Options{Identities: []Identity{id.identity}, CAPool: pool, Transport: WrapPacketConn(sockets[i]), InitiatingVersion: version, Relay: RelayOptions{Serve: serve}, Lighthouse: LighthouseOptions{AmLighthouse: !initiator && i == 0, StaticHosts: hosts}}
+						return startTestNode(t, opts)
 					}
 					if stockRelay {
 						startStockNode(t, binaryPath, pool, relay, sockets[2], static, []netip.Addr{}, true)

@@ -13,9 +13,9 @@ Embed [Nebula](https://github.com/slackhq/nebula) in a Go application and attach
 
 This project is an independent fork of [`slackhq/nebula`](https://github.com/slackhq/nebula), based on upstream commit [`a136e25`](https://github.com/slackhq/nebula/commit/a136e25a0602ed4f2ada15d0f160e52a2517d9e0). The latest recorded upstream review covers changes through [`7876efa`](https://github.com/slackhq/nebula/commit/7876efaaf499061109ca888f6ad4f197140087b8), with selected fixes backported to this fork.
 
-This fork is distributed as an embeddable Go library with its own `Node` API. Use the upstream project for the standalone Nebula daemon and its YAML configuration.
+This fork provides the embeddable `Node` API. Upstream provides the standalone daemon and its YAML configuration.
 
-The default UDP framing interoperates with upstream Nebula. Leave `Options.DatagramMagic` empty when communicating with upstream peers, lighthouses, or relays. Interoperability tests cover v1 and v2 certificates, handshakes initiated by either implementation, and relays running either implementation. The Go management APIs, health-aware path selection, and custom datagram prefixes are features of this fork. [Run the interoperability tests](#testing).
+Nodes in this fork communicate with upstream peers, lighthouses, and relays over UDP. Keep `Options.DatagramMagic` empty for upstream interoperability. Tests cover v1 and v2 certificates, handshakes initiated by either implementation, and relays running either implementation. [Run the interoperability tests](#testing).
 
 ## Installation
 
@@ -35,7 +35,7 @@ The fork retains the upstream module path. Import `github.com/slackhq/nebula` an
 2. Create a `nebulagvisor.Endpoint` for the node and register it as a NIC in your gVisor stack. Assign the overlay address from the certificate and add a route to the peer.
 3. Start the node and dial the peer's overlay address through gVisor. The first connection triggers the Nebula handshake.
 
-The [complete TCP client example](docs/quickstart.md) shows setup and cleanup for a connection to `10.42.0.254:8080`.
+The [overlay TCP client example](docs/quickstart.md) shows setup and cleanup for a connection to `10.42.0.254:8080`.
 
 ## Documentation
 
@@ -60,25 +60,6 @@ To run the interoperability suite, point `NEBULA_INTEROP_BINARY` at an upstream 
 ```sh
 NEBULA_INTEROP_BINARY=/path/to/upstream/nebula go test . -run '^TestNodeUpstream(Interop|RelayInitiator)$' -count=1
 ```
-
-<details>
-<summary>Forwarding tests and benchmarks</summary>
-
-```sh
-# Dual-stack gateway forwarding through gVisor
-go test . -run '^TestNodeGVisorForwardingAndDetach$' -count=1
-
-# Path selection and recovery after rebinding 1,000 logical sessions
-go test . -run '^(TestPathQualitySelection|TestPathRebindAtScale)$' -v -count=1
-
-# Discovery query coalescing
-go test . -run '^$' -bench '^BenchmarkPendingLighthouseQuery$' -benchmem
-
-# Datagram framing with the default format and a two-byte prefix
-go test . -run '^$' -bench '^BenchmarkDatagramFraming$' -benchmem -cpu=1
-```
-
-</details>
 
 ## License
 

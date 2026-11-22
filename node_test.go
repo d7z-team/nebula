@@ -203,6 +203,18 @@ func newNodeTestIdentitiesFor(t testing.TB, version cert.Version, curve cert.Cur
 	return pool, a, b
 }
 
+func startTestNode(t *testing.T, opts Options) *Node {
+	t.Helper()
+	n, err := New(t.Context(), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, n.Close())
+		require.NoError(t, n.Wait())
+	})
+	require.NoError(t, n.Start())
+	return n
+}
+
 func newNodeTestPair(t *testing.T) (*Node, *Node, nodeTestIdentity, nodeTestIdentity) {
 	curve := cert.Curve_CURVE25519
 	if fips140.Enforced() {

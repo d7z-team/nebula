@@ -234,6 +234,13 @@ func (lh *lighthouse) queryServerContext(ctx context.Context, addr netip.Addr) e
 	}
 }
 
+func (lh *lighthouse) refreshAfterHandshake(h *hostInfo) {
+	h.remotes.RefreshFromHandshake(h.vpnAddrs)
+	if lh.IsAnyLighthouseAddr(h.vpnAddrs) {
+		lh.TriggerUpdate()
+	}
+}
+
 func (lh *lighthouse) getOrCreateRemotes(vpnAddrs []netip.Addr) *remoteList {
 	lh.RLock()
 	if v, ok := lh.addrMap[vpnAddrs[0]]; ok {

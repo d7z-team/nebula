@@ -31,7 +31,13 @@ opts.Paths.Peers = map[netip.Addr]nebula.PeerPathPolicy{
 
 ## 手动检查去程与回程
 
-`CheckPeerPath` 发送认证探测并等待回显。传入零值检查当前出口，传入 `TunnelPath{Relay: relay}` 检查指定中转，传入 `TunnelPath{Endpoint: ep}` 检查已知直连地址。
+`node.CheckPeerPath(ctx, peer, path)` 向指定路径发送认证探测并等待回显。
+
+| 要检查的路径 | `path` |
+| --- | --- |
+| 当前业务出口 | `nebula.TunnelPath{}` |
+| 已知 UDP 直连端点 | `nebula.TunnelPath{Endpoint: ep}` |
+| 单跳中转 | `nebula.TunnelPath{Relay: relay}` |
 
 ```go
 check, err := node.CheckPeerPath(ctx, gateway, nebula.TunnelPath{})
@@ -50,7 +56,7 @@ log.Printf("sent=%v received=%v rtt=%v", check.Sent, check.Received, check.RTT)
 | `ErrPathPolicy` | 请求路径或探测回程违反本机策略。 |
 | `ErrPathTimeout` | 已发出探测，等待期限内未收到认证回显。 |
 | `ErrPathChanged` | 检查期间发生了 Rebind、会话退役或相关策略更新，可以重新检查指定路径。 |
-| `ErrPeerUnavailable` | peer 或指定中转不可用，或在 `CheckTimeout` 内未取得路径检查结果。 |
+| `ErrPeerUnavailable` | peer 或指定路径不可用，或在 `CheckTimeout` 内未取得路径检查结果。 |
 
 ## 自动巡检与切换
 

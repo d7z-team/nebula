@@ -142,7 +142,7 @@ func (p *punchManager) run(ctx context.Context) {
 			if p.l.Enabled(context.Background(), slog.LevelDebug) {
 				p.l.Debug("Sending a nebula test packet", "vpnAddr", job.vpnAddr)
 			}
-			p.engine.SendMessageToVpnAddr(header.Test, header.TestRequest, job.vpnAddr, []byte(""), nb, out)
+			p.engine.SendMessageToVpnAddr(header.Test, header.TestRequest, job.vpnAddr, nil, nb, out)
 		}
 	})
 }

@@ -12,7 +12,7 @@ type RateLimiter interface {
 // When allowed it returns l, with a "suppressed" count attached if lim denied calls since its last allowed one.
 // A nil lim allows everything.
 //
-//	if l, ok := logging.RateLimited(f.l, f.udpTxErrLimiter); ok {
+//	if l, ok := logging.RateLimited(f.l, f.txErrLimiter); ok {
 //		hostinfo.logger(l).Error("Failed to write outgoing packet", "error", err)
 //	}
 func RateLimited(l *slog.Logger, lim RateLimiter) (*slog.Logger, bool) {

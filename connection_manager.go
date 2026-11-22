@@ -296,37 +296,13 @@ func (cm *connectionManager) tryRehandshake(hostinfo *hostInfo) {
 	cs := cm.engine.pki.getCertState()
 	curCrtVersion := hostinfo.connectionState.myCert.Version()
 	peerCrt := hostinfo.connectionState.peerCert
-	if peerCrt != nil && curCrtVersion < peerCrt.Certificate.Version() {
-		// if our certificate version is less than theirs, and we have a matching version available, rehandshake?
-		if cs.getCertificate(peerCrt.Certificate.Version()) != nil {
-			cm.l.Info("Re-handshaking with remote",
-				"vpnAddrs", hostinfo.vpnAddrs,
-				"version", curCrtVersion,
-				"peerVersion", peerCrt.Certificate.Version(),
-				"reason", "local certificate version lower than peer, attempting to correct",
-			)
-			cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], func(hh *handshakeHostInfo) {
-				hh.initiatingVersionOverride = peerCrt.Certificate.Version()
-			})
-			return
-		}
+	v := max(cs.initiatingVersion, curCrtVersion)
+	if peerCrt != nil && curCrtVersion < peerCrt.Certificate.Version() && cs.GetCredential(peerCrt.Certificate.Version()) != nil {
+		v = peerCrt.Certificate.Version()
 	}
-	if curCrtVersion < cs.initiatingVersion {
-		cm.l.Info("Re-handshaking with remote",
-			"vpnAddrs", hostinfo.vpnAddrs,
-			"reason", "current cert version < pki.initiatingVersion",
-		)
-
-		cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
+	if curCrtVersion >= v && hostinfo.connectionState.messageCounter.Load() < rehandshakeAfterMessages {
 		return
 	}
-	if hostinfo.connectionState.messageCounter.Load() >= rehandshakeAfterMessages {
-		cm.l.Info("Re-handshaking with remote",
-			"vpnAddrs", hostinfo.vpnAddrs,
-			"reason", "message counter rehandshake threshold reached",
-		)
-
-		cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
-		return
-	}
+	cm.l.Info("Renewing tunnel keys", "vpnAddrs", hostinfo.vpnAddrs, "certificateVersion", v, "messageCounter", hostinfo.connectionState.messageCounter.Load())
+	cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], func(hh *handshakeHostInfo) { hh.initiatingVersionOverride = v })
 }

@@ -38,7 +38,7 @@ type packetEngine struct {
 	forwardedDatagrams   atomic.Uint64
 	roamSuppressInterval time.Duration
 	rebindEpoch          atomic.Uint32
-	udpTxErrLimiter      *ratelimit.Limiter
+	txErrLimiter         *ratelimit.Limiter
 	txOversizeLimiter    *ratelimit.Limiter
 	l                    *slog.Logger
 }
@@ -67,7 +67,7 @@ func newPacketEngine(pki *pkiState, opts *Options, logger *slog.Logger) *packetE
 		myVpnAddrs:           cs.myVpnAddrs,
 		myVpnAddrsTable:      cs.myVpnAddrsTable,
 		overlayBroadcasts:    make(map[netip.Addr]struct{}),
-		udpTxErrLimiter:      newLogLimiter(),
+		txErrLimiter:         newLogLimiter(),
 		txOversizeLimiter:    newLogLimiter(),
 	}
 	if len(f.datagramMagic) > 0 {

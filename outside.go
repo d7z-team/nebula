@@ -44,13 +44,11 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 		return
 	}
 
-	if !via.IsRelayed {
-		if f.myVpnNetworksTable.Contains(via.UdpAddr.Addr()) {
-			if f.l.Enabled(context.Background(), slog.LevelDebug) {
-				f.l.Debug("Refusing to process double encrypted packet", "from", via)
-			}
-			return
+	if !via.IsRelayed && f.myVpnNetworksTable.Contains(via.UdpAddr.Addr()) {
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("Refusing to process double encrypted packet", "from", via)
 		}
+		return
 	}
 
 	// Unencrypted packets
@@ -66,8 +64,7 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 		return
 	}
 
-	// relay packets are special
-	isMessageRelay := (h.Type == header.Message && h.Subtype == header.MessageRelay)
+	isMessageRelay := h.Type == header.Message && h.Subtype == header.MessageRelay
 
 	var hostinfo *hostInfo
 	if isMessageRelay {
@@ -94,7 +91,6 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 
 	// All remaining packets are encrypted
 	if isMessageRelay {
-		// relay packets are special, this branch should always early-return
 		err = hostinfo.connectionState.VerifyRelay(f.l, h.MessageCounter, packet, rxc.nb)
 		if err != nil {
 			if f.l.Enabled(context.Background(), slog.LevelDebug) {

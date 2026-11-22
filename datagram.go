@@ -67,8 +67,6 @@ func (p *packetConnTransport) LocalAddr() (netip.AddrPort, error) {
 
 func addrPort(addr net.Addr) (netip.AddrPort, error) {
 	switch a := addr.(type) {
-	case *net.UDPAddr:
-		return a.AddrPort(), nil
 	case interface{ AddrPort() netip.AddrPort }:
 		return a.AddrPort(), nil
 	default:

@@ -62,11 +62,7 @@ func pathTestMeshWithOptions(t *testing.T, count int, opts Options) ([]*Node, []
 		}
 		opts.Identities, opts.CAPool, opts.Transport = []Identity{id.identity}, pool, transports[i]
 		opts.Lighthouse.StaticHosts = static
-		n, err := New(t.Context(), opts)
-		require.NoError(t, err)
-		require.NoError(t, n.Start())
-		nodes = append(nodes, n)
-		t.Cleanup(func() { require.NoError(t, n.Close()); require.NoError(t, n.Wait()) })
+		nodes = append(nodes, startTestNode(t, opts))
 	}
 	return nodes, ids, transports
 }
