@@ -42,7 +42,6 @@ func TestCertificateV1_Marshal(t *testing.T) {
 
 	b, err := nc.Marshal()
 	require.NoError(t, err)
-	//t.Log("Cert size:", len(b))
 
 	nc2, err := unmarshalCertificateV1(b, nil)
 	require.NoError(t, err)
@@ -229,7 +228,6 @@ func TestCertificateV1_VerifyPrivateKey(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, caKey2, _ := NewTestCaCert(Version1, Curve_CURVE25519, time.Time{}, time.Time{}, nil, nil, nil)
-	require.NoError(t, err)
 	err = ca.VerifyPrivateKey(Curve_CURVE25519, caKey2)
 	require.Error(t, err)
 
@@ -241,7 +239,8 @@ func TestCertificateV1_VerifyPrivateKey(t *testing.T) {
 	err = c.VerifyPrivateKey(Curve_CURVE25519, rawPriv)
 	require.NoError(t, err)
 
-	_, priv2 := X25519Keypair()
+	_, priv2, err := GenerateKeyAgreementKey(Curve_CURVE25519)
+	require.NoError(t, err)
 	err = c.VerifyPrivateKey(Curve_CURVE25519, priv2)
 	require.Error(t, err)
 }
@@ -252,7 +251,6 @@ func TestCertificateV1_VerifyPrivateKeyP256(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, caKey2, _ := NewTestCaCert(Version1, Curve_P256, time.Time{}, time.Time{}, nil, nil, nil)
-	require.NoError(t, err)
 	err = ca.VerifyPrivateKey(Curve_P256, caKey2)
 	require.Error(t, err)
 
@@ -264,7 +262,8 @@ func TestCertificateV1_VerifyPrivateKeyP256(t *testing.T) {
 	err = c.VerifyPrivateKey(Curve_P256, rawPriv)
 	require.NoError(t, err)
 
-	_, priv2 := P256Keypair()
+	_, priv2, err := GenerateKeyAgreementKey(Curve_P256)
+	require.NoError(t, err)
 	err = c.VerifyPrivateKey(Curve_P256, priv2)
 	require.Error(t, err)
 }
@@ -306,11 +305,15 @@ func TestMarshalingCertificateV1Consistency(t *testing.T) {
 	assert.Equal(t, "0a0774657374696e671212828284508080fcff0f8182845080feffff0f1a12838284488080fcff0f8282844880feffff0f220b746573742d67726f757031220b746573742d67726f757032220b746573742d67726f75703328cd1c30cdb8ccf0af073a20313233343536373839306162636564666768696a3132333435363738393061624a081234567890abcedf", fmt.Sprintf("%x", b))
 }
 
-func TestCertificateV1_Copy(t *testing.T) {
-	ca, _, caKey, _ := NewTestCaCert(Version1, Curve_CURVE25519, time.Now(), time.Now().Add(10*time.Minute), nil, nil, nil)
-	c, _, _, _ := NewTestCert(Version1, Curve_CURVE25519, ca, caKey, "test", time.Now(), time.Now().Add(5*time.Minute), nil, nil, nil)
-	cc := c.Copy()
-	test.AssertDeepCopyEqual(t, c, cc)
+func TestCertificateCopy(t *testing.T) {
+	for _, v := range []Version{Version1, Version2} {
+		t.Run(fmt.Sprint(v), func(t *testing.T) {
+			ca, _, caKey, _ := NewTestCaCert(v, Curve_CURVE25519, time.Time{}, time.Time{}, nil, nil, nil)
+			c, _, _, _ := NewTestCert(v, Curve_CURVE25519, ca, caKey, "test", time.Time{}, time.Time{},
+				[]netip.Prefix{netip.MustParsePrefix("10.42.0.1/24")}, []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, []string{"gateway"})
+			test.AssertDeepCopyEqual(t, c, c.Copy())
+		})
+	}
 }
 
 func TestUnmarshalCertificateV1(t *testing.T) {

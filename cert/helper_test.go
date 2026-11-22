@@ -1,16 +1,8 @@
 package cert
 
 import (
-	"crypto/ecdh"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"io"
 	"net/netip"
 	"time"
-
-	"golang.org/x/crypto/curve25519"
-	"golang.org/x/crypto/ed25519"
 )
 
 // testCertNow is the reference "now" used to derive default before/after times
@@ -21,22 +13,9 @@ var testCertNow = time.Now().Round(time.Second)
 
 // NewTestCaCert will create a new ca certificate
 func NewTestCaCert(version Version, curve Curve, before, after time.Time, networks, unsafeNetworks []netip.Prefix, groups []string) (Certificate, []byte, []byte, []byte) {
-	var err error
-	var pub, priv []byte
-
-	switch curve {
-	case Curve_CURVE25519:
-		pub, priv, err = ed25519.GenerateKey(rand.Reader)
-	case Curve_P256:
-		privk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			panic(err)
-		}
-
-		pub = elliptic.Marshal(elliptic.P256(), privk.PublicKey.X, privk.PublicKey.Y)
-		priv = privk.D.FillBytes(make([]byte, 32))
-	default:
-		// There is no default to allow the underlying lib to respond with an error
+	pub, priv, err := GenerateSigningKey(curve)
+	if err != nil {
+		panic(err)
 	}
 
 	if before.IsZero() {
@@ -87,14 +66,9 @@ func NewTestCert(v Version, curve Curve, ca Certificate, key []byte, name string
 		networks = []netip.Prefix{netip.MustParsePrefix("10.0.0.123/8")}
 	}
 
-	var pub, priv []byte
-	switch curve {
-	case Curve_CURVE25519:
-		pub, priv = X25519Keypair()
-	case Curve_P256:
-		pub, priv = P256Keypair()
-	default:
-		panic("unknown curve")
+	pub, priv, err := GenerateKeyAgreementKey(curve)
+	if err != nil {
+		panic(err)
 	}
 
 	nc := &TBSCertificate{
@@ -121,27 +95,4 @@ func NewTestCert(v Version, curve Curve, ca Certificate, key []byte, name string
 	}
 
 	return c, pub, MarshalPrivateKeyToPEM(curve, priv), pem
-}
-
-func X25519Keypair() ([]byte, []byte) {
-	privkey := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, privkey); err != nil {
-		panic(err)
-	}
-
-	pubkey, err := curve25519.X25519(privkey, curve25519.Basepoint)
-	if err != nil {
-		panic(err)
-	}
-
-	return pubkey, privkey
-}
-
-func P256Keypair() ([]byte, []byte) {
-	privkey, err := ecdh.P256().GenerateKey(rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	pubkey := privkey.PublicKey()
-	return pubkey.Bytes(), privkey.Bytes()
 }

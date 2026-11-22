@@ -1,8 +1,6 @@
 package handshake
 
 import (
-	"fmt"
-
 	"github.com/flynn/noise"
 	"github.com/slackhq/nebula/header"
 )
@@ -31,24 +29,4 @@ var subtypeInfos = map[header.MessageSubType]subtypeInfo{
 			{expectsPayload: true, expectsCert: true},
 		},
 	},
-
-	// XX: 3 messages
-	//   msg1 (I->R): payload only
-	//   msg2 (R->I): payload + cert
-	//   msg3 (I->R): cert only
-	//header.HandshakeXXPSK0: {
-	//	pattern: noise.HandshakeXX,
-	//	msgs: []msgFlags{
-	//		{expectsPayload: true, expectsCert: false},
-	//		{expectsPayload: true, expectsCert: true},
-	//		{expectsPayload: false, expectsCert: true},
-	//	},
-	//},
-}
-
-func subtypeInfoFor(subtype header.MessageSubType) (subtypeInfo, error) {
-	if info, ok := subtypeInfos[subtype]; ok {
-		return info, nil
-	}
-	return subtypeInfo{}, fmt.Errorf("%w: %d", ErrUnknownSubtype, subtype)
 }

@@ -13,9 +13,6 @@ updates:
       golang-x-dependencies:
         patterns:
           - "golang.org/x/*"
-      zx2c4-dependencies:
-        patterns:
-          - "golang.zx2c4.com/*"
       protobuf-dependencies:
         patterns:
           - "github.com/golang/protobuf"

@@ -27,6 +27,7 @@ import (
 //
 // For log lines use logging.RateLimited, which attaches the denied count to the logger as "suppressed".
 type Limiter struct {
+	start  time.Time
 	every  int64
 	slack  int64
 	tat    atomic.Int64
@@ -41,7 +42,7 @@ const maxSpan = math.MaxInt64 / 2
 // A `burst` under 1 is 1, and an `every` of 0 or less never limits.
 // It returns an error if `burst` * `every` is over about 146 years.
 func New(burst int, every time.Duration) (*Limiter, error) {
-	l := &Limiter{}
+	l := &Limiter{start: time.Now()}
 	if every > 0 {
 		burst = max(burst, 1)
 		if int64(burst) > maxSpan/int64(every) {
@@ -53,10 +54,6 @@ func New(burst int, every time.Duration) (*Limiter, error) {
 	return l, nil
 }
 
-var monoStart = time.Now()
-
-func monoNow() int64 { return int64(time.Since(monoStart)) }
-
 // Allow reports whether this call is allowed.
 // If a token is available it spends it and returns the calls denied since the last allowed one, and true.
 // Otherwise it returns 0 and false, and counts the denial.
@@ -65,7 +62,7 @@ func (l *Limiter) Allow() (uint64, bool) {
 	if l == nil {
 		return 0, true
 	}
-	return l.allow(monoNow())
+	return l.allow(int64(time.Since(l.start)))
 }
 
 // allow is Allow at a given monotonic time.

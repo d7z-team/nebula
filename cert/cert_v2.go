@@ -336,40 +336,14 @@ func (c *certificateV2) marshalJSON() (m, error) {
 }
 
 func (c *certificateV2) Copy() Certificate {
-	nc := &certificateV2{
-		details: detailsV2{
-			name:      c.details.name,
-			notBefore: c.details.notBefore,
-			notAfter:  c.details.notAfter,
-			isCA:      c.details.isCA,
-			issuer:    c.details.issuer,
-		},
-		curve:      c.curve,
-		publicKey:  make([]byte, len(c.publicKey)),
-		signature:  make([]byte, len(c.signature)),
-		rawDetails: make([]byte, len(c.rawDetails)),
-	}
-
-	if c.details.groups != nil {
-		nc.details.groups = make([]string, len(c.details.groups))
-		copy(nc.details.groups, c.details.groups)
-	}
-
-	if c.details.networks != nil {
-		nc.details.networks = make([]netip.Prefix, len(c.details.networks))
-		copy(nc.details.networks, c.details.networks)
-	}
-
-	if c.details.unsafeNetworks != nil {
-		nc.details.unsafeNetworks = make([]netip.Prefix, len(c.details.unsafeNetworks))
-		copy(nc.details.unsafeNetworks, c.details.unsafeNetworks)
-	}
-
-	copy(nc.rawDetails, c.rawDetails)
-	copy(nc.signature, c.signature)
-	copy(nc.publicKey, c.publicKey)
-
-	return nc
+	nc := *c
+	nc.details.groups = slices.Clone(c.details.groups)
+	nc.details.networks = slices.Clone(c.details.networks)
+	nc.details.unsafeNetworks = slices.Clone(c.details.unsafeNetworks)
+	nc.publicKey = append([]byte{}, c.publicKey...)
+	nc.signature = append([]byte{}, c.signature...)
+	nc.rawDetails = append([]byte{}, c.rawDetails...)
+	return &nc
 }
 
 func (c *certificateV2) fromTBSCertificate(t *TBSCertificate) error {

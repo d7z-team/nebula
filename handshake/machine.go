@@ -81,9 +81,9 @@ func NewMachine(
 	initiator bool,
 	subtype header.MessageSubType,
 ) (*Machine, error) {
-	info, err := subtypeInfoFor(subtype)
-	if err != nil {
-		return nil, err
+	info, ok := subtypeInfos[subtype]
+	if !ok {
+		return nil, fmt.Errorf("%w: %d", ErrUnknownSubtype, subtype)
 	}
 
 	cred := getCred(version)

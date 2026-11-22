@@ -1,19 +1,14 @@
 package nebula
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/header"
 )
 
 type trafficDecision int
@@ -25,102 +20,44 @@ const (
 	swapPrimary    trafficDecision = 3
 	migrateRelays  trafficDecision = 4
 	tryRehandshake trafficDecision = 5
-	sendTestPacket trafficDecision = 6
 )
 
 type connectionManager struct {
 	// relayUsed holds which relay localIndexs are in use
 	relayUsed     map[uint32]struct{}
-	relayUsedLock *sync.RWMutex
+	relayUsedLock sync.RWMutex
 
-	hostMap      *HostMap
-	trafficTimer *LockingTimerWheel[uint32]
-	intf         *Interface
-	punchy       *Punchy
+	hostMap      *hostMap
+	trafficTimer *timerWheel[uint32]
+	engine       *packetEngine
+	punchy       *punchManager
 
-	// Configuration settings
 	checkInterval           time.Duration
 	pendingDeletionInterval time.Duration
-	inactivityTimeout       atomic.Int64
-	dropInactive            atomic.Bool
+	inactivityTimeout       time.Duration
+	dropInactive            bool
 
 	l *slog.Logger
 }
 
-func newConnectionManagerFromConfig(l *slog.Logger, c *config.C, hm *HostMap, p *Punchy) *connectionManager {
-	cm := &connectionManager{
-		hostMap:       hm,
-		l:             l,
-		punchy:        p,
-		relayUsed:     make(map[uint32]struct{}),
-		relayUsedLock: &sync.RWMutex{},
-	}
-
-	cm.reload(c, true)
-	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
-		r.RestartRequiredIfChanged("timers.connection_alive_interval", "timers.pending_deletion_interval")
-		cm.reload(c, false)
-	})
-
-	return cm
-}
-
-func (cm *connectionManager) reload(c *config.C, initial bool) {
-	if initial {
-		cm.checkInterval = time.Duration(c.GetInt("timers.connection_alive_interval", 5)) * time.Second
-		cm.pendingDeletionInterval = time.Duration(c.GetInt("timers.pending_deletion_interval", 10)) * time.Second
-
-		// We want at least a minimum resolution of 500ms per tick so that we can hit these intervals
-		// pretty close to their configured duration.
-		// The inactivity duration is checked each time a hostinfo ticks through so we don't need the wheel to contain it.
-		minDuration := min(time.Millisecond*500, cm.checkInterval, cm.pendingDeletionInterval)
-		maxDuration := max(cm.checkInterval, cm.pendingDeletionInterval)
-		cm.trafficTimer = NewLockingTimerWheel[uint32](minDuration, maxDuration)
-	}
-
-	if initial || c.HasChanged("tunnels.inactivity_timeout") {
-		old := cm.getInactivityTimeout()
-		cm.inactivityTimeout.Store((int64)(c.GetDuration("tunnels.inactivity_timeout", 10*time.Minute)))
-		if !initial {
-			cm.l.Info("Inactivity timeout has changed",
-				"oldDuration", old,
-				"newDuration", cm.getInactivityTimeout(),
-			)
-		}
-	}
-
-	if initial || c.HasChanged("tunnels.drop_inactive") {
-		old := cm.dropInactive.Load()
-		cm.dropInactive.Store(c.GetBool("tunnels.drop_inactive", false))
-		if !initial {
-			cm.l.Info("Drop inactive setting has changed",
-				"oldBool", old,
-				"newBool", cm.dropInactive.Load(),
-			)
-		}
+func newConnectionManager(l *slog.Logger, hm *hostMap, p *punchManager, cfg ConnectionOptions) *connectionManager {
+	cfg.CheckInterval = positiveOr(cfg.CheckInterval, 5*time.Second)
+	cfg.PendingDeletionInterval = positiveOr(cfg.PendingDeletionInterval, 10*time.Second)
+	cfg.InactivityTimeout = positiveOr(cfg.InactivityTimeout, 10*time.Minute)
+	minimum := min(500*time.Millisecond, cfg.CheckInterval, cfg.PendingDeletionInterval)
+	maximum := max(cfg.CheckInterval, cfg.PendingDeletionInterval)
+	return &connectionManager{
+		hostMap: hm, l: l, punchy: p,
+		relayUsed:               make(map[uint32]struct{}),
+		trafficTimer:            newTimerWheel[uint32](minimum, maximum),
+		checkInterval:           cfg.CheckInterval,
+		pendingDeletionInterval: cfg.PendingDeletionInterval,
+		inactivityTimeout:       cfg.InactivityTimeout,
+		dropInactive:            cfg.DropInactive,
 	}
 }
 
-func (cm *connectionManager) getInactivityTimeout() time.Duration {
-	return (time.Duration)(cm.inactivityTimeout.Load())
-}
-
-func (cm *connectionManager) In(h *HostInfo) {
-	h.markIn()
-}
-
-// OutNoRebind records outbound traffic without consuming the rebind epoch, for relayed sends: the direct path
-// to the relay consumes the edge, the via send must not.
-func (cm *connectionManager) OutNoRebind(h *HostInfo) {
-	h.markOutOnly()
-}
-
-// Out records outbound traffic and reports whether we rebound since this tunnel last sent
-func (cm *connectionManager) Out(h *HostInfo) bool {
-	return h.markOut(cm.intf.rebindEpoch.Load())
-}
-
-func (cm *connectionManager) RelayUsed(localIndex uint32) {
+func (cm *connectionManager) recordRelayUse(localIndex uint32) {
 	cm.relayUsedLock.RLock()
 	// If this already exists, return
 	if _, ok := cm.relayUsed[localIndex]; ok {
@@ -133,23 +70,9 @@ func (cm *connectionManager) RelayUsed(localIndex uint32) {
 	cm.relayUsedLock.Unlock()
 }
 
-// getAndResetTrafficCheck returns if there was any inbound or outbound traffic within the last tick and
-// resets the state for this local index
-func (cm *connectionManager) getAndResetTrafficCheck(h *HostInfo, now time.Time) (bool, bool) {
-	in, out := h.takeTraffic()
-	if in || out {
-		h.lastUsed = now
-	}
-	return in, out
-}
-
 func (cm *connectionManager) Start(ctx context.Context) {
-	clockSource := time.NewTicker(cm.trafficTimer.t.tickDuration)
+	clockSource := time.NewTicker(cm.trafficTimer.tickDuration)
 	defer clockSource.Stop()
-
-	p := []byte("")
-	nb := make([]byte, 12, 12)
-	out := make([]byte, mtu)
 
 	for {
 		select {
@@ -164,23 +87,23 @@ func (cm *connectionManager) Start(ctx context.Context) {
 					break
 				}
 
-				cm.doTrafficCheck(localIndex, p, nb, out, now)
+				cm.doTrafficCheck(localIndex, now)
 			}
 		}
 	}
 }
 
-func (cm *connectionManager) doTrafficCheck(localIndex uint32, p, nb, out []byte, now time.Time) {
+func (cm *connectionManager) doTrafficCheck(localIndex uint32, now time.Time) {
 	decision, hostinfo, primary := cm.makeTrafficDecision(localIndex, now)
 
 	switch decision {
 	case deleteTunnel:
 		// Local delete only, clearing the lighthouse cache if this was the last hostinfo for the vpn addr
-		cm.intf.closeTunnel(hostinfo)
+		cm.engine.closeTunnel(hostinfo)
 
 	case closeTunnel:
-		cm.intf.sendCloseTunnel(hostinfo)
-		cm.intf.closeTunnel(hostinfo)
+		cm.engine.sendCloseTunnel(hostinfo)
+		cm.engine.closeTunnel(hostinfo)
 
 	case swapPrimary:
 		cm.swapPrimary(hostinfo, primary)
@@ -190,269 +113,128 @@ func (cm *connectionManager) doTrafficCheck(localIndex uint32, p, nb, out []byte
 
 	case tryRehandshake:
 		cm.tryRehandshake(hostinfo)
-
-	case sendTestPacket:
-		cm.intf.SendMessageToHostInfo(header.Test, header.TestRequest, hostinfo, p, nb, out)
 	}
 
 	cm.resetRelayTrafficCheck(hostinfo)
 }
 
-func (cm *connectionManager) resetRelayTrafficCheck(hostinfo *HostInfo) {
+func (cm *connectionManager) resetRelayTrafficCheck(hostinfo *hostInfo) {
 	if hostinfo != nil {
 		cm.relayUsedLock.Lock()
 		defer cm.relayUsedLock.Unlock()
 		// No need to migrate any relays, delete usage info now.
-		for _, idx := range hostinfo.relayState.CopyRelayForIdxs() {
+		for _, idx := range hostinfo.relayState.localIndexes() {
 			delete(cm.relayUsed, idx)
 		}
 	}
 }
 
-func (cm *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo) {
-	relayFor := oldhostinfo.relayState.CopyAllRelayFor()
+func (cm *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *hostInfo) {
+	relayFor := oldhostinfo.relayState.mappings()
 
 	for _, r := range relayFor {
-		existing, ok := newhostinfo.relayState.QueryRelayForByIp(r.PeerAddr)
+		existing, ok := newhostinfo.relayState.mappingByAddr(r.PeerAddr)
 
-		var index uint32
-		var relayFrom netip.Addr
-		var relayTo netip.Addr
-		switch {
-		case ok:
-			switch existing.State {
-			case Established, PeerRequested, Disestablished:
-				// This relay already exists in newhostinfo, then do nothing.
+		if ok {
+			if existing.State != relayRequested {
 				continue
-			case Requested:
-				// The relay exists in a Requested state; re-send the request
-				index = existing.LocalIndex
-				switch r.Type {
-				case TerminalType:
-					relayFrom = cm.intf.myVpnAddrs[0]
-					relayTo = existing.PeerAddr
-				case ForwardingType:
-					relayFrom = existing.PeerAddr
-					relayTo = newhostinfo.vpnAddrs[0]
-				default:
-					// should never happen
-					panic(fmt.Sprintf("Migrating unknown relay type: %v", r.Type))
-				}
 			}
-		case !ok:
+		} else {
 			cm.relayUsedLock.RLock()
-			if _, relayUsed := cm.relayUsed[r.LocalIndex]; !relayUsed {
-				// The relay hasn't been used; don't migrate it.
-				cm.relayUsedLock.RUnlock()
+			_, used := cm.relayUsed[r.LocalIndex]
+			cm.relayUsedLock.RUnlock()
+			if !used {
 				continue
 			}
-			cm.relayUsedLock.RUnlock()
-			// The relay doesn't exist at all; create some relay state and send the request.
 			var err error
-			index, err = AddRelay(cm.l, newhostinfo, cm.hostMap, r.PeerAddr, nil, r.Type, Requested)
+			existing, err = cm.hostMap.getOrAddRelay(newhostinfo, r.PeerAddr, 0, r.Type, relayRequested)
 			if err != nil {
 				cm.l.Error("failed to migrate relay to new hostinfo", "error", err)
 				continue
 			}
-			switch r.Type {
-			case TerminalType:
-				relayFrom = cm.intf.myVpnAddrs[0]
-				relayTo = r.PeerAddr
-			case ForwardingType:
-				relayFrom = r.PeerAddr
-				relayTo = newhostinfo.vpnAddrs[0]
-			default:
-				// should never happen
-				panic(fmt.Sprintf("Migrating unknown relay type: %v", r.Type))
-			}
 		}
 
-		// Send a CreateRelayRequest to the peer.
-		req := NebulaControl{
-			Type:                NebulaControl_CreateRelayRequest,
-			InitiatorRelayIndex: index,
-		}
-
-		switch newhostinfo.GetCert().Certificate.Version() {
-		case cert.Version1:
-			if !relayFrom.Is4() {
-				cm.l.Error("can not migrate v1 relay with a v6 network because the relay is not running a current nebula version")
-				continue
-			}
-
-			if !relayTo.Is4() {
-				cm.l.Error("can not migrate v1 relay with a v6 remote network because the relay is not running a current nebula version")
-				continue
-			}
-
-			b := relayFrom.As4()
-			req.OldRelayFromAddr = binary.BigEndian.Uint32(b[:])
-			b = relayTo.As4()
-			req.OldRelayToAddr = binary.BigEndian.Uint32(b[:])
-		case cert.Version2:
-			req.RelayFromAddr = netAddrToProtoAddr(relayFrom)
-			req.RelayToAddr = netAddrToProtoAddr(relayTo)
+		var relayFrom, relayTo netip.Addr
+		switch r.Type {
+		case relayTypeTerminal:
+			relayFrom, relayTo = cm.engine.myVpnAddrs[0], r.PeerAddr
+		case relayTypeForwarding:
+			relayFrom, relayTo = r.PeerAddr, newhostinfo.vpnAddrs[0]
 		default:
-			newhostinfo.logger(cm.l).Error("Unknown certificate version found while attempting to migrate relay")
-			continue
+			panic(fmt.Sprintf("Migrating unknown relay type: %v", r.Type))
 		}
 
-		msg, err := req.Marshal()
-		if err != nil {
-			cm.l.Error("failed to marshal Control message to migrate relay", "error", err)
-		} else {
-			cm.intf.SendMessageToHostInfo(header.Control, 0, newhostinfo, msg, make([]byte, 12), make([]byte, mtu))
-			cm.l.Info("send CreateRelayRequest",
-				"relayFrom", relayFrom,
-				"relayTo", relayTo,
-				"initiatorRelayIndex", req.InitiatorRelayIndex,
-				"responderRelayIndex", req.ResponderRelayIndex,
-				"vpnAddrs", newhostinfo.vpnAddrs,
-			)
-		}
+		cm.engine.sendRelayControl(newhostinfo, relayFrom, relayTo, existing.LocalIndex, 0)
 	}
 }
 
-func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Time) (trafficDecision, *HostInfo, *HostInfo) {
+func (cm *connectionManager) makeTrafficDecision(localIndex uint32, now time.Time) (trafficDecision, *hostInfo, *hostInfo) {
 	// Read lock the main hostmap to order decisions based on tunnels being the primary tunnel
 	cm.hostMap.RLock()
-	defer cm.hostMap.RUnlock()
 
 	hostinfo := cm.hostMap.Indexes[localIndex]
 	if hostinfo == nil {
+		cm.hostMap.RUnlock()
 		cm.l.Debug("Not found in hostmap", "localIndex", localIndex)
 		return doNothing, nil, nil
 	}
 
+	primary := cm.hostMap.Hosts[hostinfo.vpnAddrs[0]]
+	cm.hostMap.RUnlock()
 	if cm.isInvalidCertificate(now, hostinfo) {
 		return closeTunnel, hostinfo, nil
 	}
 
-	if hostinfo.ConnectionState != nil && hostinfo.ConnectionState.messageCounter.Load() >= RejectAfterMessages {
+	if hostinfo.connectionState != nil && hostinfo.connectionState.messageCounter.Load() >= rejectAfterMessages {
 		// Send path can't encrypt a CloseTunnel notify, so just delete locally; the peer recovers via recv_error.
 		hostinfo.logger(cm.l).Error("Dropping tunnel, message counter is exhausted")
 		return deleteTunnel, hostinfo, nil
 	}
 
-	primary := cm.hostMap.Hosts[hostinfo.vpnAddrs[0]]
-	mainHostInfo := true
-	if primary != nil && primary != hostinfo {
-		mainHostInfo = false
-	}
+	mainHostInfo := primary == nil || primary == hostinfo
 
 	// Check for traffic on this hostinfo
-	inTraffic, outTraffic := cm.getAndResetTrafficCheck(hostinfo, now)
-
-	// A hostinfo is determined alive if there is incoming traffic
-	if inTraffic {
-		decision := doNothing
-		if cm.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(cm.l).Debug("Tunnel status",
-				"tunnelCheck", m{"state": "alive", "method": "passive"},
-			)
-		}
-		hostinfo.setPendingDeletion(false)
-
-		if mainHostInfo {
-			decision = tryRehandshake
-		} else {
-			if cm.shouldSwapPrimary(hostinfo) {
-				decision = swapPrimary
-			} else {
-				// migrate the relays to the primary, if in use.
-				decision = migrateRelays
-			}
-		}
-
-		cm.trafficTimer.Add(hostinfo.localIndexId, cm.checkInterval)
-
-		if !outTraffic {
-			// Send a punch packet to keep the NAT state alive
-			cm.punchy.SendPunch(hostinfo)
-		}
-
-		return decision, hostinfo, primary
+	inTraffic, outTraffic := hostinfo.takeTraffic()
+	paths := &hostinfo.paths
+	paths.mu.Lock()
+	if inTraffic || outTraffic {
+		hostinfo.lastUsed = now
+		paths.demand = now
 	}
-
-	if hostinfo.isPendingDeletion() {
-		// We have already sent a test packet and nothing was returned, this hostinfo is dead
-		hostinfo.logger(cm.l).Info("Tunnel status",
-			"tunnelCheck", m{"state": "dead", "method": "active"},
-		)
-
-		// A dead primary tunnel is as good a sign a gateway is down as a handshake timing out, so packets for a
-		// multi-gateway route go to its other gateways right away instead of waiting on a handshake with this one
-		if mainHostInfo {
-			cm.intf.handshakeManager.ecmpGateways.markDown(hostinfo.vpnAddrs...)
-		}
-
+	if outTraffic && !inTraffic && paths.last.At.Before(now.Add(-cm.checkInterval)) {
+		paths.nextActive = time.Time{}
+	}
+	unavailable := !paths.active.Endpoint.IsValid() && now.Sub(paths.changed) > cm.pendingDeletionInterval
+	paths.mu.Unlock()
+	if !mainHostInfo && !inTraffic && hostinfo.isPendingDeletion() {
 		return deleteTunnel, hostinfo, nil
 	}
-
-	decision := doNothing
-	if hostinfo != nil && hostinfo.ConnectionState != nil && mainHostInfo {
-		if !outTraffic {
-			inactiveFor, isInactive := cm.isInactive(hostinfo, now)
-			if isInactive {
-				// Tunnel is inactive, tear it down
-				hostinfo.logger(cm.l).Info("Dropping tunnel due to inactivity",
-					"inactiveDuration", inactiveFor,
-					"primary", mainHostInfo,
-				)
-
-				return closeTunnel, hostinfo, primary
-			}
-
-			// If we aren't sending or receiving traffic then its an unused tunnel and we don't to test the tunnel.
-			// Just maintain NAT state if configured to do so.
-			cm.punchy.SendPunch(hostinfo)
-			cm.trafficTimer.Add(hostinfo.localIndexId, cm.checkInterval)
-			return doNothing, nil, nil
-		}
-
-		// We aren't receiving traffic but we are sending it. The outbound
-		// traffic itself refreshes the primary remote's NAT state; this
-		// fans out to non-primary remotes, but only if target_all_remotes
-		// is configured.
+	if mainHostInfo && unavailable && cm.engine.handshakeManager.queryVpnIp(hostinfo.vpnAddrs[0]) == nil {
+		return deleteTunnel, hostinfo, nil
+	}
+	if mainHostInfo && !inTraffic && !outTraffic && cm.dropInactive && now.Sub(hostinfo.lastUsed) >= cm.inactivityTimeout && cm.engine.paths.config.Load().policy(hostinfo.vpnAddrs, cm.hostMap).MonitorInterval == 0 {
+		return closeTunnel, hostinfo, primary
+	}
+	hostinfo.setPendingDeletion(!mainHostInfo && !inTraffic)
+	cm.trafficTimer.Add(localIndex, cm.checkInterval)
+	if !outTraffic {
+		cm.punchy.SendPunch(hostinfo)
+	} else if !inTraffic {
 		cm.punchy.SendPunchToAll(hostinfo)
-
-		if cm.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(cm.l).Debug("Tunnel status",
-				"tunnelCheck", m{"state": "testing", "method": "active"},
-			)
-		}
-
-		// Send a test packet to trigger an authenticated tunnel test, this should suss out any lingering tunnel issues
-		decision = sendTestPacket
-
-	} else {
-		if cm.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(cm.l).Debug("Hostinfo sadness")
-		}
 	}
-
-	hostinfo.setPendingDeletion(true)
-	cm.trafficTimer.Add(hostinfo.localIndexId, cm.pendingDeletionInterval)
-	return decision, hostinfo, nil
+	if mainHostInfo {
+		return tryRehandshake, hostinfo, primary
+	}
+	if inTraffic {
+		if cm.shouldSwapPrimary(hostinfo) {
+			return swapPrimary, hostinfo, primary
+		}
+		return migrateRelays, hostinfo, primary
+	}
+	return doNothing, hostinfo, primary
 }
 
-func (cm *connectionManager) isInactive(hostinfo *HostInfo, now time.Time) (time.Duration, bool) {
-	if cm.dropInactive.Load() == false {
-		// We aren't configured to drop inactive tunnels
-		return 0, false
-	}
-
-	inactiveDuration := now.Sub(hostinfo.lastUsed)
-	if inactiveDuration < cm.getInactivityTimeout() {
-		// It's not considered inactive
-		return inactiveDuration, false
-	}
-
-	// The tunnel is inactive
-	return inactiveDuration, true
-}
-
-func (cm *connectionManager) shouldSwapPrimary(current *HostInfo) bool {
+func (cm *connectionManager) shouldSwapPrimary(current *hostInfo) bool {
 	// The primary tunnel is the most recent handshake to complete locally and should work entirely fine.
 	// If we are here then we have multiple tunnels for a host pair and neither side believes the same tunnel is primary.
 	// Let's sort this out.
@@ -460,27 +242,20 @@ func (cm *connectionManager) shouldSwapPrimary(current *HostInfo) bool {
 	// Only one side should swap because if both swap then we may never resolve to a single tunnel.
 	// vpn addr is static across all tunnels for this host pair so lets
 	// use that to determine if we should consider swapping.
-	if current.vpnAddrs[0].Compare(cm.intf.myVpnAddrs[0]) < 0 {
+	if current.vpnAddrs[0].Compare(cm.engine.myVpnAddrs[0]) < 0 {
 		// Their primary vpn addr is less than mine. Do not swap.
 		return false
 	}
 
-	if current.ConnectionState.messageCounter.Load() >= RehandshakeAfterMessages {
+	if current.connectionState.messageCounter.Load() >= rehandshakeAfterMessages {
 		// This tunnel is being rolled for counter exhaustion, never swap back onto its spent key.
 		return false
 	}
 
-	crt := cm.intf.pki.getCertState().getCertificate(current.ConnectionState.myCert.Version())
-	if crt == nil {
-		//my cert was reloaded away. We should definitely swap from this tunnel
-		return true
-	}
-	// If this tunnel is using the latest certificate then we should swap it to primary for a bit and see if things
-	// settle down.
-	return bytes.Equal(current.ConnectionState.myCert.Signature(), crt.Signature())
+	return true
 }
 
-func (cm *connectionManager) swapPrimary(current, primary *HostInfo) {
+func (cm *connectionManager) swapPrimary(current, primary *hostInfo) {
 	cm.hostMap.Lock()
 	// Make sure the primary is still the same after the write lock. This avoids a race with a rehandshake.
 	if cm.hostMap.Hosts[current.vpnAddrs[0]] == primary {
@@ -489,16 +264,15 @@ func (cm *connectionManager) swapPrimary(current, primary *HostInfo) {
 	cm.hostMap.Unlock()
 }
 
-// isInvalidCertificate decides if we should destroy a tunnel.
-// returns true if pki.disconnect_invalid is true and the certificate is no longer valid.
-// Blocklisted certificates will skip the pki.disconnect_invalid check and return true.
-func (cm *connectionManager) isInvalidCertificate(now time.Time, hostinfo *HostInfo) bool {
+// isInvalidCertificate decides whether a tunnel must be destroyed because its
+// peer certificate is blocked, expired, or no longer trusted.
+func (cm *connectionManager) isInvalidCertificate(now time.Time, hostinfo *hostInfo) bool {
 	remoteCert := hostinfo.GetCert()
 	if remoteCert == nil {
 		return false //don't tear down tunnels for handshakes in progress
 	}
 
-	caPool := cm.intf.pki.GetCAPool()
+	caPool := cm.engine.pki.GetCAPool()
 	err := caPool.VerifyCachedCertificate(now, remoteCert)
 	if err == nil {
 		return false //cert is still valid! yay!
@@ -509,33 +283,19 @@ func (cm *connectionManager) isInvalidCertificate(now time.Time, hostinfo *HostI
 			"fingerprint", remoteCert.Fingerprint,
 		)
 		return true
-	} else if cm.intf.disconnectInvalid.Load() {
+	} else {
 		hostinfo.logger(cm.l).Info("Remote certificate is no longer valid, tearing down the tunnel",
 			"error", err,
 			"fingerprint", remoteCert.Fingerprint,
 		)
 		return true
-	} else {
-		//if we reach here, the cert is no longer valid, but we're configured to keep tunnels from now-invalid certs open
-		return false
 	}
 }
 
-func (cm *connectionManager) tryRehandshake(hostinfo *HostInfo) {
-	cs := cm.intf.pki.getCertState()
-	curCrt := hostinfo.ConnectionState.myCert
-	curCrtVersion := curCrt.Version()
-	myCrt := cs.getCertificate(curCrtVersion)
-	if myCrt == nil {
-		cm.l.Info("Re-handshaking with remote",
-			"vpnAddrs", hostinfo.vpnAddrs,
-			"version", curCrtVersion,
-			"reason", "local certificate removed",
-		)
-		cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
-		return
-	}
-	peerCrt := hostinfo.ConnectionState.peerCert
+func (cm *connectionManager) tryRehandshake(hostinfo *hostInfo) {
+	cs := cm.engine.pki.getCertState()
+	curCrtVersion := hostinfo.connectionState.myCert.Version()
+	peerCrt := hostinfo.connectionState.peerCert
 	if peerCrt != nil && curCrtVersion < peerCrt.Certificate.Version() {
 		// if our certificate version is less than theirs, and we have a matching version available, rehandshake?
 		if cs.getCertificate(peerCrt.Certificate.Version()) != nil {
@@ -545,20 +305,11 @@ func (cm *connectionManager) tryRehandshake(hostinfo *HostInfo) {
 				"peerVersion", peerCrt.Certificate.Version(),
 				"reason", "local certificate version lower than peer, attempting to correct",
 			)
-			cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], func(hh *HandshakeHostInfo) {
+			cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], func(hh *handshakeHostInfo) {
 				hh.initiatingVersionOverride = peerCrt.Certificate.Version()
 			})
 			return
 		}
-	}
-	if !bytes.Equal(curCrt.Signature(), myCrt.Signature()) {
-		cm.l.Info("Re-handshaking with remote",
-			"vpnAddrs", hostinfo.vpnAddrs,
-			"reason", "local certificate is not current",
-		)
-
-		cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
-		return
 	}
 	if curCrtVersion < cs.initiatingVersion {
 		cm.l.Info("Re-handshaking with remote",
@@ -566,16 +317,16 @@ func (cm *connectionManager) tryRehandshake(hostinfo *HostInfo) {
 			"reason", "current cert version < pki.initiatingVersion",
 		)
 
-		cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
+		cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
 		return
 	}
-	if hostinfo.ConnectionState.messageCounter.Load() >= RehandshakeAfterMessages {
+	if hostinfo.connectionState.messageCounter.Load() >= rehandshakeAfterMessages {
 		cm.l.Info("Re-handshaking with remote",
 			"vpnAddrs", hostinfo.vpnAddrs,
 			"reason", "message counter rehandshake threshold reached",
 		)
 
-		cm.intf.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
+		cm.engine.handshakeManager.StartHandshake(hostinfo.vpnAddrs[0], nil)
 		return
 	}
 }

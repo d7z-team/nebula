@@ -1,7 +1,6 @@
 package nebula
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -14,58 +13,47 @@ import (
 )
 
 const (
-	ReplayWindow = 8192
+	replayWindowSize = 8192
 
-	// RehandshakeAfterMessages rolls keys inside the AES-GCM data-volume margin (~2^-36 advantage at 64KB frames).
-	RehandshakeAfterMessages = uint64(1) << 34
+	// rehandshakeAfterMessages rolls keys inside the AES-GCM data-volume margin (~2^-36 advantage at 64KB frames).
+	rehandshakeAfterMessages = uint64(1) << 34
 
-	// RejectAfterMessages is the nonce ceiling enforced by noiseutil; a tunnel here is deleted locally, not notified.
-	RejectAfterMessages = noiseutil.RejectAfterMessages
+	// rejectAfterMessages is the nonce ceiling enforced by noiseutil; a tunnel here is deleted locally, not notified.
+	rejectAfterMessages = noiseutil.RejectAfterMessages
 )
 
-// RehandshakeAfterMessages must stay below RejectAfterMessages so tunnels roll before the hard send stop.
-const _ = RejectAfterMessages - RehandshakeAfterMessages
+// rehandshakeAfterMessages must stay below rejectAfterMessages so tunnels roll before the hard send stop.
+const _ = rejectAfterMessages - rehandshakeAfterMessages
 
-// sessionEpoch hands out a receiver-local ordinal to every ConnectionState at creation. The RX
-// staging sort (overlay/batch) orders packets by (epoch, message counter). A re-handshake never
-// rekeys an existing tunnel; it brings up a new hostinfo and ConnectionState with a counter space
-// starting near zero, while the old tunnel keeps decrypting until torn down. During that cutover
-// one flush batch can hold packets from both tunnels, and the epoch keeps the old tunnel's
-// packets sorted first.
-var sessionEpoch atomic.Uint64
-
-type ConnectionState struct {
+type connectionState struct {
 	eKey           noiseutil.CipherState
 	dKey           noiseutil.CipherState
 	myCert         cert.Certificate
 	peerCert       *cert.CachedCertificate
 	initiator      bool
 	messageCounter atomic.Uint64
-	window         *Bits
+	window         *replayWindowBits
 	decryptLock    sync.Mutex
 	writeLock      sync.Mutex
-	// epoch is this session's sessionEpoch ordinal. Immutable after creation.
-	epoch uint64
 }
 
-// newConnectionStateFromResult builds a fully-populated ConnectionState from a
+// newConnectionStateFromResult builds a fully-populated connectionState from a
 // completed handshake.Result. It seeds messageCounter and the replay window so
 // that the post-handshake message indices already used on the wire don't count
 // as missed traffic in the data plane.
-func newConnectionStateFromResult(r *handshake.Result) (*ConnectionState, error) {
+func newConnectionStateFromResult(r *handshake.Result) (*connectionState, error) {
 	// Refuse a MessageIndex too big for the replay window: it can only be a bug, and would spin the seed loop below.
-	if r.MessageIndex >= ReplayWindow {
+	if r.MessageIndex >= replayWindowSize {
 		return nil, fmt.Errorf("handshake message index %d exceeds replay window", r.MessageIndex)
 	}
 
-	ci := &ConnectionState{
+	ci := &connectionState{
 		myCert:    r.MyCert,
 		initiator: r.Initiator,
 		peerCert:  r.RemoteCert,
 		eKey:      noiseutil.NewCipherState(r.EKey, r.Cipher),
 		dKey:      noiseutil.NewCipherState(r.DKey, r.Cipher),
-		window:    NewBits(ReplayWindow),
-		epoch:     sessionEpoch.Add(1),
+		window:    newReplayWindow(replayWindowSize),
 	}
 	ci.messageCounter.Add(r.MessageIndex)
 	for i := uint64(1); i <= r.MessageIndex; i++ {
@@ -74,34 +62,26 @@ func newConnectionStateFromResult(r *handshake.Result) (*ConnectionState, error)
 	return ci, nil
 }
 
-func (cs *ConnectionState) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m{
-		"certificate":     cs.peerCert,
-		"initiator":       cs.initiator,
-		"message_counter": cs.messageCounter.Load(),
-	})
-}
-
-// NextMessageCounter reserves the next 1-based counter; RejectAfterMessages is the first we refuse, pinned to not wrap.
-func (cs *ConnectionState) NextMessageCounter() (uint64, bool) {
+// NextMessageCounter reserves the next 1-based counter; rejectAfterMessages is the first we refuse, pinned to not wrap.
+func (cs *connectionState) NextMessageCounter() (uint64, bool) {
 	c := cs.messageCounter.Add(1)
-	if c >= RejectAfterMessages {
-		cs.messageCounter.Store(RejectAfterMessages)
+	if c >= rejectAfterMessages {
+		cs.messageCounter.Store(rejectAfterMessages)
 		return c, false
 	}
 	return c, true
 }
 
-func (cs *ConnectionState) Curve() cert.Curve {
+func (cs *connectionState) Curve() cert.Curve {
 	return cs.myCert.Curve()
 }
 
-func (cs *ConnectionState) Decrypt(l *slog.Logger, messageCounter uint64, packet []byte, nb []byte) ([]byte, error) {
+func (cs *connectionState) Decrypt(l *slog.Logger, messageCounter uint64, packet []byte, nb []byte) ([]byte, error) {
 	cs.decryptLock.Lock()
 	result := cs.window.Check(l, messageCounter)
 	cs.decryptLock.Unlock()
 	if !result {
-		return nil, ErrAlreadySeen
+		return nil, errAlreadySeen
 	}
 
 	out, err := cs.dKey.DecryptDanger(packet[header.Len:header.Len], packet[:header.Len], packet[header.Len:], messageCounter, nb)
@@ -113,17 +93,17 @@ func (cs *ConnectionState) Decrypt(l *slog.Logger, messageCounter uint64, packet
 	result = cs.window.Update(l, messageCounter)
 	cs.decryptLock.Unlock()
 	if !result {
-		return nil, ErrAlreadySeen
+		return nil, errAlreadySeen
 	}
 	return out, nil
 }
 
-func (cs *ConnectionState) VerifyRelay(l *slog.Logger, messageCounter uint64, packet []byte, nb []byte) error {
+func (cs *connectionState) VerifyRelay(l *slog.Logger, messageCounter uint64, packet []byte, nb []byte) error {
 	cs.decryptLock.Lock()
 	result := cs.window.Check(l, messageCounter)
 	cs.decryptLock.Unlock()
 	if !result {
-		return ErrAlreadySeen
+		return errAlreadySeen
 	}
 
 	// The entire body is sent as AD, not encrypted.
@@ -142,7 +122,7 @@ func (cs *ConnectionState) VerifyRelay(l *slog.Logger, messageCounter uint64, pa
 	result = cs.window.Update(l, messageCounter)
 	cs.decryptLock.Unlock()
 	if !result {
-		return ErrAlreadySeen
+		return errAlreadySeen
 	}
 	return nil
 }

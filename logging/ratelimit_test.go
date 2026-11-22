@@ -22,7 +22,7 @@ func (f fakeLimiter) Allow() (uint64, bool) { return f.denied, f.ok }
 
 func TestRateLimited(t *testing.T) {
 	var buf bytes.Buffer
-	base := NewLogger(&buf)
+	base := slog.New(slog.NewTextHandler(&buf, nil))
 
 	if l, ok := RateLimited(base, fakeLimiter{ok: false}); ok || l != nil {
 		t.Fatalf("denied call: ok=%v logger=%v", ok, l)
@@ -55,7 +55,7 @@ var (
 )
 
 func benchLogger() *slog.Logger {
-	return NewLogger(io.Discard).With("localIndex", 1234, "remoteIndex", 5678)
+	return slog.New(slog.NewTextHandler(io.Discard, nil)).With("localIndex", 1234, "remoteIndex", 5678)
 }
 
 func BenchmarkRateLimitedBaseline(b *testing.B) {

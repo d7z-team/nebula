@@ -25,7 +25,7 @@ const (
 	Version uint8 = 1
 	Len           = 16
 
-	// MaxOverhead is the most a payload grows on its way to the underlay.
+	// MaxOverhead is the maximum encapsulation added by the Nebula protocol itself.
 	// A relayed packet has two headers and two AEAD tags, one for the inner tunnel and another for the relay tunnel.
 	// Every supported cipher (today) has a 16 byte tag.
 	MaxOverhead = 2 * (Len + 16)
@@ -207,13 +207,4 @@ func IsValidSubType(t MessageType, s MessageSubType) bool {
 	default:
 		return false
 	}
-}
-
-// NewHeader turns bytes into a header
-func NewHeader(b []byte) (*H, error) {
-	h := new(H)
-	if err := h.Parse(b); err != nil {
-		return nil, err
-	}
-	return h, nil
 }

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
@@ -225,14 +226,9 @@ func (c *certificateV1) String() string {
 }
 
 func (c *certificateV1) MarshalForHandshakes() ([]byte, error) {
-	pubKey := c.details.publicKey
-	c.details.publicKey = nil
-	rawCertNoKey, err := c.Marshal()
-	if err != nil {
-		return nil, err
-	}
-	c.details.publicKey = pubKey
-	return rawCertNoKey, nil
+	handshakeCert := *c
+	handshakeCert.details.publicKey = nil
+	return handshakeCert.Marshal()
 }
 
 func (c *certificateV1) Marshal() ([]byte, error) {
@@ -278,38 +274,13 @@ func (c *certificateV1) marshalJSON() m {
 }
 
 func (c *certificateV1) Copy() Certificate {
-	nc := &certificateV1{
-		details: detailsV1{
-			name:      c.details.name,
-			notBefore: c.details.notBefore,
-			notAfter:  c.details.notAfter,
-			publicKey: make([]byte, len(c.details.publicKey)),
-			isCA:      c.details.isCA,
-			issuer:    c.details.issuer,
-			curve:     c.details.curve,
-		},
-		signature: make([]byte, len(c.signature)),
-	}
-
-	if c.details.groups != nil {
-		nc.details.groups = make([]string, len(c.details.groups))
-		copy(nc.details.groups, c.details.groups)
-	}
-
-	if c.details.networks != nil {
-		nc.details.networks = make([]netip.Prefix, len(c.details.networks))
-		copy(nc.details.networks, c.details.networks)
-	}
-
-	if c.details.unsafeNetworks != nil {
-		nc.details.unsafeNetworks = make([]netip.Prefix, len(c.details.unsafeNetworks))
-		copy(nc.details.unsafeNetworks, c.details.unsafeNetworks)
-	}
-
-	copy(nc.signature, c.signature)
-	copy(nc.details.publicKey, c.details.publicKey)
-
-	return nc
+	nc := *c
+	nc.details.groups = slices.Clone(c.details.groups)
+	nc.details.networks = slices.Clone(c.details.networks)
+	nc.details.unsafeNetworks = slices.Clone(c.details.unsafeNetworks)
+	nc.details.publicKey = append([]byte{}, c.details.publicKey...)
+	nc.signature = append([]byte{}, c.signature...)
+	return &nc
 }
 
 func (c *certificateV1) fromTBSCertificate(t *TBSCertificate) error {
