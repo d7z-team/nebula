@@ -6,7 +6,7 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/quic-go/quic-go v0.65.0
 	github.com/stretchr/testify v1.12.1
-	golang.org/x/time v0.15.0
+	golang.org/x/time v0.16.0
 	gvisor.dev/gvisor v0.0.0-20261014193016-04d31b385980
 )
 
