@@ -27,6 +27,7 @@ type discoverySender interface {
 }
 
 type lighthouse struct {
+	control *controlPlane
 	sync.RWMutex
 	ctx          context.Context
 	amLighthouse bool
@@ -175,6 +176,12 @@ func (lh *lighthouse) QueryServer(addr netip.Addr) { _ = lh.queryServerContext(n
 
 // A non-nil context requests reliable enqueueing, including when the queue is full.
 func (lh *lighthouse) queryServerContext(ctx context.Context, addr netip.Addr) error {
+	if lh.control != nil {
+		select {
+		case lh.control.lookups <- addr:
+		default:
+		}
+	}
 	addr = addr.Unmap()
 	if lh.amLighthouse || len(lh.lighthouses) == 0 || lh.IsLighthouseAddr(addr) {
 		return nil

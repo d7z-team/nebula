@@ -34,8 +34,8 @@ func interopSockets(t *testing.T, ids []nodeTestIdentity) ([]*net.UDPConn, map[n
 	return sockets, static
 }
 
-// The upstream disabled TUN answers ICMP directly, without a privileged device.
-func startStockNode(t *testing.T, binaryPath string, pool *cert.CAPool, id nodeTestIdentity, socket *net.UDPConn, static map[netip.Addr][]netip.AddrPort, lighthouses []netip.Addr, serve bool) {
+// StartTestStockNode starts an upstream subprocess with the unprivileged ICMP responder.
+func StartTestStockNode(t *testing.T, binaryPath string, pool *cert.CAPool, id Identity, socket *net.UDPConn, static map[netip.Addr][]netip.AddrPort, lighthouses []netip.Addr, serve bool) {
 	t.Helper()
 	dir := t.TempDir()
 	var bundle []byte
@@ -44,13 +44,13 @@ func startStockNode(t *testing.T, binaryPath string, pool *cert.CAPool, id nodeT
 		require.NoError(t, err)
 		bundle = append(bundle, pem...)
 	}
-	pem, err := id.identity.Certificate.MarshalPEM()
+	pem, err := id.Certificate.MarshalPEM()
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ca.crt"), bundle, 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "host.crt"), pem, 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "host.key"), cert.MarshalPrivateKeyToPEM(id.identity.Certificate.Curve(), id.identity.PrivateKey), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "host.key"), cert.MarshalPrivateKeyToPEM(id.Certificate.Curve(), id.PrivateKey), 0600))
 	static = maps.Clone(static)
-	delete(static, id.addr)
+	delete(static, id.Certificate.Networks()[0].Addr())
 	hosts, err := json.Marshal(static)
 	require.NoError(t, err)
 	lhs, err := json.Marshal(lighthouses)
@@ -105,7 +105,7 @@ func TestNodeUpstreamInterop(t *testing.T) {
 						return startTestNode(t, opts)
 					}
 					if stockRelay {
-						startStockNode(t, binaryPath, pool, relay, sockets[2], static, []netip.Addr{}, true)
+						StartTestStockNode(t, binaryPath, pool, relay.identity, sockets[2], static, []netip.Addr{}, true)
 					} else {
 						newLocal(relay, 2, true)
 					}
@@ -114,7 +114,7 @@ func TestNodeUpstreamInterop(t *testing.T) {
 					if !initiator {
 						lhs = append(lhs, local.addr)
 					}
-					startStockNode(t, binaryPath, pool, remote, sockets[1], static, lhs, false)
+					StartTestStockNode(t, binaryPath, pool, remote.identity, sockets[1], static, lhs, false)
 					ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 					defer cancel()
 					if initiator {
@@ -214,7 +214,7 @@ func TestNodeUpstreamRelayInitiator(t *testing.T) {
 					endpoint = n
 				}
 			}
-			startStockNode(t, binaryPath, pool, b, socks[1], static, []netip.Addr{r.addr}, false)
+			StartTestStockNode(t, binaryPath, pool, b.identity, socks[1], static, []netip.Addr{r.addr}, false)
 			ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
 			defer cancel()
 			require.Eventually(t, func() bool {

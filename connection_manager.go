@@ -133,6 +133,9 @@ func (cm *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *hostInfo
 	relayFor := oldhostinfo.relayState.mappings()
 
 	for _, r := range relayFor {
+		if r.Circuit != "" {
+			continue
+		}
 		existing, ok := newhostinfo.relayState.mappingByAddr(r.PeerAddr)
 
 		if ok {
@@ -274,6 +277,9 @@ func (cm *connectionManager) isInvalidCertificate(now time.Time, hostinfo *hostI
 
 	caPool := cm.engine.pki.GetCAPool()
 	err := caPool.VerifyCachedCertificate(now, remoteCert)
+	if cm.engine.paths.config.Load().network.denies(remoteCert) {
+		err = cert.ErrBlockListed
+	}
 	if err == nil {
 		return false //cert is still valid! yay!
 	} else if err == cert.ErrBlockListed { //avoiding errors.Is for speed

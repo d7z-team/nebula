@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"context"
+	"math"
 	"net/netip"
 	"slices"
 )
@@ -18,8 +19,8 @@ type DiscoverySnapshot struct {
 	AdvertisedRelays    []netip.Addr
 }
 
-// PeerDiscoverySnapshot is a detached copy of the lighthouse cache for a peer.
-// It does not trigger a lighthouse query.
+// PeerDiscoverySnapshot contains a peer's cached candidates, including static
+// endpoints, discovery reports and unexpired managed introductions.
 type PeerDiscoverySnapshot struct {
 	Addresses []netip.Addr
 	Endpoints []netip.AddrPort
@@ -97,10 +98,8 @@ func (c *remoteCandidates) copyPaths() ([]netip.AddrPort, []netip.Addr) {
 	return endpoints, cloneAddresses(c.relays)
 }
 
-// RefreshPeer reliably queues a lighthouse query for addr when discovery is
-// applicable. It is an idempotent success for lighthouse nodes, configured
-// lighthouse peers, and nodes without a lighthouse. It never waits for, or
-// guarantees, a lighthouse reply.
+// RefreshPeer requests managed introduction when enabled and queues a standard
+// lighthouse query when applicable. It returns before peer replies arrive.
 func (n *Node) RefreshPeer(ctx context.Context, addr netip.Addr) error {
 	if err := n.requireStarted(); err != nil {
 		return err
@@ -131,8 +130,8 @@ func (n *Node) AdvertiseNow(ctx context.Context) error {
 }
 
 // SetPeerEndpoints replaces the static underlay candidates for an overlay address.
-// An empty slice removes the static entry. Learned endpoints and live tunnels
-// are independent; DisconnectPeer can explicitly tear down the current tunnel.
+// An empty slice clears the static entry. If the peer is an allowed exit for a
+// restricted or bootstrapping node, the new endpoint set takes effect on return.
 func (n *Node) SetPeerEndpoints(addr netip.Addr, endpoints []netip.AddrPort) error {
 	if err := n.requireStarted(); err != nil {
 		return err
@@ -141,5 +140,24 @@ func (n *Node) SetPeerEndpoints(addr netip.Addr, endpoints []netip.AddrPort) err
 	if err := n.validatePeerAddress(addr); err != nil {
 		return err
 	}
-	return n.lighthouse.setStaticEndpoints(addr, endpoints)
+	c := n.engine.control
+	if c == nil {
+		return n.lighthouse.setStaticEndpoints(addr, endpoints)
+	}
+	pm := &n.engine.paths
+	if err := pm.submit.Acquire(n.ctx, math.MaxInt64); err != nil {
+		return ErrNodeClosed
+	}
+	defer pm.submit.Release(math.MaxInt64)
+	if err := n.lighthouse.setStaticEndpoints(addr, endpoints); err != nil {
+		return err
+	}
+	cfg := *pm.config.Load()
+	if cfg.network.exits != nil && slices.Contains(cfg.network.direct, addr) {
+		p := *cfg.network
+		p.exits = c.exitEndpoints(&p)
+		cfg.network = &p
+		pm.config.Store(&cfg)
+	}
+	return nil
 }

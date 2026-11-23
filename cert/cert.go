@@ -116,6 +116,11 @@ type CachedCertificate struct {
 	fingerprint2 string
 }
 
+// MatchesFingerprint checks the original and equivalent P256 certificate encodings.
+func (cc *CachedCertificate) MatchesFingerprint(match func(string) bool) bool {
+	return match(cc.Fingerprint) || (cc.fingerprint2 != "" && match(cc.fingerprint2))
+}
+
 func (cc *CachedCertificate) String() string {
 	return cc.Certificate.String()
 }

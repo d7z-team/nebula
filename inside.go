@@ -107,6 +107,7 @@ func (f *packetEngine) sendOnRoute(t header.MessageType, st header.MessageSubTyp
 	if ci == nil || ci.eKey == nil {
 		return TunnelPath{}, ErrPeerUnavailable
 	}
+	control := t != header.Message || (f.control != nil && priorityControl(payload, f.control.opts.Port))
 	useRelay := path.leg != nil
 	need := header.Len + len(payload) + ci.eKey.Overhead()
 	if useRelay {
@@ -152,9 +153,9 @@ func (f *packetEngine) sendOnRoute(t header.MessageType, st header.MessageSubTyp
 	}
 
 	if useRelay {
-		return f.sendVia(hostinfo, path, out, nonce, fullOut[:header.Len+len(out)], true, t != header.Message)
+		return f.sendVia(hostinfo, path, out, nonce, fullOut[:header.Len+len(out)], true, control)
 	}
-	err = f.writePath(hostinfo, path, out, t != header.Message, nil)
+	err = f.writePath(hostinfo, path, out, control, nil)
 	if err != nil && !errors.Is(err, errPathBudget) {
 		if l, ok := logging.RateLimited(f.l, f.txErrLimiter); ok {
 			hostinfo.logger(l).Debug("path write failed", "path", path.TunnelPath, "error", err)

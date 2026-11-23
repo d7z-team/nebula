@@ -187,8 +187,8 @@ func (hm *handshakeManager) handleOutbound(vpnIp netip.Addr, generation *handsha
 
 	hostinfo := hh.hostinfo
 	candidates := hostinfo.remotes.candidates()
-	remotes := candidates.endpoints
 	cfg := hm.f.paths.config.Load()
+	remotes := cfg.network.endpoints(vpnIp, candidates.endpoints)
 	ids := hostinfo.vpnAddrs
 	if known := hm.mainHostMap.QueryVpnAddr(vpnIp); known != nil {
 		ids = known.vpnAddrs
@@ -360,6 +360,9 @@ func (hm *handshakeManager) CheckAndComplete(hostinfo *hostInfo, handshakePacket
 	hm.Lock()
 	defer hm.Unlock()
 
+	if f.paths.config.Load().network.denies(hostinfo.GetCert()) {
+		return nil, cert.ErrBlockListed
+	}
 	// Check if we already have a tunnel with this vpn ip
 	existingHostInfo, found := hm.mainHostMap.Hosts[hostinfo.vpnAddrs[0]]
 	if found && existingHostInfo != nil {
@@ -405,12 +408,16 @@ func (hm *handshakeManager) CheckAndComplete(hostinfo *hostInfo, handshakePacket
 
 // completeOutbound replaces the pending dial target with the certified addresses
 // and publishes the authenticated session.
-func (hm *handshakeManager) completeOutbound(hostinfo *hostInfo, vpnAddrs []netip.Addr) {
+func (hm *handshakeManager) completeOutbound(hostinfo *hostInfo, vpnAddrs []netip.Addr) bool {
 	hm.mainHostMap.Lock()
 	defer hm.mainHostMap.Unlock()
 	hm.Lock()
 	defer hm.Unlock()
 
+	if hm.f.paths.config.Load().network.denies(hostinfo.GetCert()) {
+		hm.unlockedDeleteHostInfo(hostinfo)
+		return false
+	}
 	existingRemoteIndex, found := hm.mainHostMap.RemoteIndexes[hostinfo.remoteIndexId]
 	if found && existingRemoteIndex != nil {
 		// We have a collision, but this can happen since we can't control
@@ -423,6 +430,7 @@ func (hm *handshakeManager) completeOutbound(hostinfo *hostInfo, vpnAddrs []neti
 	hm.unlockedDeleteHostInfo(hostinfo)
 	hostinfo.vpnAddrs = vpnAddrs
 	hm.mainHostMap.unlockedAddHostInfo(hostinfo, hm.f)
+	return true
 }
 
 // allocateIndex generates a unique localIndexId for this hostInfo
@@ -851,7 +859,9 @@ func (hm *handshakeManager) continueHandshake(via packetSender, hh *handshakeHos
 
 	hostinfo.paths.setHandshakeRoute(receivedRoute(via), time.Now(), f.paths.probes.ActiveInterval)
 	target := hostinfo.vpnAddrs[0]
-	hm.completeOutbound(hostinfo, vpnAddrs)
+	if !hm.completeOutbound(hostinfo, vpnAddrs) {
+		return
+	}
 	f.lightHouse.refreshAfterHandshake(hostinfo)
 	if len(hh.controlQueue) == 0 {
 		return
@@ -1022,6 +1032,10 @@ func (hm *handshakeManager) handleCheckAndCompleteError(err error, existing, hos
 // certVerifier returns a CertVerifier that validates certs against the current CA pool.
 func (hm *handshakeManager) certVerifier() handshake.CertVerifier {
 	return func(c cert.Certificate) (*cert.CachedCertificate, error) {
-		return hm.f.pki.GetCAPool().VerifyCertificate(time.Now(), c)
+		cc, err := hm.f.pki.GetCAPool().VerifyCertificate(time.Now(), c)
+		if err == nil && hm.f.paths.config.Load().network.denies(cc) {
+			return nil, cert.ErrBlockListed
+		}
+		return cc, err
 	}
 }

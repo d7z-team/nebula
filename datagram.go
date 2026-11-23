@@ -108,6 +108,9 @@ func (f *packetEngine) receiveDatagrams() error {
 }
 
 func (f *packetEngine) writeDatagram(packet []byte, to netip.AddrPort) error {
+	if c := f.control; c != nil && !c.policy().allowsEndpoint(to) {
+		return errWritePolicy
+	}
 	if len(f.datagramMagic) == 0 {
 		return f.outside.WriteTo(packet, to)
 	}

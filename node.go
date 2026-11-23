@@ -87,6 +87,7 @@ type Options struct {
 	// Use the same bytes on every peer and relay. Empty uses upstream framing.
 	DatagramMagic []byte
 
+	Control         *ControlOptions
 	IPPort          IPPortOptions
 	Lighthouse      LighthouseOptions
 	Punchy          PunchyOptions
@@ -173,6 +174,12 @@ func New(parent context.Context, options Options) (*Node, error) {
 		cancel()
 		return nil, err
 	}
+	if options.Control != nil {
+		if err := n.initControl(*options.Control); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 	// Keep Wait blocked through shutdown, including when it is called before Start.
 	n.workers.Add(1)
 	return n, nil
@@ -187,6 +194,9 @@ func (n *Node) Start() error {
 	case NodeStateClosed:
 		return ErrNodeClosed
 	}
+	if c := n.engine.control; c != nil && c.socket == nil {
+		return errors.New("attach overlay control socket before Start")
+	}
 	transportAddr, err := n.transport.LocalAddr()
 	if err != nil {
 		n.state = NodeStateClosed
@@ -200,6 +210,12 @@ func (n *Node) Start() error {
 	n.punchy.ctx = n.ctx
 	n.workers.Go(func() { n.handshake.Run(n.ctx) })
 	n.workers.Go(func() { n.punchy.run(n.ctx) })
+	if c := n.engine.control; c != nil {
+		n.workers.Go(c.run)
+		n.workers.Go(c.read)
+		n.workers.Go(c.runEvents)
+		n.workers.Go(func() { c.shaper.run(c) })
+	}
 	n.workers.Go(n.runPathChecks)
 	n.workers.Go(func() { n.connections.Start(n.ctx) })
 	n.workers.Go(n.lighthouse.runQueryWorker)
@@ -236,6 +252,17 @@ func (n *Node) shutdown(cause error) error {
 // closeTransport is called once after the transition to NodeStateClosed.
 func (n *Node) closeTransport() error {
 	defer n.workers.Done()
+	if c := n.engine.control; c != nil {
+		if c.socket != nil {
+			_ = c.socket.Close()
+		}
+		c.mu.Lock()
+		for s := range c.subs {
+			close(s.events)
+			delete(c.subs, s)
+		}
+		c.mu.Unlock()
+	}
 	if port := n.engine.port.Load(); port != nil {
 		port.Close()
 	}

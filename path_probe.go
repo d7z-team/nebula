@@ -148,10 +148,34 @@ func (n *Node) resolveProbeRoute(h *hostInfo, want TunnelPath) (tunnelRoute, err
 		return tunnelRoute{}, ErrPathPolicy
 	}
 	if !want.Relay.IsValid() {
-		if want.Endpoint != h.GetRemote() && !slices.Contains(h.remotes.candidates().endpoints, want.Endpoint) {
+		if want.Circuit != "" {
+			return tunnelRoute{}, ErrPathPolicy
+		}
+		if want.Endpoint != h.GetRemote() && !slices.Contains(cfg.network.endpoints(h.vpnAddrs[0], h.remotes.candidates().endpoints), want.Endpoint) {
 			return tunnelRoute{}, errProbeRoutePending
 		}
 		return tunnelRoute{TunnelPath: want}, nil
+	}
+	if want.Circuit != "" {
+		if f.control == nil {
+			return tunnelRoute{}, ErrPeerUnavailable
+		}
+		route, ok := f.control.circuits.terminalRoute(want)
+		if ok && (!want.Endpoint.IsValid() || want.Endpoint == route.Endpoint) && f.routeLive(h, route) {
+			return route, nil
+		}
+		return tunnelRoute{}, ErrPeerUnavailable
+	}
+	if c := f.control; c != nil {
+		paths := c.circuitPaths(h.vpnAddrs[0], want.Relay)
+		if len(paths) > 0 && len(paths[0]) > 3 {
+			for _, path := range paths {
+				if route, ok := c.initiateCircuit(path); ok && (!want.Endpoint.IsValid() || want.Endpoint == route.Endpoint) && f.routeLive(h, route) {
+					return route, nil
+				}
+			}
+			return tunnelRoute{}, errProbeRoutePending
+		}
 	}
 	if leg, r, err := f.hostMap.QueryVpnAddrsRelayFor(h.vpnAddrs, want.Relay); err == nil && r.Type == relayTypeTerminal {
 		route := receivedRoute(packetSender{UdpAddr: leg.GetRemote(), IsRelayed: true, relayHI: leg, relay: r})
@@ -513,8 +537,19 @@ func (f *packetEngine) backupCandidates(h *hostInfo, policy PeerPathPolicy, acti
 		}
 	}
 	var options []TunnelPath
+	if c := f.control; c != nil && active.Relay.IsValid() {
+		for _, path := range c.circuitPaths(h.vpnAddrs[0], active.Relay) {
+			if len(path) == 3 {
+				if active.Circuit != "" {
+					options = append(options, TunnelPath{Relay: active.Relay})
+				}
+			} else if r, ok := c.initiateCircuit(path); ok && r.Circuit != active.Circuit {
+				options = append(options, r.TunnelPath)
+			}
+		}
+	}
 	if cfg.allows(h.vpnAddrs, netip.Addr{}, h.remotes) {
-		for _, ep := range c.endpoints {
+		for _, ep := range cfg.network.endpoints(h.vpnAddrs[0], c.endpoints) {
 			path := TunnelPath{Endpoint: ep}
 			if path != active.TunnelPath && (degraded || ep == roam || active.leg != nil) {
 				options = append(options, path)

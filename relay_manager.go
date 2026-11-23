@@ -23,6 +23,7 @@ const (
 	relayTypeUnknown = iota
 	relayTypeForwarding
 	relayTypeTerminal
+	relayTypeCircuit
 )
 
 // RelayStats reports local relay index use and cumulative transit traffic.
@@ -45,6 +46,8 @@ func (n *Node) RelayStats() RelayStats {
 }
 
 type relay struct {
+	Circuit     string
+	Origin      netip.Addr
 	created     time.Time
 	lastRequest time.Time
 	Type        int
@@ -68,7 +71,9 @@ func (rs *relayState) storeLocked(r *relay) {
 		rs.relayForByAddr = make(map[netip.Addr]*relay)
 		rs.relayForByIdx = make(map[uint32]*relay)
 	}
-	rs.relayForByAddr[r.PeerAddr] = r
+	if r.Circuit == "" {
+		rs.relayForByAddr[r.PeerAddr] = r
+	}
 	rs.relayForByIdx[r.LocalIndex] = r
 }
 
@@ -167,25 +172,39 @@ func (hm *hostMap) getOrAddRelay(leg *hostInfo, peer netip.Addr, remoteIndex uin
 	if len(hm.Relays) >= hm.maxRelayMappings {
 		return nil, errors.New("relay capacity reached")
 	}
+	index, err := hm.unusedRelayIndex(0)
+	if err != nil {
+		return nil, err
+	}
+	if !hm.unlockedMakePrimary(leg) {
+		return nil, errors.New("relay neighbor is no longer in the hostmap")
+	}
+	r := &relay{created: time.Now(), Type: role, State: state, LocalIndex: index, RemoteIndex: remoteIndex, PeerAddr: peer}
+	hm.storeRelay(leg, r)
+	return r, nil
+}
+
+// unusedRelayIndex requires the host map lock. A circuit reserves its first
+// index before publishing either leg, so the second must also exclude that index.
+func (hm *hostMap) unusedRelayIndex(reserved uint32) (uint32, error) {
 	for range 32 {
 		index, err := generateIndex(hm.l)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
-		if _, exists := hm.Relays[index]; exists {
-			continue
+		if hm.Relays[index] == nil && index != reserved {
+			return index, nil
 		}
-		if !hm.unlockedMakePrimary(leg) {
-			return nil, errors.New("relay neighbor is no longer in the hostmap")
-		}
-		r := &relay{created: time.Now(), Type: role, State: state, LocalIndex: index, RemoteIndex: remoteIndex, PeerAddr: peer}
-		hm.Relays[index] = leg
-		rs.Lock()
-		rs.storeLocked(r)
-		rs.Unlock()
-		return r, nil
 	}
-	return nil, errors.New("failed to generate a unique relay index")
+	return 0, errors.New("failed to generate a unique relay index")
+}
+
+// storeRelay publishes both indexes while the caller holds the host map lock.
+func (hm *hostMap) storeRelay(leg *hostInfo, r *relay) {
+	hm.Relays[r.LocalIndex] = leg
+	leg.relayState.Lock()
+	leg.relayState.storeLocked(r)
+	leg.relayState.Unlock()
 }
 
 // directNeighbor never starts a relay-dependent handshake on behalf of a transit leg.
@@ -218,6 +237,24 @@ func (f *packetEngine) ensureRelay(h *hostInfo, addr netip.Addr) (tunnelRoute, b
 	if !f.paths.config.Load().allows(h.vpnAddrs, addr, h.remotes, f.hostMap.relayIdentities(addr)...) {
 		return tunnelRoute{}, false
 	}
+	if c := f.control; c != nil {
+		if paths := c.circuitPaths(h.vpnAddrs[0], addr); len(paths) > 0 {
+			for _, path := range paths {
+				if len(path) == 3 {
+					if r, ok := f.ensureSingleRelay(h, addr); ok {
+						return r, true
+					}
+				} else if r, ok := c.initiateCircuit(path); ok {
+					return r, true
+				}
+			}
+			return tunnelRoute{}, false
+		}
+	}
+	return f.ensureSingleRelay(h, addr)
+}
+
+func (f *packetEngine) ensureSingleRelay(h *hostInfo, addr netip.Addr) (tunnelRoute, bool) {
 	s := &h.paths
 	now := time.Now()
 	s.mu.Lock()
@@ -310,7 +347,7 @@ func (f *packetEngine) handleRelayControl(h *hostInfo, d []byte) {
 	switch msg.Type {
 	case NebulaControl_CreateRelayResponse:
 		r, ok := h.relayState.mappingByIndex(idx)
-		if !ok || msg.ResponderRelayIndex == 0 || (r.RemoteIndex != 0 && r.RemoteIndex != msg.ResponderRelayIndex) {
+		if !ok || r.Circuit != "" || msg.ResponderRelayIndex == 0 || (r.RemoteIndex != 0 && r.RemoteIndex != msg.ResponderRelayIndex) {
 			return
 		}
 		if r.Type == relayTypeTerminal {
@@ -361,6 +398,9 @@ func (f *packetEngine) handleRelayControl(h *hostInfo, d []byte) {
 		if !f.servesRelays || !slices.Contains(h.vpnAddrs, from) || slices.Contains(h.vpnAddrs, to) {
 			return
 		}
+		if p := f.paths.config.Load().network; p != nil && !p.allowsTransit(from, to) {
+			return
+		}
 		target := f.directNeighbor(to)
 		if target == nil || target == h {
 			return
@@ -392,7 +432,7 @@ func (hm *hostMap) expirePendingRelays(now time.Time) {
 	for idx, h := range hm.Relays {
 		rs := &h.relayState
 		rs.Lock()
-		if r := rs.relayForByIdx[idx]; r != nil && r.State != relayEstablished && now.Sub(r.created) > hm.pendingRelayTimeout {
+		if r := rs.relayForByIdx[idx]; r != nil && r.Circuit == "" && r.State != relayEstablished && now.Sub(r.created) > hm.pendingRelayTimeout {
 			delete(hm.Relays, idx)
 			delete(rs.relayForByIdx, idx)
 			delete(rs.relayForByAddr, r.PeerAddr)

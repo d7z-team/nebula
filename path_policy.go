@@ -48,6 +48,7 @@ var (
 
 // The runtime policy map is replaced atomically. Probe settings are fixed at New.
 type pathPolicies struct {
+	network *networkPolicy
 	Default PeerPathPolicy
 	Peers   map[netip.Addr]PeerPathPolicy
 }
@@ -128,7 +129,8 @@ func (n *Node) PeerPathPolicy(peer netip.Addr) (PeerPathPolicy, bool) {
 	return policy.clone(), ok
 }
 
-// SetPeerPathPolicy replaces an overlay address override. A nil policy restores the default.
+// SetPeerPathPolicy replaces the local override for one overlay address.
+// A nil policy clears that override. Managed topology constraints also apply.
 func (n *Node) SetPeerPathPolicy(ctx context.Context, peer netip.Addr, policy *PeerPathPolicy) error {
 	peer = peer.Unmap()
 	if err := n.validatePeerAddress(peer); err != nil {
@@ -214,6 +216,12 @@ func (cfg *pathPolicies) allows(ids []netip.Addr, relay netip.Addr, remotes *rem
 		}
 		return remotes != nil && matchesIdentity(remotes.candidates().relays, relay, aliases)
 	}
+	if cfg.network != nil {
+		p := cfg.network.peerPathPolicy(ids)
+		if p.Mode == PathBlocked || !match(p) {
+			return false
+		}
+	}
 	override := false
 	for _, id := range ids {
 		if v, ok := cfg.Peers[id]; ok {
@@ -238,6 +246,31 @@ func (hm *hostMap) relayIdentities(addr netip.Addr) []netip.Addr {
 }
 
 func (cfg *pathPolicies) effectivePolicy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
+	v := cfg.localPolicy(ids, hm)
+	if cfg.network == nil {
+		return v
+	}
+	m := cfg.network.peerPathPolicy(ids)
+	if m.Mode == PathBlocked || (m.Mode != Auto && v.Mode != Auto && m.Mode != v.Mode) {
+		return PeerPathPolicy{Mode: PathBlocked}
+	}
+	if m.Mode != Auto {
+		v.Mode = m.Mode
+	}
+	if len(m.Relays) > 0 {
+		if len(v.Relays) == 0 {
+			v.Relays = m.Relays
+		} else {
+			v.Relays = slices.DeleteFunc(slices.Clone(v.Relays), func(a netip.Addr) bool { return !matchesIdentity(m.Relays, a, hm.relayIdentities(a)) })
+			if len(v.Relays) == 0 && v.Mode == RelayOnly {
+				v.Mode = PathBlocked
+			}
+		}
+	}
+	return v
+}
+
+func (cfg *pathPolicies) localPolicy(ids []netip.Addr, hm *hostMap) PeerPathPolicy {
 	var v PeerPathPolicy
 	var constrained, found bool
 	for _, id := range ids {
@@ -280,6 +313,8 @@ func (cfg *pathPolicies) effectivePolicy(ids []netip.Addr, hm *hostMap) PeerPath
 }
 
 type tunnelRoute struct {
+	owner        netip.Addr
+	ingressIndex uint32
 	TunnelPath
 	leg           *hostInfo
 	relayFor      netip.Addr // Terminal peer named by a direct CreateRelay control message.
@@ -289,6 +324,7 @@ type tunnelRoute struct {
 func receivedRoute(v packetSender) tunnelRoute {
 	r := tunnelRoute{TunnelPath: TunnelPath{Endpoint: v.UdpAddr}}
 	if v.IsRelayed {
+		r.Circuit = v.relay.Circuit
 		r.leg = v.relayHI
 		r.Relay = r.leg.vpnAddrs[0]
 		r.local, r.remote = v.relay.LocalIndex, v.relay.RemoteIndex
@@ -298,6 +334,9 @@ func receivedRoute(v packetSender) tunnelRoute {
 
 func (f *packetEngine) allowed(h *hostInfo, r tunnelRoute) bool {
 	cfg := f.paths.config.Load()
+	if cfg.network != nil && h.connectionState != nil && cfg.network.denies(h.GetCert()) {
+		return false
+	}
 	if r.relayFor.IsValid() {
 		ids := []netip.Addr{r.relayFor}
 		var remotes *remoteList
@@ -328,7 +367,7 @@ func (f *packetEngine) allowed(h *hostInfo, r tunnelRoute) bool {
 }
 
 func (f *packetEngine) routeLive(h *hostInfo, r tunnelRoute) bool {
-	if !r.Endpoint.IsValid() || !f.allowed(h, r) {
+	if !r.Endpoint.IsValid() || (f.control != nil && !f.control.policy().allowsEndpoint(r.Endpoint)) || !f.allowed(h, r) {
 		return false
 	}
 	if r.leg == nil {
@@ -338,15 +377,25 @@ func (f *packetEngine) routeLive(h *hostInfo, r tunnelRoute) bool {
 		return false
 	}
 	entry, ok := r.leg.relayState.mappingByIndex(r.local)
-	return ok && entry.State == relayEstablished && entry.Type == relayTypeTerminal && entry.RemoteIndex == r.remote && slices.Contains(h.vpnAddrs, entry.PeerAddr) && !r.leg.paths.failedDirect(r.Endpoint, f.paths.selection.FailureThreshold)
+	return ok && entry.State == relayEstablished && entry.Type == relayTypeTerminal && entry.RemoteIndex == r.remote && entry.Circuit == r.Circuit && slices.Contains(h.vpnAddrs, entry.PeerAddr) && !r.leg.paths.failedDirect(r.Endpoint, f.paths.selection.FailureThreshold)
 }
 
 func (f *packetEngine) writePath(h *hostInfo, r tunnelRoute, packet []byte, control bool, ingress *hostInfo) error {
+	if c := f.control; c != nil && !control && c.policy().local.BytesPerSecond > 0 {
+		return c.shaper.submit(c, h, r, packet, ingress)
+	}
+	return f.submitPath(h, r, packet, control, ingress)
+}
+
+func (f *packetEngine) submitPath(h *hostInfo, r tunnelRoute, packet []byte, control bool, ingress *hostInfo) error {
 	if err := f.paths.submit.Acquire(f.paths.ctx, 1); err != nil {
 		return ErrNodeClosed
 	}
 	defer f.paths.submit.Release(1)
-	if (r.leg != nil && !f.routeLive(h, r)) || (r.leg == nil && !f.allowed(h, r)) || (ingress != nil && !f.allowed(ingress, tunnelRoute{})) {
+	if p := f.paths.config.Load().network; p != nil && p.bootstrapOnly && !control {
+		return errWritePolicy
+	}
+	if (r.leg != nil && !f.routeLive(h, r)) || (h != nil && r.leg == nil && !f.allowed(h, r)) || (ingress != nil && !f.allowed(ingress, tunnelRoute{})) {
 		return errWritePolicy
 	}
 	if control {
@@ -354,7 +403,28 @@ func (f *packetEngine) writePath(h *hostInfo, r tunnelRoute, packet []byte, cont
 			return errPathBudget
 		}
 	}
-	return f.writeDatagram(packet, r.Endpoint)
+	if ingress != nil && r.ingressIndex != 0 {
+		if p := f.paths.config.Load().network; p != nil && !p.allowsTransit(ingress.vpnAddrs[0], h.vpnAddrs[0]) {
+			return errWritePolicy
+		}
+		if f.hostMap.QueryRelayIndex(r.ingressIndex) != ingress || f.hostMap.QueryRelayIndex(r.local) != h || h.GetRemote() != r.Endpoint {
+			return errWritePolicy
+		}
+		target, ok := h.relayState.mappingByIndex(r.local)
+		if !ok || target.State != relayEstablished || target.RemoteIndex != r.remote {
+			return errWritePolicy
+		}
+	}
+	var err error
+	if c := f.control; control && c != nil && c.policy().local.BytesPerSecond > 0 {
+		err = c.shaper.writeControl(c, packet, r.Endpoint)
+	} else {
+		err = f.writeDatagram(packet, r.Endpoint)
+	}
+	if err == nil && ingress != nil {
+		f.forwardedDatagrams.Add(1)
+	}
+	return err
 }
 
 func (f *packetEngine) handshakeAllowed(ids []netip.Addr, v packetSender, remotes *remoteList) bool {

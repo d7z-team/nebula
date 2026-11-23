@@ -62,8 +62,8 @@ func (n *Node) Snapshot() NodeSnapshot {
 	return out
 }
 
-// Err reports the datagram transport failure that caused the Node
-// to shut down. Explicit Close and a Node that is still running return nil.
+// Err reports a fatal read error from the datagram transport or the managed
+// control socket. It returns nil while the node is running and on normal shutdown.
 func (n *Node) Err() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -79,6 +79,7 @@ const (
 
 // TunnelPath identifies the underlay destination and optional overlay relay.
 type TunnelPath struct {
+	Circuit  string // Managed multi-hop generation, empty on standard routes.
 	Endpoint netip.AddrPort
 	Relay    netip.Addr
 }

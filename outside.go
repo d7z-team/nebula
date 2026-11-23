@@ -155,7 +155,7 @@ func (f *packetEngine) dispatchDatagram(via packetSender, packet []byte, rxc *rx
 	case header.Message:
 		// Relay messages were dispatched before decryption.
 		if port := f.port.Load(); port != nil {
-			port.receiveIP(hostinfo, out)
+			port.receiveIP(hostinfo, out, via)
 		}
 
 	case header.LightHouse:
@@ -208,7 +208,7 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 		f.connectionManager.recordRelayUse(h.RemoteIndex)
 	}
 
-	relay, ok := hostinfo.relayState.mappingByIndex(h.RemoteIndex)
+	entry, ok := hostinfo.relayState.mappingByIndex(h.RemoteIndex)
 	if !ok {
 		// The only way this happens is if hostmap has an index to the correct hostInfo, but the hostInfo is missing
 		// its internal mapping. This should never happen.
@@ -216,9 +216,9 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 		return
 	}
 
-	switch relay.Type {
+	switch entry.Type {
 	case relayTypeTerminal:
-		if relay.State != relayEstablished && inner.Type != header.Handshake {
+		if entry.State != relayEstablished && (inner.Type != header.Handshake || entry.Circuit != "") {
 			return
 		}
 		// If I am the target of this relay, process the unwrapped packet
@@ -226,24 +226,34 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 		via = packetSender{
 			UdpAddr:   via.UdpAddr,
 			relayHI:   hostinfo,
-			relay:     relay,
+			relay:     entry,
 			IsRelayed: true,
 		}
 		f.dispatchDatagram(via, signedPayload, rxc)
-	case relayTypeForwarding:
+	case relayTypeForwarding, relayTypeCircuit:
 		// Find the target hostInfo relay object
-		targetHI, targetRelay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relay.PeerAddr)
+		var targetHI *hostInfo
+		var targetRelay *relay
+		var err error
+		if entry.Type == relayTypeCircuit {
+			targetHI, targetRelay = f.control.circuits.forward(entry.Circuit, hostinfo, entry.LocalIndex)
+			if targetHI == nil {
+				return
+			}
+		} else {
+			targetHI, targetRelay, err = f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, entry.PeerAddr)
+		}
 		if err != nil {
 			hostinfo.logger(f.l).Info("Failed to find target host info by ip",
-				"relayTo", relay.PeerAddr,
+				"relayTo", entry.PeerAddr,
 				"relayFrom", hostinfo.vpnAddrs[0],
 				"error", err,
 			)
 			return
 		}
 
-		if relay.State != relayEstablished || targetRelay.State != relayEstablished || targetRelay.Type != relayTypeForwarding {
-			hostinfo.logger(f.l).Debug("relay mapping unavailable", "relayTo", relay.PeerAddr, "state", relay.State, "targetState", targetRelay.State, "targetType", targetRelay.Type)
+		if entry.State != relayEstablished || targetRelay.State != relayEstablished || targetRelay.Type != entry.Type {
+			hostinfo.logger(f.l).Debug("relay mapping unavailable", "relayTo", entry.PeerAddr, "state", entry.State, "targetState", targetRelay.State, "targetType", targetRelay.Type)
 			return
 		}
 		endpoint := targetHI.GetRemote()
@@ -256,16 +266,17 @@ func (f *packetEngine) handleOutsideRelayPacket(hostinfo *hostInfo, via packetSe
 		// Reuse the authenticated frame's outer header and tag space.
 		out, err := f.prepareSendVia(targetHI, targetRelay, signedPayload, rxc.nb, packet[:0], true)
 		if err == nil {
-			err = f.writePath(targetHI, tunnelRoute{TunnelPath: TunnelPath{Endpoint: endpoint}}, out, false, hostinfo)
+			priority := f.control != nil && (inner.Type == header.Handshake || (inner.Type == header.Test && len(signedPayload) <= header.Len+16+probeSize))
+			err = f.writePath(targetHI, tunnelRoute{TunnelPath: TunnelPath{Endpoint: endpoint}, owner: targetRelay.Origin, ingressIndex: entry.LocalIndex, local: targetRelay.LocalIndex, remote: targetRelay.RemoteIndex}, out, priority, hostinfo)
 		}
 		if err != nil {
 			targetHI.logger(f.l).Debug("failed to forward relay datagram", "error", err)
 			return
 		}
-		f.forwardedDatagrams.Add(1)
+
 	default:
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
-			hostinfo.logger(f.l).Debug("Unexpected relay type", "from", via, "relayType", relay.Type)
+			hostinfo.logger(f.l).Debug("Unexpected relay type", "from", via, "relayType", entry.Type)
 		}
 	}
 }
@@ -312,9 +323,7 @@ func (f *packetEngine) handleHostRoaming(hostinfo *hostInfo, via packetSender) {
 
 func (f *packetEngine) sendRecvError(endpoint netip.AddrPort, index uint32) {
 	b := header.Encode(make([]byte, header.Len), header.Version, header.RecvError, 0, index, 0)
-	if _, ok := f.paths.controlBudget.Allow(); ok {
-		_ = f.writeDatagram(b, endpoint)
-	}
+	_ = f.writePath(nil, tunnelRoute{TunnelPath: TunnelPath{Endpoint: endpoint}}, b, true, nil)
 	if f.l.Enabled(context.Background(), slog.LevelDebug) {
 		f.l.Debug("Recv error sent",
 			"index", index,

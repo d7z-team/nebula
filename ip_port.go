@@ -153,7 +153,7 @@ func (p *IPPort) Stats() PortStats {
 	return stats
 }
 
-func (p *IPPort) receiveIP(hostinfo *hostInfo, packet []byte) {
+func (p *IPPort) receiveIP(hostinfo *hostInfo, packet []byte, via packetSender) {
 	if p.ctx.Err() != nil {
 		return
 	}
@@ -164,6 +164,8 @@ func (p *IPPort) receiveIP(hostinfo *hostInfo, packet []byte) {
 	switch {
 	case err != nil:
 		reason = "invalid inner IP packet"
+	case f.control != nil && f.control.policy().bootstrapOnly && (ip.destination != f.myVpnAddrs[0] || !slices.Contains(hostinfo.vpnAddrs, ip.source) || !bootstrapKind(controlKind(packet, f.control.opts.Port))):
+		reason = "waiting for signed configuration"
 	case !f.authorizesLocal(ip.destination):
 		reason = "local certificate does not authorize destination"
 	case !hostinfo.authorizes(ip.source):
@@ -175,6 +177,9 @@ func (p *IPPort) receiveIP(hostinfo *hostInfo, packet []byte) {
 		p.stats.ReceivedPackets++
 		p.stats.ReceivedBytes += uint64(len(packet))
 		p.statsMu.Unlock()
+		if f.control != nil {
+			f.control.recordIngress(hostinfo, ip, packet, via)
+		}
 		p.deliver(packet)
 		return
 	}
@@ -187,9 +192,10 @@ func (p *IPPort) queueFull(q *peerQueue) bool {
 	return p.queued >= limits.QueueSize || (q != nil && len(q.packets) >= limits.PerPeerQueueSize)
 }
 
-// WriteIP accepts a copy into a bounded queue. An empty next hop selects a
-// directly connected overlay destination. The authenticated peer is checked
-// again when the queue is serviced, including after a pending handshake.
+// WriteIP submits an IP packet to its next hop. An empty next hop selects the
+// overlay destination itself. Ordinary packets are copied into a bounded queue
+// and checked against the peer certificate at send time. Priority control
+// packets can be submitted directly when a usable path already exists.
 func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
 	var ip innerPacket
 	peer := nextHop.Unmap()
@@ -209,6 +215,9 @@ func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
 		return err
 	}
 	f := p.node.engine
+	if f.control != nil && f.control.policy().bootstrapOnly && (ip.source != f.myVpnAddrs[0] || (peer.IsValid() && peer != ip.destination) || !bootstrapKind(controlKind(packet, f.control.opts.Port))) {
+		return ErrPathPolicy
+	}
 	if !f.authorizesLocal(ip.source) {
 		return fmt.Errorf("%w: source %s", ErrAddressNotCertified, ip.source)
 	}
@@ -221,8 +230,18 @@ func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
 	if err := p.node.validatePeerAddress(peer); err != nil {
 		return err
 	}
-	if h := f.hostMap.QueryVpnAddr(peer); h != nil && !h.authorizes(ip.destination) {
-		return fmt.Errorf("%w: destination %s via %s", ErrAddressNotCertified, ip.destination, peer)
+	if h := f.hostMap.QueryVpnAddr(peer); h != nil {
+		if !h.authorizes(ip.destination) {
+			return fmt.Errorf("%w: destination %s via %s", ErrAddressNotCertified, ip.destination, peer)
+		}
+		// Keep the service socket independent of a bulk worker waiting for
+		// its byte budget. Both paths use the same final submission checks.
+		if f.control != nil && ip.source == f.myVpnAddrs[0] && ip.destination == peer && priorityControl(packet, f.control.opts.Port) {
+			if r := f.currentRoute(h); r.Endpoint.IsValid() {
+				_, err := p.send(h, r, packet, make([]byte, 12), make([]byte, 0, len(packet)+header.MaxOverhead))
+				return err
+			}
+		}
 	}
 
 	p.queueMu.Lock()
@@ -247,6 +266,20 @@ func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
 	q.packets = append(q.packets, queuedIP{ip, slices.Clone(packet)})
 	p.queued++
 	return nil
+}
+
+func (p *IPPort) send(h *hostInfo, route tunnelRoute, data, nonce, out []byte) (TunnelPath, error) {
+	path, err := p.node.engine.sendOnRoute(header.Message, header.MessageNone, h, route, data, nonce, out)
+	if err == nil {
+		p.statsMu.Lock()
+		p.stats.SentPackets++
+		p.stats.SentBytes += uint64(len(data))
+		p.statsMu.Unlock()
+		if last := h.lastDataPath.Load(); last == nil || *last != path {
+			h.lastDataPath.Store(&path)
+		}
+	}
+	return path, err
 }
 
 func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
@@ -284,15 +317,8 @@ func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
 		if cap(out) < len(packet.data)+header.MaxOverhead {
 			out = make([]byte, 0, len(packet.data)+header.MaxOverhead)
 		}
-		path, err := f.sendOnRoute(header.Message, header.MessageNone, h, route, packet.data, nonce, out)
+		path, err := p.send(h, route, packet.data, nonce, out)
 		if err == nil {
-			p.statsMu.Lock()
-			p.stats.SentPackets++
-			p.stats.SentBytes += uint64(len(packet.data))
-			p.statsMu.Unlock()
-			if last := h.lastDataPath.Load(); last == nil || *last != path {
-				h.lastDataPath.Store(&path)
-			}
 			continue
 		}
 

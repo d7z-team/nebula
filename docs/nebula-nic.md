@@ -26,7 +26,7 @@ s.AddRoute(tcpip.Route{
 })
 ```
 
-应用拨号时使用下游地址 `192.168.50.20`。gVisor 选出的下一跳是 `10.42.0.254`，Nebula 通过静态配置或 lighthouse 找到该网关的外层地址。要强制经中转到达网关，或检查这段链路的抖动，在网关的 overlay 地址上配置路径策略。[直连、中转与链路健康](paths.md)
+应用拨号时使用下游地址 `192.168.50.20`。gVisor 选出的下一跳是 `10.42.0.254`。Nebula 可以通过静态配置、lighthouse 或受管网络的签名配置与引介找到网关。沿途的中转转发加密数据，到达网关后才由网关把内层 IP 包送入 LAN。要强制经中转到达网关，在网关的 overlay 地址上配置路径策略。[直连、中转与链路健康](paths.md)
 
 在网关上，为 Nebula 和 LAN 两张网卡启用转发。`vpnNIC` 和 `lanNIC` 是它们在网关栈中的 NIC ID。
 
@@ -55,7 +55,7 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 | 提供传输 | 普通 UDP 使用 `nebula.WrapPacketConn`。`nebula.New` 成功后节点接管传输，失败时调用方关闭它。自定义 `DatagramTransport` 须保留数据报边界、支持并发写，并在 `Close` 时唤醒阻塞的读写。`WriteTo` 在调用期间借用输入缓冲，异步发送须在返回前复制。 |
 | 挂载和卸载 | 一个节点同时持有一个数据端口。`NewEndpoint` 预留端口，`CreateNIC` 失败时调用 `ep.Close()`。挂载成功后用 `s.RemoveNIC(id)` 删除该 NIC 及其路由并释放端口，之后可挂载新端点。 |
 | 选择 MTU | 用 `nebulagvisor.Options.MTU` 设置，默认 `nebulagvisor.DefaultMTU`（1300）。构造时接受 1280 至 9001，运行时 `SetMTU` 将值限制在该范围。外层传输还要容纳 Nebula 封装开销。 |
-| 停止服务 | 宿主管理 socket 的关闭或 deadline。`node.Close()` 取消数据端口并关闭外层传输，`node.Wait()` 等待节点任务退出并报告致命传输错误。其他 NIC 和整个栈继续由宿主管理。 |
+| 停止服务 | 宿主管理业务 socket 的关闭或 deadline。`node.Close()` 关闭数据端口、外层传输、已附加的控制套接字及订阅。`node.Wait()` 等待节点任务退出并返回致命错误。其他 NIC 和整个栈由宿主管理。 |
 
 ### 自定义 UDP 数据报前缀
 
@@ -67,7 +67,7 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 
 通过 `node.OpenIPPort(deliver)`，应用可以将隧道接入自己的三层设备。例如，应用可以使用 `IFF_TUN | IFF_NO_PI` 创建 Linux TUN 接口，配置接口地址和系统路由，再按以下方向收发原始 IP 包。
 
-- 系统发往隧道时，从 TUN 读取完整的单播 IP 包，调用 `port.WriteIP(nextHop, packet)`。直达 overlay 地址时，下一跳可传 `netip.Addr{}`。访问下游子网时，传网关的 overlay 地址。成功返回表示包副本已入队。
+- 系统发往隧道时，从 TUN 读取完整的单播 IP 包，调用 `port.WriteIP(nextHop, packet)`。直达 overlay 地址时，下一跳可传 `netip.Addr{}`。访问下游子网时，传网关的 overlay 地址。成功返回表示本机已接受该包。普通业务包进入有界队列，已建链时优先级控制包可直接提交传输。
 - 隧道发往系统时，`deliver` 收到已通过证书授权的 IP 包。回调在节点接收协程上借用包数据，交给异步写 TUN 的协程前须复制。
 
 退出时由应用关闭 TUN 并调用 `port.Close()` 释放节点的数据端口。
@@ -80,9 +80,9 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 
 | 操作 | API 与结果 |
 | --- | --- |
-| 查找或刷新 peer | `PeerDiscovery(addr)` 读取缓存。客户端用 `RefreshPeer(ctx, addr)` 将查询排队，同一地址共享在途请求，队列满时可用 context 取消等待。要等待可用隧道，调用 `ConnectPeer`。 |
-| 更新静态候选 | `SetPeerEndpoints(addr, endpoints)` 替换该 peer 的静态 UDP 地址，已学习的地址和已建立的隧道继续可用。 |
-| 通告本机地址 | `AdvertiseNow(ctx)` 获取动态地址并向 lighthouse 发送更新。底层传输实现 `RebindableTransport` 时，`node.Rebind()` 重绑 UDP 并重新通告。 |
+| 查找或刷新 peer | `PeerDiscovery(addr)` 读取发现缓存。`RefreshPeer(ctx, addr)` 发起适用的查询。标准 lighthouse 查询会合并同一地址的请求，等待入队时可取消。受管引介单独排队，队列满时跳过本次尝试。等待可用隧道用 `ConnectPeer`。 |
+| 更新静态候选 | `SetPeerEndpoints(addr, endpoints)` 替换该 peer 的静态 UDP 地址，传空切片可清空。受限叶节点会立即重算邻居的允许出口。仅由旧静态记录授权的地址随即失效，即使该会话仍然存在。 |
+| 通告本机地址 | 客户端用 `AdvertiseNow(ctx)` 向配置的 lighthouse 发送更新。底层传输实现 `RebindableTransport` 时，`node.Rebind()` 重绑、更新本机监听地址并触发通告。受管发现通过签名引介交换候选。 |
 | 建立或关闭连接 | `ConnectPeer(ctx, addr)` 等待经过认证且具有可用出口的隧道。取消 context 结束本次等待，共享握手可继续。`DisconnectPeer` 和 `DisconnectAll` 撤销所选 peer 的在途握手并关闭隧道，后续流量可重新触发握手。 |
 
 接收端按 `Lighthouse.MaxReported` 分别限制每个来源的 IPv4 endpoint、IPv6 endpoint 和 relay 数量。主动通告、查询回复和打洞通知超出单包容量时，发送端按相同的条数上限裁剪各类候选，保留各列表的原始顺序。UDP 直连握手先尝试 `Options.PreferredRanges` 中的地址，组内依次优先 IPv6、非私有 IPv4 和私有 IPv4。
@@ -108,12 +108,14 @@ for _, id := range []tcpip.NICID{vpnNIC, lanNIC} {
 
 **中转负载**通过 `node.RelayStats()` 读取。`UsedMappings` 和 `MaxMappings` 分别是本地中转索引的当前占用和生效上限。半开映射和端点映射都占用索引，一条端到端线路可占多个索引。`ForwardedDatagrams` 按节点生命周期累计，每次替其他节点向下一跳成功提交握手、探测或业务数据报时加一。
 
+**受管网络**通过 `node.ControlStatus()` 查看本机安装的版本、最近交换 hello 的邻居、已分配的多跳路线和出口整形计数。排查拥塞时，`PortStats.Queued` 是等待发往下一跳的内层 IP 包数，`ControlStatus().Egress.QueuedBytes` 是等待整形发送的外层数据报字节数。[受管网络诊断](control.md#排查受管网络)
+
 ## 排错
 
 | 现象 | 检查方法 |
 | --- | --- |
 | 节点启动后连不上 peer | 用 `node.Snapshot()` 核对本机状态、证书地址和外层监听地址，用 `node.Discovery()` 核对 lighthouse 配置。`node.PeerDiscovery(addr)` 返回缓存中已知的 endpoint 与 relay，供核对 UDP 可达性。`node.Err()` 可读取导致节点停机的传输错误。 |
-| 想知道 IP 包实际走了哪条路 | 在 `node.Peer(addr)` 返回的快照中，`CurrentEndpoint` 是该会话已知的直连 UDP 地址，`LastDataPath` 记录最近一次成功提交给外层传输的 IP 包路径。其中 `Endpoint` 是外层 UDP 端点，`Relay` 为空表示直连。 |
+| 想知道 IP 包实际走了哪条路 | 在 `node.Peer(addr)` 返回的快照中，`CurrentEndpoint` 是该会话已知的直连 UDP 地址，`LastDataPath` 记录最近一次成功提交给外层传输的 IP 包路径。`Endpoint` 是外层 UDP 端点，`Relay` 是中转第一跳，直连时为空。受管多跳路径还具有 `Circuit` ID。 |
 | peer 能连通，下游主机不通 | 核对下游路由的 `Gateway`、网关证书、两侧 NIC 转发开关和回程路由。直接使用 IPPort 时，缺少网关会返回 `ErrMissingGateway`，证书拒绝可通过 `errors.Is(err, nebula.ErrAddressNotCertified)` 判断。 |
 | 包已入队，稍后发送失败 | 查看 `ep.Stats()` 或 `port.Stats()` 的 `Queued`、`RejectedInbound`、`RejectedOutbound` 和 `LastDrop`。最后一项记录最近一次端口拒绝的原因和可取得的地址。适配器自身的 MTU 检查直接返回 gVisor 的 `ErrMessageTooLong`。 |
 | 队列满或正在更换网关 | `ErrQueueFull` 对应 gVisor 的 `ErrNoBufferSpace`。检查端口总容量与下一跳容量。更换网关后可用 `ClearPending(oldPeer)` 撤销旧下一跳的积压包，返回值为撤销数量。已交给传输的包仍可能完成发送。 |

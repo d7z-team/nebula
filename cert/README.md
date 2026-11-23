@@ -40,7 +40,7 @@ func LoadIdentity(hostPEM, keyPEM, caPEM []byte) (nebula.Identity, *cert.CAPool,
 
 ## 签发客户端与网关证书
 
-签发端用 `cert.CreateCA` 建立 CA。对于本指南的网关示例，CA 的 `Networks` 可限定为 `10.42.0.0/24`，`UnsafeNetworks` 可限定为 `192.168.50.0/24`。以下片段使用 CA 证书 `ca` 和原始签名私钥 `signingKey` 返回网关身份。
+签发端用 `cert.CreateCA` 创建 CA，默认签发 v2 CA 证书。`cert.IssueCertificate` 默认沿用 CA 的证书版本。对于本指南的网关示例，CA 的 `Networks` 可限定为 `10.42.0.0/24`，`UnsafeNetworks` 可限定为 `192.168.50.0/24`。以下片段使用 CA 证书 `ca` 和原始签名私钥 `signingKey` 返回网关身份。
 
 ```go
 host, key, err := cert.IssueCertificate(ca, signingKey, cert.CertificateOptions{
@@ -57,6 +57,16 @@ return nebula.Identity{Certificate: host, PrivateKey: key}, nil
 签发客户端时，将 `Name` 设为 `client`，在 `Networks` 中填写 `10.42.0.1/24`，`UnsafeNetworks` 留空。前缀中的 `10.42.0.1` 是节点身份，`/24` 指定 overlay 网段。签发网关证书后，在客户端添加下游路由，在网关的 gVisor 栈上启用转发。[网关配置](../docs/nebula-nic.md#经网关访问下游子网)
 
 如需由节点自行保管私钥，在节点上用 `cert.GenerateKeyAgreementKey` 生成密钥对，仅将公钥交给签发端填入 `CertificateOptions.PublicKey`。这种用法下，`IssueCertificate` 的私钥返回值为 nil。保存证书使用 `host.MarshalPEM()`，保存主机私钥使用 `cert.MarshalPrivateKeyToPEM`。
+
+## 受管网络的信任配置
+
+| 凭证 | 配置位置 | 用途 |
+| --- | --- | --- |
+| 主机身份及其受信 CA | `Options.Identities`、`Options.CAPool` | Nebula 握手验证对端身份，收发 IP 包时检查证书授权的地址和子网。 |
+| 配置 CA 公共证书 | `ControlOptions.Authority` | 节点以部署时指定的 CA 验证完整网络配置。签发机持有对应私钥，可用 `cert.MarshalSigningPrivateKeyToPEM` 保存供 `nebula-config` 使用。 |
+| 成员 Ed25519 发布密钥 | 本机 `ControlOptions.Publisher` 私钥、签名成员记录中的 `publisher` 公钥 | 签名端点介绍和获准主题的应用事件。 |
+
+普通节点只需主机身份和信任池。受管节点可以使用独立的配置 CA。要吊销主机证书，用 `host.Fingerprint()` 取得小写十六进制指纹，纳入下一版完整的 `revoked` 列表。变更在各节点安装该版本时生效。成员记录固定的 `certificate` 指纹命中列表时，该成员的事件发布权限也会停用。使用独立发布密钥且未设置 `certificate` 的成员，可以在同一版本清空 `publisher` 和 `topics` 来撤回发布权限。[签发与分发网络配置](../docs/control.md#签发配置)
 
 ## 格式与互通
 

@@ -8,7 +8,7 @@
 | --- | --- |
 | `Auto`（默认） | 初次连接优先尝试直连。业务使用一条活动路径，探测可验证一条备用路径。显式设置 `Relays` 可限制允许的中转。 |
 | `DirectOnly` | 握手和业务只走直连。可探测并切换同一 peer 的不同外层地址。 |
-| `RelayOnly` | 握手、业务、探测和关闭通知均须经过允许的单跳中转，并停用对该 peer 的直连打洞。可用中转来自显式的 `Relays`，留空时使用发现记录。 |
+| `RelayOnly` | 握手、业务、探测和关闭通知均须经过允许的中转，并停用对该 peer 的直连打洞。可用中转来自显式的 `Relays`，留空时使用发现记录。 |
 
 例如，客户端可以强制通过中转访问网关，并在空闲时每隔约 30 秒检查活动路径。`gateway` 和 `relay` 分别是网关和中转的 overlay 地址。将以下配置传给 `nebula.New`。
 
@@ -22,12 +22,14 @@ opts.Paths.Peers = map[netip.Addr]nebula.PeerPathPolicy{
 }
 ```
 
-中转节点设置 `Relay.Serve = true` 并与两端直连。它也可以为自己的连接选择其他中转。端点通过 `Relay.AdvertiseVia` 向 lighthouse 发布可以到达自己的中转。使用纯静态配置时，在两端设置对方的中转名单，并为中转提供静态外层地址。
+标准单跳中转节点设置 `Relay.Serve = true` 并与两端直连。它也可以为自己的连接选择其他中转。端点通过 `Relay.AdvertiseVia` 向 lighthouse 发布可以到达自己的中转。使用纯静态配置时，在两端设置对方的中转名单，并为中转提供静态外层地址。启用受管控制服务后，也可以在签名拓扑上通过多个网关转发。[多跳部署与整形](control.md)
 
 `node.SetPeerPathPolicy(ctx, gateway, &policy)` 替换指定地址的策略，传入 `nil` 撤销该地址的覆盖。更新成功后，新提交给传输的数据报使用新策略。
 
 - 拨号前用 `policy, ok := node.PeerPathPolicy(gateway)` 查询该地址的显式策略。显式设置为 `Auto` 时也返回 `true`，返回的中转列表可由调用方修改。`ok` 为 `false` 表示该地址没有覆盖，节点默认策略见 `node.Discovery().DefaultPathPolicy`。
-- 认证后用 `node.Peer(gateway)` 返回的 `PathHealth.Policy` 查看有效策略。同一证书的多个地址共享路径，各地址的显式限制取交集。没有共同路径时显示 `PathBlocked`。要让首次握手也强制中转，为应用可能拨号的每个地址设置策略。
+- 认证后用 `node.Peer(gateway)` 返回的快照查看 `PathHealth.Policy`。同一证书的多个地址共享路径，各地址的显式限制取交集。要让首次握手也强制中转，为应用可能拨号的每个地址设置策略。
+
+受管节点还会把本地策略与当前签名拓扑取交集。例如，受限叶节点与签名 `links` 中的网关直连，访问远端 peer 则须经获准的中转。给远端配置本地 `DirectOnly` 会得到 `PathBlocked`。它是有效策略的诊断结果，可配置的模式为表中的三种。[成员与拓扑配置](control.md#签发配置)
 
 ## 手动检查去程与回程
 
@@ -37,7 +39,8 @@ opts.Paths.Peers = map[netip.Addr]nebula.PeerPathPolicy{
 | --- | --- |
 | 当前业务出口 | `nebula.TunnelPath{}` |
 | 已知 UDP 直连端点 | `nebula.TunnelPath{Endpoint: ep}` |
-| 单跳中转 | `nebula.TunnelPath{Relay: relay}` |
+| 指定第一跳 | `nebula.TunnelPath{Relay: relay}` |
+| 指定一条已建立的多跳路线 | `nebula.TunnelPath{Relay: relay, Circuit: id}`。可直接传入该 peer 的 `PathHealth.Active.Path` 或 `Standby.Path`。完整路线见本机 `ControlStatus().Circuits` 中的同一 ID。 |
 
 ```go
 check, err := node.CheckPeerPath(ctx, gateway, nebula.TunnelPath{})
@@ -47,7 +50,7 @@ if err != nil {
 log.Printf("sent=%v received=%v rtt=%v", check.Sent, check.Received, check.RTT)
 ```
 
-上游 Nebula 能回显标准的加密 Test 消息。`Sent` 和 `Received` 分别记录探测的去程和回程，只有 `SamePath` 为真的样本参与 RTT 和抖动比较。要确认业务包实际走的路径，查看 `node.Peer(addr)` 快照中的 `LastDataPath`。
+上游 Nebula 能回显标准的加密 Test 消息。`Sent` 和 `Received` 分别记录本机发送和收到回显的路径，只有 `SamePath` 为真的样本参与 RTT 和抖动比较。两条多跳路线可使用同一第一跳和 UDP 端点，`Circuit` 区分具体路线。重建后应从新快照取 ID。`LastDataPath` 记录本机最近一次成功提交的 IP 包，包含受管服务的隧道内 UDP 流量。
 
 单端收紧策略后，如果本机已有验证成功的中转，却收到违反策略的直连业务包，本机会丢弃该包并沿中转重新握手。需要从发送端约束两个方向的业务时，在两端都配置 `RelayOnly`。
 

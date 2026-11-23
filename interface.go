@@ -17,6 +17,7 @@ import (
 const mtu = 9001
 
 type packetEngine struct {
+	control              *controlPlane
 	paths                pathManager
 	hostMap              *hostMap
 	outside              DatagramTransport

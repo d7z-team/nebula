@@ -112,12 +112,12 @@ func TestIPPortInboundPolicyAndSource(t *testing.T) {
 	peer := &hostInfo{vpnAddrs: []netip.Addr{b.addr}}
 	peer.buildNetworks(node.engine.myVpnNetworksTable, b.identity.Certificate)
 	for _, src := range []netip.Addr{a.addr, netip.MustParseAddr("10.42.0.50"), a.virtual, b.virtual} {
-		port.receiveIP(peer, testIPv4(src, a.virtual, "in"))
+		port.receiveIP(peer, testIPv4(src, a.virtual, "in"), packetSender{})
 	}
 	require.EqualValues(t, 4, port.Stats().RejectedInbound)
 	denied = false
 	pkt := testIPv4(b.virtual, a.virtual, "asymmetric")
-	port.receiveIP(peer, pkt)
+	port.receiveIP(peer, pkt, packetSender{})
 	require.Equal(t, pkt, <-rx)
 	stats := port.Stats()
 	require.EqualValues(t, 1, stats.ReceivedPackets)

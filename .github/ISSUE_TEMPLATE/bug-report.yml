@@ -13,7 +13,7 @@ body:
     id: reproducer
     attributes:
       label: Reproducer
-      description: Include the relevant Options, transport behavior, and a minimal Go reproducer. Remove certificate private keys.
+      description: Include the relevant public option values, transport behavior, and a minimal Go reproducer. Use placeholders for host, CA, and event publisher private keys.
     validations:
       required: true
   - type: textarea

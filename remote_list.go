@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/gaissmai/bart"
 )
@@ -67,6 +68,10 @@ type remoteList struct {
 	preferredRanges []netip.Prefix
 	records         map[netip.Addr]*discoveryRecord
 	staticEndpoints map[netip.Addr][]netip.AddrPort
+	introduced      []netip.AddrPort
+	introRelays     []netip.Addr
+	introExpiry     time.Time
+	introCert       string
 	badRemotes      []netip.AddrPort
 	cached          *remoteCandidates
 }
@@ -120,11 +125,18 @@ func (r *remoteList) candidates() *remoteCandidates {
 	}
 	r.Lock()
 	defer r.Unlock()
+	if !r.introExpiry.IsZero() && !time.Now().Before(r.introExpiry) {
+		r.introCert = ""
+		r.introduced = nil
+		r.introRelays = nil
+		r.introExpiry = time.Time{}
+		r.cached = nil
+	}
 	if r.cached != nil {
 		return r.cached
 	}
 
-	c := &remoteCandidates{addresses: r.vpnAddrs}
+	c := &remoteCandidates{addresses: r.vpnAddrs, endpoints: slices.Clone(r.introduced), relays: slices.Clone(r.introRelays)}
 	for _, endpoints := range r.staticEndpoints {
 		c.endpoints = append(c.endpoints, endpoints...)
 	}
