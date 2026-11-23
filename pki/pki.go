@@ -58,7 +58,7 @@ func ParseChain(der [][]byte) ([]*x509.Certificate, error) {
 	return chain, nil
 }
 
-// VerifyChain builds ordinary PKIX paths and checks membership and delegation on each path.
+// VerifyChain builds ordinary PKIX paths and checks the expected identity, usage and mesh delegation on each path.
 func VerifyChain(chain []*x509.Certificate, roots *x509.CertPool, network string, peer PeerID, usage x509.ExtKeyUsage, now time.Time) ([][]*x509.Certificate, error) {
 	if roots == nil || len(chain) == 0 || chain[0] == nil {
 		return nil, errors.New("chain and explicit roots required")

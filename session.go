@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
+
 	"github.com/hashicorp/yamux"
 	quic "github.com/quic-go/quic-go"
 )

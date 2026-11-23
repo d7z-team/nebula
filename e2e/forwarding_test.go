@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"code.d7z.net/d7z-team/nebula"
 	"code.d7z.net/d7z-team/nebula/nebulagvisor"
+
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -66,10 +68,14 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 	require.Less(t, default4.MTU, uint32(1280))
 	require.EqualValues(t, 1280, default6.MTU)
 	a.SetRouteTable([]tcpip.Route{route("10.13.0.0/24", "", vpn), route("fd42::/64", "", vpn), default4, default6})
-	g.SetRouteTable([]tcpip.Route{route("10.13.0.0/24", "", vpn), route("fd42::/64", "", vpn),
-		route("172.30.0.0/24", "", lan), route("2001:db8:42::/64", "", lan)})
-	h.SetRouteTable([]tcpip.Route{route("172.30.0.0/24", "", lan), route("2001:db8:42::/64", "", lan),
-		route("0.0.0.0/0", "172.30.0.1", lan), route("::/0", "2001:db8:42::1", lan)})
+	g.SetRouteTable([]tcpip.Route{
+		route("10.13.0.0/24", "", vpn), route("fd42::/64", "", vpn),
+		route("172.30.0.0/24", "", lan), route("2001:db8:42::/64", "", lan),
+	})
+	h.SetRouteTable([]tcpip.Route{
+		route("172.30.0.0/24", "", lan), route("2001:db8:42::/64", "", lan),
+		route("0.0.0.0/0", "172.30.0.1", lan), route("::/0", "2001:db8:42::1", lan),
+	})
 
 	for _, tc := range []struct {
 		host, client string
@@ -124,7 +130,7 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 }
 
 func TestNodeNativeEndpointDiagnostics(t *testing.T) {
-	a, _ := forwardingPair(t)
+	a, gateway := forwardingPair(t)
 	_, err := nebulagvisor.NewEndpoint(a, nebulagvisor.Options{MTU: 1279})
 	require.Error(t, err)
 	ep, err := nebulagvisor.NewEndpoint(a, nebulagvisor.Options{})
@@ -145,5 +151,10 @@ func TestNodeNativeEndpointDiagnostics(t *testing.T) {
 	n, e := ep.WritePackets(list)
 	require.Zero(t, n)
 	require.IsType(t, &tcpip.ErrHostUnreachable{}, e)
-	ep.Close()
+
+	require.NoError(t, a.SetPeerPathPolicy(gateway.ID().IPv4(), nebula.Blocked))
+	pkt.EgressRoute.NextHop = tcpip.AddrFromSlice(gateway.ID().IPv4().AsSlice())
+	n, e = ep.WritePackets(list)
+	require.Zero(t, n)
+	require.IsType(t, &tcpip.ErrNotPermitted{}, e)
 }

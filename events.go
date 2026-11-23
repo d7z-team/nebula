@@ -20,6 +20,7 @@ const (
 	eventLifetime   = 5 * time.Minute
 )
 
+// Event is a signed application publication. Origin identifies its publisher.
 type Event struct {
 	Origin       PeerID
 	Topic, Nonce string
@@ -27,6 +28,7 @@ type Event struct {
 	Expires      time.Time
 }
 
+// DeliveredEvent pairs an accepted event with its content ID.
 type DeliveredEvent struct {
 	ID string
 	Event
@@ -37,6 +39,7 @@ type cachedEvent struct {
 	expires time.Time
 }
 
+// Subscription receives new events on one exact topic.
 type Subscription struct {
 	n      *Node
 	topic  string
@@ -44,8 +47,13 @@ type Subscription struct {
 	missed atomic.Uint64
 }
 
+// Events returns a channel closed by Subscription.Close or Node.Close.
 func (s *Subscription) Events() <-chan DeliveredEvent { return s.events }
-func (s *Subscription) Missed() uint64                { return s.missed.Load() }
+
+// Missed counts deliveries dropped because this subscription was full.
+func (s *Subscription) Missed() uint64 { return s.missed.Load() }
+
+// Close releases the subscription. It is safe to call repeatedly.
 func (s *Subscription) Close() {
 	n := s.n
 	n.mu.Lock()
@@ -56,6 +64,8 @@ func (s *Subscription) Close() {
 	}
 }
 
+// Subscribe registers for future admissions to an exact topic, including before Start.
+// Each subscription buffers 32 events. Earlier local admissions are not replayed.
 func (n *Node) Subscribe(topic string) (*Subscription, error) {
 	if !ValidTopic(topic) {
 		return nil, errors.New("invalid topic")
@@ -70,12 +80,20 @@ func (n *Node) Subscribe(topic string) (*Subscription, error) {
 	return s, nil
 }
 
+// Publish signs and admits an event of up to 4096 bytes on an authorized topic.
+// The returned ID confirms local admission. Neighbors receive it asynchronously.
 func (n *Node) Publish(ctx context.Context, topic string, payload []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if !ValidTopic(topic) || len(payload) > maxEventPayload {
 		return "", errors.New("invalid topic or event size")
+	}
+	n.mu.Lock()
+	err := n.state.runningError()
+	n.mu.Unlock()
+	if err != nil {
+		return "", err
 	}
 	var nonce [16]byte
 	rand.Read(nonce[:])
@@ -121,7 +139,11 @@ func (n *Node) acceptEvent(ctx context.Context, from *session, record statement)
 	id := event.ID
 	n.mu.Lock()
 	now := time.Now()
-	if n.state != running || !n.memberOf(p) || !now.Before(until) || from != nil && !n.usableLocked(from) {
+	if err := n.state.runningError(); err != nil {
+		n.mu.Unlock()
+		return "", err
+	}
+	if !n.memberOf(p) || !now.Before(until) || from != nil && !n.usableLocked(from) {
 		n.mu.Unlock()
 		return "", ErrPathPolicy
 	}

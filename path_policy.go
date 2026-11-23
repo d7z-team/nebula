@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// PathMode limits which paths the local node may use for a peer. Auto permits
+// direct and relayed paths within the current topology.
 type PathMode uint8
 
 const (
@@ -63,6 +65,8 @@ func (n *Node) modeLocked(a PeerID) PathMode {
 	return mode
 }
 
+// SetPeerPathPolicy applies a local policy to either overlay address and prunes
+// disallowed paths. It may be called before Start.
 func (n *Node) SetPeerPathPolicy(address netip.Addr, mode PathMode) error {
 	n.mu.Lock()
 	a := n.policy.Load().owners[address]

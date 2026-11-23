@@ -22,6 +22,13 @@ jobs:
           go-version: '1.27'
           check-latest: true
       - run: go test ./...
+      - name: Run the public examples
+        working-directory: examples
+        shell: bash
+        run: |
+          for example in quickstart relay gateway pki; do
+            go run "./$example"
+          done
 
   static:
     runs-on: ubuntu-latest

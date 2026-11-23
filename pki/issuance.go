@@ -19,6 +19,9 @@ type Issuer struct {
 	Chain  []*x509.Certificate
 	Signer crypto.Signer
 }
+
+// CAProfile specifies an issuing authority's validity, name and delegation limits.
+// MaxPathLen of zero permits leaf issuance only. Use -1 for an unconstrained depth.
 type CAProfile struct {
 	Subject             pkix.Name
 	NotBefore, NotAfter time.Time
@@ -53,6 +56,7 @@ func (ca Issuer) authority(at time.Time) (*x509.Certificate, error) {
 	}
 	return ca.Chain[0], nil
 }
+
 func issue(template, parent *x509.Certificate, pub crypto.PublicKey, key crypto.Signer) (*x509.Certificate, error) {
 	// DER encodes certificate validity to whole seconds. Validate the interval
 	// that relying parties will actually see.
@@ -67,6 +71,7 @@ func issue(template, parent *x509.Certificate, pub crypto.PublicKey, key crypto.
 	}
 	return x509.ParseCertificate(der)
 }
+
 func caTemplate(p CAProfile) (*x509.Certificate, error) {
 	c := &x509.Certificate{Subject: p.Subject, NotBefore: p.NotBefore, NotAfter: p.NotAfter, IsCA: true, BasicConstraintsValid: true, MaxPathLen: p.MaxPathLen, MaxPathLenZero: p.MaxPathLen == 0, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
 	if p.Scope != nil {
@@ -85,6 +90,8 @@ func caTemplate(p CAProfile) (*x509.Certificate, error) {
 	}
 	return c, nil
 }
+
+// CreateRoot creates a self-signed X.509 trust anchor using key.
 func CreateRoot(key crypto.Signer, p CAProfile) (*x509.Certificate, error) {
 	if key == nil || p.Subject.String() == "" || p.MaxPathLen < -1 {
 		return nil, errors.New("invalid CA profile or key")
@@ -95,6 +102,8 @@ func CreateRoot(key crypto.Signer, p CAProfile) (*x509.Certificate, error) {
 	}
 	return issue(c, c, key.Public(), key)
 }
+
+// CreateCSR signs a PKCS#10 request with the applicant's key.
 func CreateCSR(key crypto.Signer, subject pkix.Name) (*x509.CertificateRequest, error) {
 	if key == nil {
 		return nil, errors.New("invalid request key")
@@ -126,6 +135,8 @@ func (ca Issuer) checkIPRanges(prefixes []netip.Prefix) error {
 	}
 	return nil
 }
+
+// IssueCA signs a subordinate CA request. The caller approves the CSR public key.
 func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile) (*x509.Certificate, error) {
 	parent, err := ca.authority(time.Now())
 	if err != nil {
@@ -154,6 +165,8 @@ func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile) (*x509.Certi
 	return issue(c, parent, csr.PublicKey, ca.Signer)
 }
 
+// IssueLeaf checks the CSR signature and approved public key hash, then issues
+// a certificate with the addresses, scope and usages specified by the issuer.
 func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Certificate, error) {
 	parent, err := ca.authority(time.Now())
 	if err != nil {

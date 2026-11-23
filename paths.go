@@ -122,7 +122,8 @@ func (n *Node) preferredSessionLocked(paths *peerPaths, direct bool, packet *inn
 	return best
 }
 
-// ConnectPeer connects to the member that owns either overlay address.
+// ConnectPeer waits for a usable path to the member owning either overlay address.
+// Canceling ctx ends this wait. The node owns the shared dial attempt.
 func (n *Node) ConnectPeer(ctx context.Context, address netip.Addr) error {
 	return n.connectPeer(ctx, n.policy.Load().owners[address])
 }
@@ -132,9 +133,9 @@ func (n *Node) connectPeer(ctx context.Context, peer PeerID) error {
 		return ErrPeerUnavailable
 	}
 	n.mu.Lock()
-	if n.state != running {
+	if err := n.state.runningError(); err != nil {
 		n.mu.Unlock()
-		return ErrNodeNotStarted
+		return err
 	}
 	if n.modeLocked(peer) == Blocked {
 		n.mu.Unlock()
@@ -153,7 +154,7 @@ func (n *Node) connectPeer(ctx context.Context, peer PeerID) error {
 			n.mu.Lock()
 			a.err = err
 			if err != nil {
-				n.lastError = err.Error()
+				n.lastConnectError = err.Error()
 			}
 			delete(n.attempts, peer)
 			close(a.done)
@@ -299,7 +300,7 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 		}
 	}
 	if a.err != nil {
-		n.retries.Add(1)
+		n.dialFailures.Add(1)
 	}
 	n.mu.Lock()
 	delete(n.directDials, key)
@@ -456,6 +457,9 @@ func (n *Node) hasCircuit(peer PeerID, route []PeerID) bool {
 	})
 }
 
+// RecommendedMTU returns a route MTU in bytes for the given inner address family.
+// A nonpositive limit selects MaxIPSize. With no known QUIC budget it returns
+// the capped limit. An IPv6 limit below 1280 yields zero.
 func (n *Node) RecommendedMTU(address netip.Addr, ipv6 bool, limit int) int {
 	peer := n.policy.Load().owners[address]
 	if limit <= 0 || limit > n.o.MaxIPSize {

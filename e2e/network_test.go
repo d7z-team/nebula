@@ -214,9 +214,11 @@ func (g *natGate) sent(public, remote netip.AddrPort) {
 	}
 	p[g.permission(remote)] = true
 }
+
 func (g *natGate) accepts(public, remote netip.AddrPort) bool {
 	return g.permissions[public][g.permission(remote)]
 }
+
 func (g *natGate) permission(remote netip.AddrPort) netip.AddrPort {
 	switch g.filter {
 	case openFilter:

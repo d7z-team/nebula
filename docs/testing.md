@@ -10,6 +10,8 @@ go test -race -count=1 ./...
 go test -race -count=1 -timeout=5m ./e2e -args -extended
 ```
 
+常规 CI 还会在 `examples` 目录依次执行 `go run ./quickstart`、`go run ./relay`、`go run ./gateway`、`go run ./pki`。各命令检查业务结果后退出。[案例与预期结果](../README.md#getting-started)
+
 复查端口受限 NAT 的直连行为，或重放指定混沌种子，可以单独运行相应场景。
 
 ```sh
@@ -29,7 +31,7 @@ go test -v -count=1 -run '^TestSeededChaos$' ./e2e -args -extended -seed 7
 | 中继分区、事件补发或关闭积压队列 | 扩展场景切断中继、撤回发布者授权，或在整形与拨号期间关闭节点。分别核对恢复路径、晚加入订阅者收到的事件和关闭后的队列状态。[混沌测试](../e2e/chaos_test.go) |
 | 证书签发、热加载或授权期限 | 检查 CSR 公钥审批、双栈 SAN、逐链 CIDR 委派与有效期。会话测试核对握手期间换证前后的实际序列号，事件测试覆盖最大 CMS 对象和分页清单的交付。[签发边界](../pki/boundaries_test.go) · [路径授权](../identity_boundaries_test.go) · [握手与帧](../authentication_test.go) |
 
-NAT 网关由 gVisor 执行转发、SNAT 和 DNAT。测试固定 UDP 公网映射并按已发送的报文记录允许的回包来源，从而分别控制映射与过滤。IPv4 转发测试在 FORWARD 钩子中保留包头引用。使用项目固定依赖构建网关时，参见部署步骤。[IPv4 网关构建](quickstart.md#gvisor-的-ipv4-网关构建)
+NAT 网关由 gVisor 执行转发、SNAT 和 DNAT。测试固定 UDP 公网映射并按已发送的报文记录允许的回包来源，从而分别控制映射与过滤。IPv4 转发测试在 FORWARD 钩子中保留包头引用。使用项目固定依赖构建网关时，参见部署步骤。[IPv4 网关构建](integration.md#gvisor-的-ipv4-网关构建)
 
 ## 性能对照
 
@@ -37,7 +39,7 @@ NAT 网关由 gVisor 执行转发、SNAT 和 DNAT。测试固定 UDP 公网映�
 
 ```sh
 go test -run '^$' -bench '^BenchmarkMeshIP$' -benchtime=500x -benchmem -count=5 -cpu=2 .
-go test -run '^$' -bench '^BenchmarkPeerStatus$' -benchmem .
+go test -run '^$' -bench '^BenchmarkPathStatus$' -benchmem .
 ```
 
-`BenchmarkMeshIP` 经 UDP 和 TCP 逐包发送 1 KiB 的内层 IPv4 包，每次等对端收到后再发下一个。可比较每包分配次数、字节数以及交付延迟的 p95、p99。`BenchmarkPeerStatus` 分别在连接 16 和 128 个 TCP 对端后读取完整路径状态。[基准代码](../mesh_test.go)
+`BenchmarkMeshIP` 经 UDP 和 TCP 逐包发送 1 KiB 的内层 IPv4 包，每次等对端收到后再发下一个。可比较每包分配次数、字节数以及交付延迟的 p95、p99。`BenchmarkPathStatus` 分别在连接 16 和 128 个 TCP 对端后读取完整路径状态。[基准代码](../mesh_test.go)

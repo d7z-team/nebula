@@ -84,7 +84,7 @@ func TestIssuanceAndCMS(t *testing.T) {
 				}
 				dir := t.TempDir()
 				caPath := filepath.Join(dir, "root.pem")
-				require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw}), 0600))
+				require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw}), 0o600))
 				cmd := exec.Command(exe, "cms", "-verify", "-binary", "-inform", "DER", "-purpose", "any", "-CAfile", caPath)
 				cmd.Stdin = bytes.NewReader(wire)
 				out, err := cmd.CombinedOutput()

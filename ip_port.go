@@ -10,8 +10,10 @@ import (
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
+// MaxIPPacketSize is the largest inner packet accepted by a node, in bytes.
 const MaxIPPacketSize = 65535
 
+// PortStats holds counters for this attachment. Queued excludes in-flight packets.
 type PortStats struct {
 	ReceivedPackets, ReceivedBytes    uint64
 	SentPackets, SentBytes            uint64
@@ -26,6 +28,7 @@ type ipQueue struct {
 	stopCurrent context.CancelFunc
 }
 
+// IPPort delivers complete IPv4 and IPv6 packets for one attachment.
 type IPPort struct {
 	node    *Node
 	deliver func([]byte)
@@ -35,6 +38,8 @@ type IPPort struct {
 	stats   PortStats
 }
 
+// OpenIPPort attaches the sole IP receiver, including before Start. The callback
+// can run concurrently on receive tasks. Call Node.Close outside the callback.
 func (n *Node) OpenIPPort(deliver func([]byte)) (*IPPort, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -49,6 +54,7 @@ func (n *Node) OpenIPPort(deliver func([]byte)) (*IPPort, error) {
 	return p, nil
 }
 
+// Close detaches this receiver and discards pending sends.
 func (p *IPPort) Close() {
 	p.mu.Lock()
 	p.closed = true
@@ -88,6 +94,7 @@ func (p *IPPort) discardQueueLocked(peer PeerID) int {
 	return count
 }
 
+// Stats returns a snapshot of this attachment's queues and traffic.
 func (p *IPPort) Stats() PortStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -102,7 +109,7 @@ func (ip innerPacket) authorizedOn(cfg *topologyView, from, to pki.Identity) boo
 	return ip.authorizedBy(cfg, from.ID, to.ID) && from.AllowsIP(ip.source) && to.AllowsIP(ip.destination)
 }
 
-// WriteIP queues a copy of a complete IP packet. A zero peer selects the member
+// WriteIP queues a copy of a complete IP packet. A zero via selects the member
 // that owns the destination address. For a downstream subnet, pass its gateway.
 func (p *IPPort) WriteIP(via netip.Addr, b []byte) error {
 	n := p.node
@@ -110,36 +117,33 @@ func (p *IPPort) WriteIP(via netip.Addr, b []byte) error {
 	if err != nil || len(b) > n.o.MaxIPSize {
 		return ErrInvalidPacketAddress
 	}
-	cfg := n.policy.Load()
-	if !n.memberOf(cfg) {
-		return ErrPathPolicy
-	}
 	if !via.IsValid() {
 		via = ip.destination
 	}
-	peer := cfg.owners[via]
-	if peer == (PeerID{}) {
-		return ErrMissingGateway
-	}
-	if !ip.authorizedBy(cfg, n.id, peer) {
-		return ErrAddressUnauthorized
-	}
 	n.mu.Lock()
-	state, mode := n.state, n.modeLocked(peer)
-	if !n.ready(cfg) && n.selectSessionLocked(peer, false) == nil {
-		mode = Blocked
-	}
+	cfg := n.policy.Load()
+	peer := cfg.owners[via]
+	state := n.state
+	blocked := n.modeLocked(peer) == Blocked || !n.ready(cfg) && n.selectSessionLocked(peer, false) == nil
 	n.mu.Unlock()
-	if state != running {
-		return ErrNodeNotStarted
+	if err := state.runningError(); err != nil {
+		return err
 	}
-	if mode == Blocked {
-		return ErrPathPolicy
-	}
+	authorized := ip.authorizedBy(cfg, n.id, peer)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	switch {
+	case p.closed:
 		return ErrPortClosed
+	case !n.memberOf(cfg):
+		return ErrPathPolicy
+	case peer == (PeerID{}):
+		return ErrMissingGateway
+	case !authorized:
+		return ErrAddressUnauthorized
+	case blocked:
+		return ErrPathPolicy
 	}
 	q := p.queues[peer]
 	if p.stats.Queued >= 512 || q != nil && len(q.packets) >= 64 {

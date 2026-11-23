@@ -15,8 +15,8 @@ import (
 
 const ALPN = "nebula-mesh"
 
-// LocalCertificates contains leaf-first chains. An empty Server reuses Client.
-// A dedicated Object credential uses the codeSigning EKU.
+// LocalCertificates holds leaf-first chains for clientAuth, serverAuth and codeSigning.
+// Empty Server and Object credentials reuse Client.
 type LocalCertificates struct{ Client, Server, Object tls.Certificate }
 
 type credentials struct {
@@ -184,8 +184,10 @@ func (n *Node) ready(p *topologyView) bool {
 }
 
 func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
-	cfg := &tls.Config{RootCAs: n.o.Roots, ClientCAs: n.o.Roots, ClientAuth: tls.RequireAndVerifyClientCert,
-		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, NextProtos: []string{ALPN}, SessionTicketsDisabled: true, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768}}
+	cfg := &tls.Config{
+		RootCAs: n.o.Roots, ClientCAs: n.o.Roots, ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, NextProtos: []string{ALPN}, SessionTicketsDisabled: true, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
+	}
 	if server {
 		cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &n.cred.Load().Server, nil }
 	} else {
@@ -216,11 +218,13 @@ func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
 	return cfg
 }
 
-type statement []byte
-type publishedStatement[T any] struct {
-	Publisher PeerID
-	Value     T
-}
+type (
+	statement                 []byte
+	publishedStatement[T any] struct {
+		Publisher PeerID
+		Value     T
+	}
+)
 
 func (n *Node) signStatement(kind string, value any, signer tls.Certificate) (statement, error) {
 	b, err := json.Marshal(publishedStatement[any]{n.id, value})

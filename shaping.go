@@ -42,7 +42,7 @@ func (n *Node) shape(ctx context.Context, size int) error {
 				return err
 			}
 		}
-		n.shaped.Add(uint64(size))
+		n.bytesScheduled.Add(uint64(size))
 		return nil
 	}
 }

@@ -14,6 +14,7 @@ import (
 // PeerID is the network-order IPv4 address followed by the IPv6 address.
 type PeerID [20]byte
 
+// NewPeerID binds one unicast IPv4 address and one native unicast IPv6 address.
 func NewPeerID(v4, v6 netip.Addr) (PeerID, error) {
 	var id PeerID
 	if !v4.Is4() || !v6.Is6() || v6.Is4In6() || v6.Zone() != "" || !v4.IsGlobalUnicast() || !v6.IsGlobalUnicast() {

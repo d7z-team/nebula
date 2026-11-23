@@ -7,6 +7,7 @@ import (
 	"net/netip"
 
 	"code.d7z.net/d7z-team/nebula"
+
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -96,7 +97,7 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 			return i, &tcpip.ErrClosedForSend{}
 		case errors.Is(err, nebula.ErrMissingGateway), errors.Is(err, nebula.ErrPeerUnavailable):
 			return i, &tcpip.ErrHostUnreachable{}
-		case errors.Is(err, nebula.ErrAddressUnauthorized):
+		case errors.Is(err, nebula.ErrAddressUnauthorized), errors.Is(err, nebula.ErrPathPolicy):
 			return i, &tcpip.ErrNotPermitted{}
 		default:
 			return i, &tcpip.ErrBadAddress{}

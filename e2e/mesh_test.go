@@ -16,6 +16,7 @@ import (
 	"code.d7z.net/d7z-team/nebula"
 	"code.d7z.net/d7z-team/nebula/nebulagvisor"
 	"code.d7z.net/d7z-team/nebula/pki"
+
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -49,6 +50,7 @@ func labPeer(ip netip.Addr) nebula.PeerID {
 	}
 	return id
 }
+
 func newLab(t *testing.T) *lab {
 	t.Helper()
 	key, err := pki.GenerateKey("ed25519")
@@ -95,6 +97,7 @@ func (l *lab) host(segment, physical, via, transport string, publish bool) *host
 	l.hosts = append(l.hosts, h)
 	return h
 }
+
 func (l *lab) addUnderlay(h *host, segment, physical, via, transport string, publish bool) {
 	l.t.Helper()
 	s := newStack(l.t)
@@ -172,17 +175,17 @@ func (l *lab) start() {
 		if l.t.Failed() {
 			l.net.snapshot(l.t)
 			for _, h := range l.hosts {
-				l.t.Logf("%s: %+v; paths %+v", h.ip, h.node.ControlStatus(), h.node.Peers())
+				l.t.Logf("%s: %+v; paths %+v", h.ip, h.node.ControlStatus(), h.node.Paths())
 			}
 		}
 	})
 }
 
-func waitPath(t *testing.T, a, b *host, kind string) nebula.PeerStatus {
+func waitPath(t *testing.T, a, b *host, kind string) nebula.PathStatus {
 	t.Helper()
-	var path nebula.PeerStatus
+	var path nebula.PathStatus
 	require.Eventually(t, func() bool {
-		for _, p := range a.node.Peers() {
+		for _, p := range a.node.Paths() {
 			if p.Peer == labPeer(b.ip) && p.Active && p.Transport == kind {
 				path = p
 				return true
@@ -194,7 +197,7 @@ func waitPath(t *testing.T, a, b *host, kind string) nebula.PeerStatus {
 	return path
 }
 
-func (l *lab) connect(a, b *host, kind string) nebula.PeerStatus {
+func (l *lab) connect(a, b *host, kind string) nebula.PathStatus {
 	l.t.Helper()
 	ctx, cancel := context.WithTimeout(l.t.Context(), 10*time.Second)
 	defer cancel()
@@ -266,7 +269,7 @@ func TestMixedTLSCredentials(t *testing.T) {
 			p := l.connect(a, b, tc.transport)
 			require.EqualValues(t, tls.VersionTLS13, p.TLSVersion)
 			require.Equal(t, nebula.ALPN, p.ALPN)
-			require.Equal(t, tls.X25519MLKEM768.String(), p.Group)
+			require.Equal(t, tls.X25519MLKEM768, p.TLSGroup)
 			require.Equal(t, b.options.Certificates.Client.Leaf.SerialNumber.String(), p.Serial)
 			require.Equal(t, a.options.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).Serial)
 			eventReceipt(t, a, b, "client publication")
@@ -294,7 +297,7 @@ func TestDualUnderlayFamilyFailover(t *testing.T) {
 			roundTrip(t, c6, s6)
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.segment == "wan4"} })
 			require.Eventually(t, func() bool {
-				for _, path := range a.node.Peers() {
+				for _, path := range a.node.Paths() {
 					if path.Peer == b.node.ID() && path.Transport == kind && path.Active && path.Endpoint.Addr().Is6() {
 						return true
 					}

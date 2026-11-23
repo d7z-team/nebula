@@ -22,7 +22,7 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -43,12 +43,13 @@ func input(path string, in io.Reader) ([]byte, error) {
 	}
 	return b, err
 }
+
 func save(path string, b []byte, out io.Writer) error {
 	if path == "-" {
 		_, err := out.Write(b)
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -59,6 +60,7 @@ func save(path string, b []byte, out io.Writer) error {
 	}
 	return err
 }
+
 func readKey(path string) (crypto.Signer, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -66,6 +68,7 @@ func readKey(path string) (crypto.Signer, error) {
 	}
 	return pki.ParseKeyPEM(b)
 }
+
 func readChain(path string) ([]*x509.Certificate, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -74,12 +77,18 @@ func readChain(path string) ([]*x509.Certificate, error) {
 	return pki.ParseCertificates(b)
 }
 
-func run(args []string, in io.Reader, out io.Writer) error {
+func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
+	const usage = "usage: nebula-pki {keygen|root|request|issue|inspect|verify} [flags]"
 	if len(args) == 0 {
-		return errors.New("usage: nebula-pki {keygen|root|request|issue|inspect|verify} [flags]")
+		return errors.New(usage)
+	}
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		_, err := fmt.Fprintln(out, usage)
+		return err
 	}
 	op := args[0]
 	fs := flag.NewFlagSet(op, flag.ContinueOnError)
+	fs.SetOutput(diagnostics)
 	var key, caFile, caKey, src, dst, alg, name, network, ipv4, ipv6, routed, permitted, role, approved, roots string
 	var days, pathLen int
 	var fingerprint bool
@@ -118,6 +127,9 @@ func run(args []string, in io.Reader, out io.Writer) error {
 		fs.StringVar(&role, "role", "node", "node, server, client, object or ca (issue only)")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if fs.NArg() != 0 {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
+
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -81,11 +82,13 @@ func (g gateway) install(t *testing.T, n *network) {
 			out.Dst, out.DstMask = addr(b.remote.Addr().String()), all
 		}
 		post = append(post, stack.Rule{Filter: out, Matchers: []stack.Matcher{ports{src: b.inside.Port(), dst: b.remote.Port()}}, Target: &stack.SNATTarget{
-			Addr: addr(wan), Port: b.port, ChangeAddress: true, ChangePort: true, NetworkProtocol: ipv4.ProtocolNumber}})
+			Addr: addr(wan), Port: b.port, ChangeAddress: true, ChangePort: true, NetworkProtocol: ipv4.ProtocolNumber,
+		}})
 		in := filter
 		in.Dst, in.DstMask = addr(wan), all
 		pre = append(pre, stack.Rule{Filter: in, Matchers: []stack.Matcher{ports{dst: b.port}}, Target: &stack.DNATTarget{
-			Addr: addr(b.inside.Addr().String()), Port: b.inside.Port(), ChangeAddress: true, ChangePort: true, NetworkProtocol: ipv4.ProtocolNumber}})
+			Addr: addr(b.inside.Addr().String()), Port: b.inside.Port(), ChangeAddress: true, ChangePort: true, NetworkProtocol: ipv4.ProtocolNumber,
+		}})
 	}
 	if g.hairpin {
 		local := filter
@@ -111,8 +114,10 @@ func (g gateway) install(t *testing.T, n *network) {
 func gvisorAddr(ip netip.Addr) tcpip.Address { return tcpip.AddrFromSlice(ip.AsSlice()) }
 
 func edge(lan, private, public, inside string, port uint16, filter natFilter) gateway {
-	return gateway{lan: lan, wan: "wan", private: netip.MustParsePrefix(private), public: netip.MustParsePrefix(public), filter: filter,
-		bindings: []binding{{inside: netip.MustParseAddrPort(inside), port: port}}}
+	return gateway{
+		lan: lan, wan: "wan", private: netip.MustParsePrefix(private), public: netip.MustParsePrefix(public), filter: filter,
+		bindings: []binding{{inside: netip.MustParseAddrPort(inside), port: port}},
+	}
 }
 
 func TestNATCalibration(t *testing.T) {

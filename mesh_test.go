@@ -12,7 +12,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-
 	"net"
 	"net/netip"
 	"slices"
@@ -22,6 +21,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -68,6 +68,7 @@ func labPeer(ip netip.Addr) PeerID {
 	}
 	return id
 }
+
 func newFixture(t testing.TB, transports ...string) *fixture {
 	t.Helper()
 	_, key, e := ed25519.GenerateKey(rand.Reader)
@@ -141,7 +142,6 @@ func (f *fixture) link(i, j int) {
 	x, y := &f.cfg.Members[i], &f.cfg.Members[j]
 	x.Links = append(x.Links, labPeer(b))
 	y.Links = append(y.Links, labPeer(a))
-
 }
 
 func testIPv4(src, dst netip.Addr, payload string) []byte {
@@ -190,22 +190,22 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 		case got := <-in:
 			require.Equal(t, pkt, got)
 		case <-time.After(3 * time.Second):
-			t.Fatalf("IP delivery stalled: %+v %+v", out.Stats(), x.Peers())
+			t.Fatalf("IP delivery stalled: %+v %+v", out.Stats(), x.Paths())
 		}
 	}
 	require.Greater(t, x.RecommendedMTU(b, false, 1500), 1000)
 	require.Less(t, x.RecommendedMTU(b, false, 1500), 1280)
 	require.Equal(t, 1280, x.RecommendedMTU(b, true, 1500))
 	require.ErrorIs(t, out.WriteIP(b, testIPv4(b, a, "spoof")), ErrAddressUnauthorized)
-	peers := x.Peers()
-	require.NotEmpty(t, peers)
-	require.Equal(t, "X25519MLKEM768", peers[0].Group)
-	require.Equal(t, uint16(tls.VersionTLS13), peers[0].TLSVersion)
-	require.True(t, slices.ContainsFunc(peers, func(p PeerStatus) bool { return p.StreamFallbacks > 0 }))
+	paths := x.Paths()
+	require.NotEmpty(t, paths)
+	require.Equal(t, tls.X25519MLKEM768, paths[0].TLSGroup)
+	require.Equal(t, uint16(tls.VersionTLS13), paths[0].TLSVersion)
+	require.True(t, slices.ContainsFunc(paths, func(p PathStatus) bool { return p.StreamFallbacks > 0 }))
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
 	f.cfg.Members[0].Links = nil
 	require.NoError(t, x.ApplyTopology(t.Context(), f.cfg))
-	require.Empty(t, x.Peers())
+	require.Empty(t, x.Paths())
 }
 
 func TestTCPFallbackOnInitialDial(t *testing.T) {
@@ -217,9 +217,9 @@ func TestTCPFallbackOnInitialDial(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, a.ConnectPeer(ctx, b))
-	peers := a.Peers()
-	require.Len(t, peers, 1)
-	require.Equal(t, "tcp", peers[0].Transport)
+	paths := a.Paths()
+	require.Len(t, paths, 1)
+	require.Equal(t, "tcp", paths[0].Transport)
 }
 
 func TestMixedRelayOnlyAndTopologyWithdrawal(t *testing.T) {
@@ -245,11 +245,11 @@ func TestMixedRelayOnlyAndTopologyWithdrawal(t *testing.T) {
 	err := a.ConnectPeer(ctx, b.id.IPv4())
 	if err != nil {
 		for _, n := range f.nodes {
-			t.Log(n.id.IPv4(), n.Peers(), n.ControlStatus())
+			t.Log(n.id.IPv4(), n.Paths(), n.ControlStatus())
 		}
 	}
 	require.NoError(t, err)
-	require.True(t, slices.ContainsFunc(a.Peers(), func(p PeerStatus) bool {
+	require.True(t, slices.ContainsFunc(a.Paths(), func(p PathStatus) bool {
 		return p.Peer == b.id && p.Transport == "relay" && slices.Equal(p.Circuit, []PeerID{a.id, labPeer(f.ips[1]), labPeer(f.ips[2]), b.id})
 	}))
 	received := make(chan []byte, 1)
@@ -292,7 +292,7 @@ func TestHealthSwitchesTransportAndRecovers(t *testing.T) {
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
 	active := func() string {
-		for _, p := range a.Peers() {
+		for _, p := range a.Paths() {
 			if p.Peer == b.id && p.Active {
 				return p.Transport
 			}
@@ -367,7 +367,7 @@ func BenchmarkMeshIP(b *testing.B) {
 	}
 }
 
-func BenchmarkPeerStatus(b *testing.B) {
+func BenchmarkPathStatus(b *testing.B) {
 	for _, count := range []int{16, 128} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
 			f := newFixture(b, slices.Repeat([]string{"tcp"}, count+1)...)
@@ -380,10 +380,43 @@ func BenchmarkPeerStatus(b *testing.B) {
 				require.NoError(b, node.ConnectPeer(b.Context(), peer))
 			}
 			for b.Loop() {
-				if got := len(node.Peers()); got != count {
+				if got := len(node.Paths()); got != count {
 					b.Fatalf("got %d sessions, want %d", got, count)
 				}
 			}
 		})
 	}
+}
+
+func TestNodeLifecycle(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp")
+	o := f.opts[0]
+	o.Topology = f.cfg
+	n, err := New(t.Context(), o)
+	require.NoError(t, err)
+	t.Cleanup(func() { n.Close() })
+	peer := f.ips[1]
+	port, err := n.OpenIPPort(func([]byte) {})
+	require.NoError(t, err)
+	sub, err := n.Subscribe("app/test")
+	require.NoError(t, err)
+	require.NoError(t, n.SetPeerPathPolicy(peer, DirectOnly))
+	ip := testIPv4(f.ips[0], peer, "data")
+	checkOperations := func(want error) {
+		t.Helper()
+		require.ErrorIs(t, n.ConnectPeer(t.Context(), peer), want)
+		_, err := n.Publish(t.Context(), "app/test", nil)
+		require.ErrorIs(t, err, want)
+		require.ErrorIs(t, port.WriteIP(peer, ip), want)
+	}
+	checkOperations(ErrNodeNotStarted)
+	require.NoError(t, n.Start())
+	require.ErrorIs(t, n.Start(), ErrNodeAlreadyStarted)
+	port.Close()
+	require.ErrorIs(t, port.WriteIP(peer, ip), ErrPortClosed)
+	require.NoError(t, n.Close())
+	require.ErrorIs(t, n.Start(), ErrNodeClosed)
+	checkOperations(ErrNodeClosed)
+	_, open := <-sub.Events()
+	require.False(t, open)
 }

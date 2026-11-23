@@ -1,0 +1,19 @@
+version: "2"
+
+formatters:
+  enable:
+    - gci
+    - gofumpt
+  settings:
+    gci:
+      custom-order: true
+      sections:
+        - standard
+        - prefix(code.d7z.net/d7z-team/nebula)
+        - blank
+        - default
+    gofumpt:
+      extra:
+        group-params: true
+  exclusions:
+    generated: lax

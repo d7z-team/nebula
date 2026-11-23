@@ -4,13 +4,26 @@ Nebula connects Go applications over an encrypted Layer 3 mesh. Each node has a 
 
 ## Getting started
 
-From your application's Go module, install the library with Go 1.27.3 or later.
+From the repository root, run the two-node example with Go 1.27.3 or later.
+
+```sh
+go run ./examples/quickstart
+```
+
+Each example generates its own short-lived certificates in memory. The network examples use ephemeral loopback ports and run as an ordinary user.
+
+| Command | What the example verifies |
+| --- | --- |
+| `go run ./examples/quickstart` | A signed event and an IPv6 packet arrive over IPv4 QUIC. [Source](examples/quickstart/main.go) |
+| `go run ./examples/relay` | A and B exchange IP packets on an authenticated A → R → B circuit. [Source](examples/relay/main.go) |
+| `go run ./examples/gateway` | A gVisor gateway routes traffic to a dual-stack LAN over a TLS/TCP mesh connection. The downstream service sees the client's address. [Source](examples/gateway/main.go) |
+| `go run ./examples/pki` | A root issues a dual-stack member certificate and the application verifies its identity and server usage. [Source](examples/pki/main.go) |
+
+To embed the library, run this in your application's Go module. The gVisor adapter creates a NIC inside your application's userspace stack. [Integration guide](docs/integration.md)
 
 ```sh
 go get code.d7z.net/d7z-team/nebula
 ```
-
-To try it locally, follow the quickstart to issue credentials for two nodes, then run the example from this repository. It sends a signed application event and an IPv6 packet over an IPv4 loopback connection. [Quickstart](docs/quickstart.md) · [Runnable example](examples/quickstart/main.go)
 
 ## Features
 
@@ -25,7 +38,8 @@ The guides are in Chinese.
 
 | Guide | Contents |
 | --- | --- |
-| [Quickstart](docs/quickstart.md) | Issue credentials, connect nodes, deploy on separate hosts and attach a gVisor NIC. |
+| [Quickstart](docs/quickstart.md) | Connect two local nodes and check the event and packet output. |
+| [Integration guide](docs/integration.md) | Embed a node, configure physical endpoints and policies, route a subnet and diagnose delivery. |
 | [Mesh protocol](docs/mesh.md) | Peer identity, path selection, packet authorization, event delivery and runtime status. |
 | [PKI reference](docs/pki.md) | X.509 certificate profile, certificate roles, delegation and signed objects. |
 | [Testing guide](docs/testing.md) | NAT scenarios, fault replay and benchmarks. |

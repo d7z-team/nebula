@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
+
 	quic "github.com/quic-go/quic-go"
 	"golang.org/x/time/rate"
 )
 
 var (
-	ErrNodeNotStarted      = errors.New("node not running")
+	ErrNodeNotStarted      = errors.New("node not started")
+	ErrNodeAlreadyStarted  = errors.New("node already started")
 	ErrNodeClosed          = errors.New("node closed")
 	ErrPeerUnavailable     = errors.New("peer unavailable")
 	ErrPathPolicy          = errors.New("path denied")
@@ -31,61 +33,75 @@ var (
 
 // Options configures a node's transports, credentials and initial topology.
 type Options struct {
-	Roots                 *x509.CertPool
-	Certificates          LocalCertificates
-	Topology              Topology
-	CheckChain            func(context.Context, ChainCheck) (time.Time, error)
-	UDP4, UDP6            net.PacketConn
-	TCP4, TCP6            net.Listener
-	DialTCP               func(context.Context, string, string) (net.Conn, error)
-	AdvertiseEndpoints    []Endpoint
-	Interval, DialTimeout time.Duration
-	MaxCircuits           int
-	MaxIPSize             int
-	InboundPolicy         func(peer PeerID, source, destination netip.Addr) bool
+	// Roots is the explicit trust store. New takes a private copy.
+	Roots        *x509.CertPool
+	Certificates LocalCertificates
+	Topology     Topology
+	// CheckChain may deny a verified chain or shorten its lifetime. A zero deadline
+	// accepts the chain until expiry. Calls may run concurrently.
+	CheckChain func(context.Context, ChainCheck) (time.Time, error)
+	// UDP sockets carry QUIC and hole punches for their respective address families.
+	UDP4, UDP6 net.PacketConn
+	// TCP listeners accept inbound TLS connections.
+	TCP4, TCP6 net.Listener
+	// DialTCP opens outbound TCP connections. The default is net.Dialer.DialContext.
+	DialTCP func(context.Context, string, string) (net.Conn, error)
+	// AdvertiseEndpoints adds reachable physical addresses to signed introductions.
+	AdvertiseEndpoints []Endpoint
+	// Interval is the path maintenance interval. The default is two seconds.
+	Interval time.Duration
+	// DialTimeout bounds individual dial and control exchanges. The default is four seconds.
+	DialTimeout time.Duration
+	// MaxCircuits limits concurrent circuits at this node. The default is 128.
+	MaxCircuits int
+	// MaxIPSize bounds a complete inner packet in bytes (1280 through 65535). Zero selects 65535.
+	MaxIPSize int
+	// InboundPolicy optionally filters authenticated, address-authorized IP packets.
+	// Calls run on receive tasks and may overlap.
+	InboundPolicy func(peer PeerID, source, destination netip.Addr) bool
 }
 
 // Node manages the transports and peer sessions for one mesh identity.
 type Node struct {
-	o               Options
-	id              PeerID
-	network         string
-	ctx             context.Context
-	cancel          context.CancelFunc
-	mu              sync.Mutex
-	udpWrites       sync.RWMutex
-	state           lifecycle
-	wg              sync.WaitGroup
-	done            chan struct{}
-	cred            atomic.Pointer[credentials]
-	policy          atomic.Pointer[topologyView]
-	admissions      uint64 // increments when a session or event joins the live set
-	introMu         sync.Mutex
-	introCache      cachedIntroduction
-	transports      map[bool]*quic.Transport
-	listeners       []*quic.Listener
-	peers           map[PeerID]*peerPaths
-	modes           map[PeerID]PathMode
-	discovered      map[PeerID]introduction
-	attempts        map[PeerID]*attempt
-	directDials     map[directDial]*attempt
-	observations    map[observer]observation
-	introduced      map[Endpoint]map[PeerID]time.Time
-	deniedUDP       map[netip.AddrPort]deniedEndpoint
-	queries         map[string]time.Time
-	backgroundSlots chan struct{}
-	port            *IPPort
-	handshakeSlots  chan struct{}
-	sizeQuery       []byte
-	circuits        map[*circuitLease]struct{}
-	limiter         *rate.Limiter
-	rateCtx         context.Context
-	rateCancel      context.CancelFunc
-	shaped          atomic.Uint64
-	retries         atomic.Uint64
-	events          map[string]cachedEvent
-	subscriptions   map[*Subscription]struct{}
-	lastError       string
+	o                Options
+	id               PeerID
+	network          string
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mu               sync.Mutex
+	udpWrites        sync.RWMutex
+	state            lifecycle
+	wg               sync.WaitGroup
+	done             chan struct{}
+	cred             atomic.Pointer[credentials]
+	policy           atomic.Pointer[topologyView]
+	admissions       uint64 // increments when a session or event joins the live set
+	introMu          sync.Mutex
+	introCache       cachedIntroduction
+	transports       map[bool]*quic.Transport
+	listeners        []*quic.Listener
+	peers            map[PeerID]*peerPaths
+	modes            map[PeerID]PathMode
+	discovered       map[PeerID]introduction
+	attempts         map[PeerID]*attempt
+	directDials      map[directDial]*attempt
+	observations     map[observer]observation
+	introduced       map[Endpoint]map[PeerID]time.Time
+	deniedUDP        map[netip.AddrPort]deniedEndpoint
+	queries          map[string]time.Time
+	backgroundSlots  chan struct{}
+	port             *IPPort
+	handshakeSlots   chan struct{}
+	sizeQuery        []byte
+	circuits         map[*circuitLease]struct{}
+	limiter          *rate.Limiter
+	rateCtx          context.Context
+	rateCancel       context.CancelFunc
+	bytesScheduled   atomic.Uint64
+	dialFailures     atomic.Uint64
+	events           map[string]cachedEvent
+	subscriptions    map[*Subscription]struct{}
+	lastConnectError string
 }
 
 type lifecycle uint8
@@ -96,8 +112,20 @@ const (
 	closed
 )
 
+func (s lifecycle) runningError() error {
+	switch s {
+	case created:
+		return ErrNodeNotStarted
+	case closed:
+		return ErrNodeClosed
+	default:
+		return nil
+	}
+}
+
 // New creates a node with the supplied credentials and topology. On success,
-// the node owns the UDP socket and TCP listener. Close releases them even before Start.
+// the node owns the supplied sockets and listeners. Close releases them even before Start.
+// Canceling parent shuts down a started node.
 func New(parent context.Context, o Options) (*Node, error) {
 	if parent == nil || (o.UDP4 == nil && o.UDP6 == nil && o.TCP4 == nil && o.TCP6 == nil && o.DialTCP == nil) {
 		return nil, errors.New("context and transport required")
@@ -213,11 +241,20 @@ func (n *Node) tryTask(slots chan struct{}, fn func()) bool {
 }
 
 // Start begins accepting peer connections and maintaining authorized paths.
+// A second call on a running node returns ErrNodeAlreadyStarted.
 func (n *Node) Start() error {
 	n.mu.Lock()
-	if n.state != created || n.ctx.Err() != nil {
+	if n.state == closed {
 		n.mu.Unlock()
-		return ErrNodeNotStarted
+		return ErrNodeClosed
+	}
+	if err := n.ctx.Err(); err != nil {
+		n.mu.Unlock()
+		return err
+	}
+	if n.state == running {
+		n.mu.Unlock()
+		return ErrNodeAlreadyStarted
 	}
 	n.state = running
 	if n.o.UDP4 != nil || n.o.UDP6 != nil {
@@ -349,8 +386,12 @@ func (n *Node) quicConfig() *quic.Config {
 	}
 }
 
-func (n *Node) ID() PeerID     { return n.id }
+// ID returns the certified overlay address pair.
+func (n *Node) ID() PeerID { return n.id }
+
+// MaxIPSize returns the configured inner packet limit in bytes.
 func (n *Node) MaxIPSize() int { return n.o.MaxIPSize }
+
 func (n *Node) sessionListLocked() []*session {
 	ss := make([]*session, 0, len(n.peers))
 	for _, peer := range n.peers {

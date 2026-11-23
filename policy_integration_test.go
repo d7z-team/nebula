@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,10 +96,10 @@ func TestLiveCertificateExpiry(t *testing.T) {
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
 	fresh, key := f.issue(labPeer(f.ips[1]))
 	require.NoError(t, f.nodes[1].ReloadCertificates(t.Context(), LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{fresh.Raw}, PrivateKey: key}}))
-	require.Eventually(t, func() bool { return len(f.nodes[0].Peers()) == 0 && len(f.nodes[1].Peers()) == 0 }, 4*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool { return len(f.nodes[0].Paths()) == 0 && len(f.nodes[1].Paths()) == 0 }, 4*time.Second, 20*time.Millisecond)
 	require.True(t, f.nodes[1].ControlStatus().Ready)
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
-	require.Equal(t, fresh.SerialNumber.String(), f.nodes[0].Peers()[0].Serial)
+	require.Equal(t, fresh.SerialNumber.String(), f.nodes[0].Paths()[0].Serial)
 }
 
 func TestEventRepairAndPolicyWithdrawal(t *testing.T) {
@@ -163,7 +164,7 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	var node atomic.Pointer[Node]
 	f.opts[1].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		if n := node.Load(); n != nil {
-			_ = n.Peers()
+			_ = n.Paths()
 		} // host callbacks may query live state
 		if deny.Load() && c.Object && c.Member == labPeer(a) {
 			return time.Time{}, errors.New("publisher suspended")
@@ -305,7 +306,7 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	shortened := time.Now().Add(350 * time.Millisecond)
 	limit.Store(&shortened)
 	require.NoError(t, n.Revalidate(t.Context()))
-	for _, p := range n.Peers() {
+	for _, p := range n.Paths() {
 		require.Equal(t, shortened, p.AuthorizedUntil)
 	}
 	require.Eventually(t, func() bool {
@@ -362,7 +363,7 @@ func TestPeerNameAndTLSAdmission(t *testing.T) {
 	f.cfg.Members[2].Endpoints = f.cfg.Members[1].Endpoints
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	require.Error(t, a.ConnectPeer(t.Context(), f.ips[2]))
-	require.Empty(t, a.Peers())
+	require.Empty(t, a.Paths())
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
 }
 
@@ -378,8 +379,8 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	}
 	require.NoError(t, <-done)
 	require.NoError(t, <-done)
-	require.Len(t, a.Peers(), 1)
-	require.Equal(t, b.id, a.Peers()[0].Peer)
+	require.Len(t, a.Paths(), 1)
+	require.Equal(t, b.id, a.Paths()[0].Peer)
 	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv6(), Blocked))
 	require.ErrorIs(t, a.ConnectPeer(t.Context(), b.id.IPv4()), ErrPathPolicy)
 	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), Auto))
@@ -400,7 +401,7 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	require.Eventually(t, func() bool { return port.Stats().RejectedOutbound == 1 }, time.Second, time.Millisecond)
-	require.Empty(t, a.Peers())
+	require.Empty(t, a.Paths())
 	require.Error(t, a.ConnectPeer(t.Context(), next.IPv4()))
 	require.Error(t, port.WriteIP(b.id.IPv6(), testIPv6(a.id.IPv6(), b.id.IPv6(), 1280)))
 }

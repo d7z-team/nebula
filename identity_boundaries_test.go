@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -162,7 +163,7 @@ func TestPathQueriesPreserveSelection(t *testing.T) {
 	n.mu.Lock()
 	n.peers[labPeer(peer)].active = nil
 	n.mu.Unlock()
-	status := n.Peers()
+	status := n.Paths()
 	require.Len(t, status, 1)
 	require.True(t, status[0].Active)
 	require.Equal(t, 1280, n.RecommendedMTU(peer, true, 1280))

@@ -9,13 +9,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	_ "crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"math/big"
+
+	_ "crypto/sha512"
 )
 
 // MaxDocument is the largest DER object accepted by the mesh CMS profile.
@@ -31,11 +32,14 @@ var (
 	oidMLDSA44       = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 3, 17}
 )
 
-type algorithm = pkix.AlgorithmIdentifier
-type contentInfo struct {
-	Type  asn1.ObjectIdentifier
-	Value asn1.RawValue `asn1:"optional"`
-}
+type (
+	algorithm   = pkix.AlgorithmIdentifier
+	contentInfo struct {
+		Type  asn1.ObjectIdentifier
+		Value asn1.RawValue `asn1:"optional"`
+	}
+)
+
 type issuerSerial struct {
 	Issuer asn1.RawValue
 	Serial *big.Int
@@ -65,6 +69,7 @@ func raw(b []byte) asn1.RawValue { return asn1.RawValue{FullBytes: b} }
 func explicit(b []byte) asn1.RawValue {
 	return asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: b}
 }
+
 func readDER(b []byte, v any) error {
 	rest, err := asn1.Unmarshal(b, v)
 	if err != nil {
@@ -75,9 +80,11 @@ func readDER(b []byte, v any) error {
 	}
 	return nil
 }
+
 func validAlg(a algorithm, oid asn1.ObjectIdentifier) bool {
 	return a.Algorithm.Equal(oid) && len(a.Parameters.FullBytes) == 0
 }
+
 func wrapCMS(s signedData) ([]byte, error) {
 	b, err := asn1.Marshal(s)
 	if err != nil {
@@ -89,6 +96,7 @@ func wrapCMS(s signedData) ([]byte, error) {
 	}
 	return wire, err
 }
+
 func parseCMS(b []byte) (signedData, error) {
 	var c contentInfo
 	var s signedData
@@ -136,6 +144,7 @@ func (a cmsAlgorithm) digestID() algorithm {
 	}
 	return algorithm{Algorithm: asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}}
 }
+
 func (a cmsAlgorithm) attributes(payload []byte) ([]byte, asn1.RawValue) {
 	h := a.digest.New()
 	h.Write(payload)

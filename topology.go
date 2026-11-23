@@ -25,15 +25,22 @@ type PeerID = pki.PeerID
 
 // Member contains the local routing and application permissions for one peer.
 type Member struct {
-	IPv4           netip.Addr     `json:"ipv4"`
-	IPv6           netip.Addr     `json:"ipv6"`
-	Links          []PeerID       `json:"links,omitempty"`
-	Endpoints      []Endpoint     `json:"endpoints,omitempty"`
+	IPv4 netip.Addr `json:"ipv4"`
+	IPv6 netip.Addr `json:"ipv6"`
+	// Links declares reciprocal neighbors to maintain and use as circuit hops.
+	Links []PeerID `json:"links,omitempty"`
+	// Endpoints lists reachable physical addresses of this member.
+	Endpoints []Endpoint `json:"endpoints,omitempty"`
+	// RoutedPrefixes enables downstream prefixes within the session certificate's authority.
 	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
-	Transit        bool           `json:"transit,omitempty"`
-	Restricted     bool           `json:"restricted,omitempty"`
-	BytesPerSecond int            `json:"bytesPerSecond,omitempty"`
-	Topics         []string       `json:"topics,omitempty"`
+	// Transit authorizes this member to relay mesh circuits.
+	Transit bool `json:"transit,omitempty"`
+	// Restricted limits direct connections to the neighbors in Links.
+	Restricted bool `json:"restricted,omitempty"`
+	// BytesPerSecond shapes this member's total outbound application bytes. Zero is unlimited.
+	BytesPerSecond int `json:"bytesPerSecond,omitempty"`
+	// Topics grants publication on each topic and its descendants.
+	Topics []string `json:"topics,omitempty"`
 }
 
 // Topology is the host-approved local view.

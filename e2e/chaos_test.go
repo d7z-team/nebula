@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
+
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -25,8 +26,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 )
 
-var runExtended = flag.Bool("extended", false, "run extended mesh fault scenarios")
-var chaosSeed = flag.Int64("seed", 1, "seed for the bounded chaos scenario")
+var (
+	runExtended = flag.Bool("extended", false, "run extended mesh fault scenarios")
+	chaosSeed   = flag.Int64("seed", 1, "seed for the bounded chaos scenario")
+)
 
 func extended(t *testing.T) {
 	t.Helper()
@@ -158,7 +161,7 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	g.bindings[0].port = 45002
 	g.install(t, l.net)
 	require.Eventually(t, func() bool {
-		return slices.ContainsFunc(b.node.Peers(), func(p nebula.PeerStatus) bool {
+		return slices.ContainsFunc(b.node.Paths(), func(p nebula.PathStatus) bool {
 			return p.Peer == labPeer(a.ip) && p.Active && p.Endpoint.String() == "192.0.2.1:45002"
 		})
 	}, 15*time.Second, 50*time.Millisecond)
@@ -167,7 +170,7 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	require.Positive(t, l.net.packets(before))
 	require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.Blocked))
 	require.ErrorIs(t, a.node.ConnectPeer(t.Context(), b.ip), nebula.ErrPathPolicy)
-	require.Empty(t, a.node.Peers())
+	require.Empty(t, a.node.Paths())
 	dest := tcpip.FullAddress{Addr: gvisorAddr(b.ip), Port: 7011}
 	rx, err := gonet.DialUDP(right, &dest, nil, ipv4.ProtocolNumber)
 	require.NoError(t, err)
@@ -238,7 +241,7 @@ func TestChaosRelayPartition(t *testing.T) {
 	})
 	require.NoError(t, primary.node.Close())
 	require.Eventually(t, func() bool {
-		return !slices.ContainsFunc(a.node.Peers(), func(p nebula.PeerStatus) bool { return p.Peer == labPeer(b.ip) && p.Active })
+		return !slices.ContainsFunc(a.node.Paths(), func(p nebula.PathStatus) bool { return p.Peer == labPeer(b.ip) && p.Active })
 	}, 10*time.Second, 50*time.Millisecond)
 	require.Error(t, a.node.ConnectPeer(t.Context(), b.ip))
 	l.net.disturb(nil)
