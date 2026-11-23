@@ -1,4 +1,4 @@
-// Package nebulagvisor attaches Nebula as a layer-3 NIC to a caller-owned gVisor stack.
+// Package nebulagvisor exposes a mesh node as a layer 3 NIC in a caller-owned gVisor stack.
 package nebulagvisor
 
 import (
@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/slackhq/nebula"
+	"code.d7z.net/d7z-team/nebula"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -16,38 +16,41 @@ import (
 )
 
 const (
-	// DefaultMTU is used when Options.MTU is zero.
+	// DefaultMTU is the default link MTU, capped by the node's MaxIPSize.
 	DefaultMTU = 1300
-	// MinMTU is the smallest MTU supported by this dual-stack endpoint.
+	// MinMTU is the minimum MTU for a dual-stack endpoint.
 	MinMTU = 1280
 )
 
-// Options configures the L3 interface. A zero MTU selects DefaultMTU.
+// Options configures the dual-stack link MTU.
 type Options struct {
+	// A zero MTU selects the default.
 	MTU uint32
 }
 
 type networkLink = stack.NetworkLinkEndpoint
 
-// Endpoint implements stack.LinkEndpoint. Remove an attached NIC with
-// Stack.RemoveNIC. Close an endpoint directly if CreateNIC failed.
+// Endpoint implements stack.LinkEndpoint. Use Stack.RemoveNIC to detach a
+// registered NIC. If CreateNIC fails, call Close to release the endpoint.
 type Endpoint struct {
 	networkLink
-	port *nebula.IPPort
+	port   *nebula.IPPort
+	maxMTU uint32
 }
 
 var _ stack.LinkEndpoint = (*Endpoint)(nil)
 
-// NewEndpoint reserves the data port of node for one gVisor NIC.
+// NewEndpoint opens the node's IP port for exclusive use by a gVisor NIC.
 func NewEndpoint(node *nebula.Node, opts Options) (*Endpoint, error) {
 	if node == nil {
 		return nil, errors.New("node is required")
 	}
+	maxMTU := uint32(node.MaxIPSize())
 	if opts.MTU == 0 {
-		opts.MTU = DefaultMTU
+		opts.MTU = min(DefaultMTU, maxMTU)
 	}
-	if opts.MTU < MinMTU || opts.MTU > nebula.MaxIPPacketSize {
-		return nil, fmt.Errorf("MTU must be between %d and %d", MinMTU, nebula.MaxIPPacketSize)
+	if opts.MTU < MinMTU || opts.MTU > maxMTU {
+		return nil, fmt.Errorf("MTU must be between %d and %d", MinMTU, maxMTU)
 	}
 	// channel.Endpoint supplies a headerless dispatcher. TX uses the port's
 	// bounded per-peer queues directly, so the channel needs no TX queue.
@@ -65,7 +68,7 @@ func NewEndpoint(node *nebula.Node, opts Options) (*Endpoint, error) {
 		link.Close()
 		return nil, err
 	}
-	return &Endpoint{networkLink: link, port: port}, nil
+	return &Endpoint{networkLink: link, port: port, maxMTU: maxMTU}, nil
 }
 
 func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
@@ -81,7 +84,8 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 			}
 		}
 		view := pkt.ToView()
-		err := e.port.WriteIP(via, view.AsSlice())
+		packet := view.AsSlice()
+		err := e.port.WriteIP(via, packet)
 		view.Release()
 		switch {
 		case err == nil:
@@ -92,7 +96,7 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 			return i, &tcpip.ErrClosedForSend{}
 		case errors.Is(err, nebula.ErrMissingGateway), errors.Is(err, nebula.ErrPeerUnavailable):
 			return i, &tcpip.ErrHostUnreachable{}
-		case errors.Is(err, nebula.ErrAddressNotCertified):
+		case errors.Is(err, nebula.ErrAddressUnauthorized):
 			return i, &tcpip.ErrNotPermitted{}
 		default:
 			return i, &tcpip.ErrBadAddress{}
@@ -101,15 +105,15 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	return pkts.Len(), nil
 }
 
-// SetMTU clamps the value to the supported dual-stack tunnel limits.
+// SetMTU clamps the dual-stack link MTU to [MinMTU, MaxIPSize].
 func (e *Endpoint) SetMTU(mtu uint32) {
-	e.networkLink.SetMTU(min(max(mtu, MinMTU), nebula.MaxIPPacketSize))
+	e.networkLink.SetMTU(min(max(mtu, MinMTU), e.maxMTU))
 }
 
-// ClearPending discards queued frames for the exact overlay next hop.
+// ClearPending discards queued packets for peer and returns their count.
 func (e *Endpoint) ClearPending(peer netip.Addr) int { return e.port.ClearPending(peer) }
 
-// Stats returns a detached snapshot of the tunnel port.
+// Stats returns a snapshot of the IP port's traffic, queue and drop counters.
 func (e *Endpoint) Stats() nebula.PortStats { return e.port.Stats() }
 
 func (e *Endpoint) Close() {

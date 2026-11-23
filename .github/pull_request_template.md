@@ -1,5 +1,5 @@
-Describe the embedded-library behavior being changed and why.
+请说明本次修改影响的行为、原因和验证方法。
 
-- Include tests for lifecycle, packet identity/route authorization, or wire compatibility as applicable.
-- Update the affected usage guide when changing a public API or peer interoperability.
-- Confirm `go test ./...`, `go test -race ./...`, and `go vet ./...` pass.
+- 为受影响的传输、身份、路由授权或生命周期行为提供测试。
+- 若修改公共 API 或线上协议，同步更新部署指南或协议说明。
+- 列出 `go test ./...`、`go test -race ./...` 和 `go vet ./...` 的检查结果。

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
-	"slices"
 )
 
 var ErrInvalidPacketAddress = errors.New("invalid inner IP packet")
@@ -43,21 +42,6 @@ func parseInnerPacket(packet []byte) (innerPacket, error) {
 		return ip, ErrInvalidPacketAddress
 	}
 	return ip, nil
-}
-
-func (h *hostInfo) authorizes(addr netip.Addr) bool {
-	if slices.Contains(h.vpnAddrs, addr) {
-		return true
-	}
-	if h.networks == nil {
-		return false
-	}
-	kind, _ := h.networks.Lookup(addr)
-	return kind == networkTypeUnsafe
-}
-
-func (f *packetEngine) authorizesLocal(addr netip.Addr) bool {
-	return f.myVpnAddrsTable.Contains(addr) || (!f.myVpnNetworksTable.Contains(addr) && f.localUnsafe.Contains(addr))
 }
 
 func isTunnelUnicast(addr netip.Addr) bool {

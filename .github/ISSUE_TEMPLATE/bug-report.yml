@@ -1,30 +1,30 @@
-name: Bug report
-description: Report an embedded library or wire compatibility problem
+name: 缺陷报告
+description: 报告嵌入式网络库或传输问题
 title: "bug: "
 body:
   - type: textarea
     id: description
     attributes:
-      label: Description
-      description: Describe the observed and expected behavior.
+      label: 问题描述
+      description: 说明实际行为和预期结果。
     validations:
       required: true
   - type: textarea
     id: reproducer
     attributes:
-      label: Reproducer
-      description: Include the relevant public option values, transport behavior, and a minimal Go reproducer. Use placeholders for host, CA, and event publisher private keys.
+      label: 复现方法
+      description: 提供相关选项、传输行为和最小 Go 示例。涉及节点、CA 或事件签名私钥时请使用占位符。
     validations:
       required: true
   - type: textarea
     id: environment
     attributes:
-      label: Environment
-      description: Include the commit, Go version, OS, certificate version/curve, and cipher.
+      label: 运行环境
+      description: 提供提交号、Go 版本、操作系统、传输类型、协商参数和相关拓扑设置。
     validations:
       required: true
   - type: textarea
-    id: interoperability
+    id: path
     attributes:
-      label: Interoperability details
-      description: If an upstream peer is involved, include its version, role, relevant routes, and sanitized logs.
+      label: 路径信息
+      description: 提供对端传输、活动路径、MTU 及相关的脱敏状态信息。

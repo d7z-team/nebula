@@ -3,351 +3,287 @@ package nebula
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/netip"
 	"slices"
 	"sync"
 
-	"github.com/slackhq/nebula/header"
+	"code.d7z.net/d7z-team/nebula/pki"
 )
 
-// MaxIPPacketSize is the largest complete IP frame carried by a Nebula NIC.
-const MaxIPPacketSize = mtu
+const MaxIPPacketSize = 65535
 
-// IPPortOptions bounds queued IP packets for both OpenIPPort and gVisor endpoints.
-type IPPortOptions struct {
-	QueueSize        int // Maximum across all next hops. Default 512.
-	PerPeerQueueSize int // Maximum per next hop. Default 100.
+type PortStats struct {
+	ReceivedPackets, ReceivedBytes    uint64
+	SentPackets, SentBytes            uint64
+	RejectedInbound, RejectedOutbound uint64
+	Queued                            int
+	LastDrop                          string
 }
 
-var (
-	ErrPortInUse           = errors.New("node already has an IP port")
-	ErrPortClosed          = errors.New("IP port is closed")
-	ErrQueueFull           = errors.New("IP transmit queue is full")
-	ErrMissingGateway      = errors.New("off-overlay destination requires an overlay gateway")
-	ErrAddressNotCertified = errors.New("certificate does not authorize inner IP address")
-)
+type ipQueue struct {
+	packets     [][]byte
+	current     []byte
+	stopCurrent context.CancelFunc
+}
 
-// InboundPolicy may narrow the certificate checks on authenticated IP packets.
-// peer is the first overlay address in the authenticated peer's certificate.
-// It runs on the receive worker and must return promptly.
-type InboundPolicy func(peer, source, destination netip.Addr) bool
-
-// IPPort connects one L3 device to a Node. Each frame is a complete IP packet.
 type IPPort struct {
 	node    *Node
-	ctx     context.Context
-	cancel  context.CancelFunc
 	deliver func([]byte)
-
-	queueMu sync.Mutex
-	queues  map[netip.Addr]*peerQueue
-	queued  int
-	workers int
-
-	statsMu sync.Mutex
+	mu      sync.Mutex
+	closed  bool
+	queues  map[PeerID]*ipQueue
 	stats   PortStats
 }
 
-type queuedIP struct {
-	innerPacket
-	data []byte
-}
-
-type peerQueue struct {
-	packets []queuedIP
-	cancel  context.CancelFunc
-}
-
-// OpenIPPort reserves the node's sole data port. deliver borrows a packet only
-// for the duration of the call. It must return promptly. Start enables traffic.
 func (n *Node) OpenIPPort(deliver func([]byte)) (*IPPort, error) {
-	if deliver == nil {
-		return nil, errors.New("IP receiver is required")
-	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.state == NodeStateClosed || n.ctx.Err() != nil {
+	if n.state == closed {
 		return nil, ErrNodeClosed
 	}
-	if n.engine.port.Load() != nil {
-		return nil, ErrPortInUse
+	if n.port != nil || deliver == nil {
+		return nil, errors.New("IP receiver already attached or nil")
 	}
-	ctx, cancel := context.WithCancel(n.ctx)
-	p := &IPPort{node: n, ctx: ctx, cancel: cancel, deliver: deliver, queues: make(map[netip.Addr]*peerQueue)}
-	n.engine.port.Store(p)
+	p := &IPPort{node: n, deliver: deliver, queues: map[PeerID]*ipQueue{}}
+	n.port = p
 	return p, nil
 }
 
-// Close releases this port and drops queued frames. A frame already being
-// transmitted or delivered may finish. The outer transport belongs to Node.
 func (p *IPPort) Close() {
-	p.queueMu.Lock()
-	p.cancel()
-	for _, q := range p.queues {
-		q.packets = nil
+	p.mu.Lock()
+	p.closed = true
+	for peer := range p.queues {
+		p.discardQueueLocked(peer)
 	}
-	clear(p.queues)
-	p.queued = 0
-	p.node.engine.port.CompareAndSwap(p, nil)
-	p.queueMu.Unlock()
+	p.mu.Unlock()
+	n := p.node
+	n.mu.Lock()
+	if n.port == p {
+		n.port = nil
+	}
+	n.mu.Unlock()
 }
 
-// ClearPending discards packets still queued for this overlay next hop.
-// An in-flight datagram and the shared Nebula handshake are independent.
-func (p *IPPort) ClearPending(peer netip.Addr) int {
-	p.queueMu.Lock()
-	defer p.queueMu.Unlock()
-	peer = peer.Unmap()
+// ClearPending discards the peer's backlog and cancels a send waiting for a path or bandwidth.
+// The count includes only packets that were still waiting in the queue.
+func (p *IPPort) ClearPending(address netip.Addr) int {
+	peer := p.node.policy.Load().owners[address]
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.discardQueueLocked(peer)
+}
+
+func (p *IPPort) discardQueueLocked(peer PeerID) int {
 	q := p.queues[peer]
 	if q == nil {
 		return 0
 	}
-	n := len(q.packets)
+	if q.stopCurrent != nil {
+		q.stopCurrent()
+	}
 	delete(p.queues, peer)
+	count := len(q.packets)
 	q.packets = nil
-	q.cancel()
-	p.queued -= n
-	return n
+	p.stats.Queued -= count
+	return count
 }
 
-// PacketDrop describes the last rejected IP frame. Address fields may be empty
-// when the packet could not be parsed.
-type PacketDrop struct {
-	Inbound                   bool
-	Peer, Source, Destination netip.Addr
-	Reason                    string
-}
-
-// PortStats reports queue depth and cumulative traffic for one IP port.
-// Sent counts successful transport submissions. Received counts delivery to
-// the port callback. Byte counts include the complete inner IP packet.
-// Explicit ClearPending and Close are excluded from the rejection counts.
-type PortStats struct {
-	Queued                            int
-	SentPackets, SentBytes            uint64
-	ReceivedPackets, ReceivedBytes    uint64
-	RejectedInbound, RejectedOutbound uint64
-	LastDrop                          PacketDrop
-}
-
-func (p *IPPort) recordDrop(inbound bool, peer netip.Addr, ip innerPacket, reason string, count int) {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	if inbound {
-		p.stats.RejectedInbound += uint64(count)
-	} else {
-		p.stats.RejectedOutbound += uint64(count)
-	}
-	p.stats.LastDrop = PacketDrop{Inbound: inbound, Peer: peer, Source: ip.source, Destination: ip.destination, Reason: reason}
-}
-
-// Stats returns a snapshot of this port's queue and traffic counters.
 func (p *IPPort) Stats() PortStats {
-	p.queueMu.Lock()
-	defer p.queueMu.Unlock()
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	stats := p.stats
-	stats.Queued = p.queued
-	return stats
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stats
 }
 
-func (p *IPPort) receiveIP(hostinfo *hostInfo, packet []byte, via packetSender) {
-	if p.ctx.Err() != nil {
-		return
-	}
-	f := p.node.engine
-	ip, err := parseInnerPacket(packet)
-	peer := hostinfo.vpnAddrs[0]
-	var reason string
-	switch {
-	case err != nil:
-		reason = "invalid inner IP packet"
-	case f.control != nil && f.control.policy().bootstrapOnly && (ip.destination != f.myVpnAddrs[0] || !slices.Contains(hostinfo.vpnAddrs, ip.source) || !bootstrapKind(controlKind(packet, f.control.opts.Port))):
-		reason = "waiting for signed configuration"
-	case !f.authorizesLocal(ip.destination):
-		reason = "local certificate does not authorize destination"
-	case !hostinfo.authorizes(ip.source):
-		reason = "peer certificate does not authorize source"
-	case f.inboundPolicy != nil && !f.inboundPolicy(peer, ip.source, ip.destination):
-		reason = "inbound policy denied packet"
-	default:
-		p.statsMu.Lock()
-		p.stats.ReceivedPackets++
-		p.stats.ReceivedBytes += uint64(len(packet))
-		p.statsMu.Unlock()
-		if f.control != nil {
-			f.control.recordIngress(hostinfo, ip, packet, via)
-		}
-		p.deliver(packet)
-		return
-	}
-	p.recordDrop(true, peer, ip, reason, 1)
+func (ip innerPacket) authorizedBy(cfg *topologyView, from, to PeerID) bool {
+	return cfg.authorizes(from, ip.source) && cfg.authorizes(to, ip.destination)
 }
 
-// queueFull is called under p.queueMu for both initial admission and a route retry.
-func (p *IPPort) queueFull(q *peerQueue) bool {
-	limits := p.node.portOptions
-	return p.queued >= limits.QueueSize || (q != nil && len(q.packets) >= limits.PerPeerQueueSize)
+func (ip innerPacket) authorizedOn(cfg *topologyView, from, to pki.Identity) bool {
+	return ip.authorizedBy(cfg, from.ID, to.ID) && from.AllowsIP(ip.source) && to.AllowsIP(ip.destination)
 }
 
-// WriteIP submits an IP packet to its next hop. An empty next hop selects the
-// overlay destination itself. Ordinary packets are copied into a bounded queue
-// and checked against the peer certificate at send time. Priority control
-// packets can be submitted directly when a usable path already exists.
-func (p *IPPort) WriteIP(nextHop netip.Addr, packet []byte) (err error) {
-	var ip innerPacket
-	peer := nextHop.Unmap()
-	defer func() {
-		if err != nil {
-			p.recordDrop(false, peer, ip, err.Error(), 1)
-		}
-	}()
-	if err := p.node.requireStarted(); err != nil {
-		return err
+// WriteIP queues a copy of a complete IP packet. A zero peer selects the member
+// that owns the destination address. For a downstream subnet, pass its gateway.
+func (p *IPPort) WriteIP(via netip.Addr, b []byte) error {
+	n := p.node
+	ip, err := parseInnerPacket(b)
+	if err != nil || len(b) > n.o.MaxIPSize {
+		return ErrInvalidPacketAddress
 	}
-	if p.ctx.Err() != nil {
-		return ErrPortClosed
-	}
-	ip, err = parseInnerPacket(packet)
-	if err != nil {
-		return err
-	}
-	f := p.node.engine
-	if f.control != nil && f.control.policy().bootstrapOnly && (ip.source != f.myVpnAddrs[0] || (peer.IsValid() && peer != ip.destination) || !bootstrapKind(controlKind(packet, f.control.opts.Port))) {
+	cfg := n.policy.Load()
+	if !n.memberOf(cfg) {
 		return ErrPathPolicy
 	}
-	if !f.authorizesLocal(ip.source) {
-		return fmt.Errorf("%w: source %s", ErrAddressNotCertified, ip.source)
+	if !via.IsValid() {
+		via = ip.destination
 	}
-	if !peer.IsValid() {
-		if !f.myVpnNetworksTable.Contains(ip.destination) {
-			return ErrMissingGateway
-		}
-		peer = ip.destination
+	peer := cfg.owners[via]
+	if peer == (PeerID{}) {
+		return ErrMissingGateway
 	}
-	if err := p.node.validatePeerAddress(peer); err != nil {
-		return err
+	if !ip.authorizedBy(cfg, n.id, peer) {
+		return ErrAddressUnauthorized
 	}
-	if h := f.hostMap.QueryVpnAddr(peer); h != nil {
-		if !h.authorizes(ip.destination) {
-			return fmt.Errorf("%w: destination %s via %s", ErrAddressNotCertified, ip.destination, peer)
-		}
-		// Keep the service socket independent of a bulk worker waiting for
-		// its byte budget. Both paths use the same final submission checks.
-		if f.control != nil && ip.source == f.myVpnAddrs[0] && ip.destination == peer && priorityControl(packet, f.control.opts.Port) {
-			if r := f.currentRoute(h); r.Endpoint.IsValid() {
-				_, err := p.send(h, r, packet, make([]byte, 12), make([]byte, 0, len(packet)+header.MaxOverhead))
-				return err
-			}
-		}
+	n.mu.Lock()
+	state, mode := n.state, n.modeLocked(peer)
+	if !n.ready(cfg) && n.selectSessionLocked(peer, false) == nil {
+		mode = Blocked
 	}
-
-	p.queueMu.Lock()
-	defer p.queueMu.Unlock()
-	if p.ctx.Err() != nil {
+	n.mu.Unlock()
+	if state != running {
+		return ErrNodeNotStarted
+	}
+	if mode == Blocked {
+		return ErrPathPolicy
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
 		return ErrPortClosed
 	}
 	q := p.queues[peer]
-	if p.queueFull(q) {
+	if p.stats.Queued >= 512 || q != nil && len(q.packets) >= 64 {
+		p.stats.RejectedOutbound++
 		return ErrQueueFull
 	}
 	if q == nil {
-		if p.workers >= p.node.portOptions.QueueSize {
-			return ErrQueueFull
-		}
-		ctx, cancel := context.WithCancel(p.ctx)
-		q = &peerQueue{cancel: cancel}
+		q = &ipQueue{}
 		p.queues[peer] = q
-		p.workers++
-		p.node.workers.Go(func() { p.drainPeer(ctx, peer, q) })
+		if !n.task(func() { p.drain(peer, q) }) {
+			delete(p.queues, peer)
+			return ErrNodeClosed
+		}
 	}
-	q.packets = append(q.packets, queuedIP{ip, slices.Clone(packet)})
-	p.queued++
+	q.packets = append(q.packets, slices.Clone(b))
+	p.stats.Queued++
 	return nil
 }
 
-func (p *IPPort) send(h *hostInfo, route tunnelRoute, data, nonce, out []byte) (TunnelPath, error) {
-	path, err := p.node.engine.sendOnRoute(header.Message, header.MessageNone, h, route, data, nonce, out)
-	if err == nil {
-		p.statsMu.Lock()
-		p.stats.SentPackets++
-		p.stats.SentBytes += uint64(len(data))
-		p.statsMu.Unlock()
-		if last := h.lastDataPath.Load(); last == nil || *last != path {
-			h.lastDataPath.Store(&path)
+func (p *IPPort) drain(peer PeerID, q *ipQueue) {
+	n := p.node
+	for {
+		p.mu.Lock()
+		if p.queues[peer] != q {
+			p.mu.Unlock()
+			return
 		}
+		if len(q.packets) == 0 {
+			delete(p.queues, peer)
+			p.mu.Unlock()
+			return
+		}
+		b := q.packets[0]
+		packetCtx, stop := context.WithCancel(n.ctx)
+		q.current, q.stopCurrent = b, stop
+		q.packets[0] = nil
+		q.packets = q.packets[1:]
+		p.stats.Queued--
+		p.mu.Unlock()
+		err := n.connectPeer(packetCtx, peer)
+		if err == nil {
+			err = n.shape(packetCtx, len(b))
+		}
+		if err == nil {
+			ip, _ := parseInnerPacket(b)
+			n.mu.Lock()
+			cfg := n.policy.Load()
+			var s *session
+			if n.memberOf(cfg) && ip.authorizedBy(cfg, n.id, peer) {
+				s = n.preferredSessionLocked(n.peers[peer], false, &ip)
+			}
+			n.mu.Unlock()
+			if s == nil || packetCtx.Err() != nil {
+				err = ErrAddressUnauthorized
+			} else {
+				err = s.sendIP(b)
+			}
+		}
+		p.mu.Lock()
+		interrupted := packetCtx.Err() != nil
+		stop()
+		q.current, q.stopCurrent = nil, nil
+		if err == nil {
+			p.stats.SentPackets++
+			p.stats.SentBytes += uint64(len(b))
+		} else {
+			p.stats.RejectedOutbound++
+			p.stats.LastDrop = err.Error()
+			if !errors.Is(err, ErrAddressUnauthorized) && !interrupted && p.queues[peer] == q {
+				p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer))
+			}
+		}
+		p.mu.Unlock()
 	}
-	return path, err
 }
 
-func (p *IPPort) drainPeer(ctx context.Context, peer netip.Addr, q *peerQueue) {
-	defer q.cancel()
-	f := p.node.engine
-	var connectErr error
-	nonce := make([]byte, 12)
-	var out []byte
-	for {
-		p.queueMu.Lock()
-		if p.queues[peer] != q || len(q.packets) == 0 || ctx.Err() != nil || connectErr != nil {
-			break
-		}
-		h := f.hostMap.QueryVpnAddr(peer)
-		var route tunnelRoute
-		if h != nil {
-			route = f.currentRoute(h)
-		}
-		if !route.Endpoint.IsValid() {
-			p.queueMu.Unlock()
-			connectErr = p.node.ConnectPeer(ctx, peer)
+func (p *IPPort) revalidateQueues(disconnected map[PeerID]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.node
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	cfg := n.policy.Load()
+	for peer, q := range p.queues {
+		if disconnected[peer] || n.modeLocked(peer) == Blocked {
+			p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer))
+			p.stats.LastDrop = ErrPathPolicy.Error()
 			continue
 		}
-		packet := q.packets[0]
-		q.packets[0] = queuedIP{}
-		q.packets = q.packets[1:]
-		p.queued--
-		p.queueMu.Unlock()
+		unauthorized := func(b []byte) bool {
+			ip, err := parseInnerPacket(b)
+			return err != nil || !ip.authorizedBy(cfg, n.id, peer)
+		}
+		if q.current != nil && unauthorized(q.current) {
+			q.stopCurrent()
+		}
+		before := len(q.packets)
+		q.packets = slices.DeleteFunc(q.packets, unauthorized)
+		dropped := before - len(q.packets)
+		p.stats.Queued -= dropped
+		p.stats.RejectedOutbound += uint64(dropped)
+		if dropped > 0 {
+			p.stats.LastDrop = ErrAddressUnauthorized.Error()
+		}
+	}
+}
 
-		ip := packet.innerPacket
-		if !h.authorizes(ip.destination) {
-			p.recordDrop(false, peer, ip, "peer certificate does not authorize destination", 1)
-			continue
-		}
-		if cap(out) < len(packet.data)+header.MaxOverhead {
-			out = make([]byte, 0, len(packet.data)+header.MaxOverhead)
-		}
-		path, err := p.send(h, route, packet.data, nonce, out)
-		if err == nil {
-			continue
-		}
-
-		if err == errWritePolicy || (path == (TunnelPath{}) && errors.Is(err, ErrPeerUnavailable)) {
-			// Retry at the head of the original queue if it is still attached.
-			p.queueMu.Lock()
-			if p.queues[peer] == q && !p.queueFull(q) {
-				q.packets = slices.Insert(q.packets, 0, packet)
-				p.queued++
-				p.queueMu.Unlock()
-				continue
+func (n *Node) receiveIP(s *session, b []byte) {
+	ip, err := parseInnerPacket(b)
+	n.mu.Lock()
+	port := n.port
+	cfg := n.policy.Load()
+	if err == nil && (len(b) > n.o.MaxIPSize || !n.usableLocked(s) || !ip.authorizedOn(cfg, s.remoteIdentity, s.localIdentity)) {
+		err = ErrAddressUnauthorized
+	}
+	n.mu.Unlock()
+	if port == nil {
+		return
+	}
+	if err == nil && n.o.InboundPolicy != nil {
+		if !n.o.InboundPolicy(s.peer, ip.source, ip.destination) {
+			err = ErrPathPolicy
+		} else {
+			// A host callback may revalidate the node before returning.
+			n.mu.Lock()
+			if current := n.policy.Load(); !n.usableLocked(s) || current != cfg && !ip.authorizedOn(current, s.remoteIdentity, s.localIdentity) {
+				err = ErrAddressUnauthorized
 			}
-			p.queueMu.Unlock()
-		}
-		p.recordDrop(false, peer, ip, err.Error(), 1)
-	}
-
-	// The loop exits with queueMu held so a concurrent writer sees either
-	// the existing worker or a detached queue.
-	if p.queues[peer] == q {
-		delete(p.queues, peer)
-		p.queued -= len(q.packets)
-		if connectErr != nil && len(q.packets) > 0 && ctx.Err() == nil {
-			p.recordDrop(false, peer, q.packets[0].innerPacket, connectErr.Error(), len(q.packets))
+			n.mu.Unlock()
 		}
 	}
-	p.workers--
-	p.queueMu.Unlock()
-	if connectErr != nil && ctx.Err() == nil {
-		f.l.Debug("IP queue handshake failed", "peer", peer, "error", connectErr)
+	port.mu.Lock()
+	if port.closed {
+		port.mu.Unlock()
+		return
 	}
+	if err != nil {
+		port.stats.RejectedInbound++
+		port.stats.LastDrop = err.Error()
+		port.mu.Unlock()
+		return
+	}
+	port.stats.ReceivedPackets++
+	port.stats.ReceivedBytes += uint64(len(b))
+	port.mu.Unlock()
+	port.deliver(b)
 }

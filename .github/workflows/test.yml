@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -33,18 +36,6 @@ jobs:
       - run: go mod tidy && git diff --exit-code -- go.mod go.sum
       - run: go test -race ./...
 
-  fips:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: '1.27'
-          check-latest: true
-      - run: go test . ./cert -run '^Test(Node|Packet|Generate|CreateCA)'
-        env:
-          GODEBUG: fips140=only
-
   cross-compile:
     runs-on: ubuntu-latest
     strategy:
@@ -59,3 +50,22 @@ jobs:
       - run: go test -exec=true ./...
         env:
           GOOS: ${{ matrix.goos }}
+
+  chaos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+      - name: Run fixed fault scenarios with the race detector
+        run: go test -race -count=1 -timeout=5m -run '^TestChaos' ./e2e -args -extended
+      - name: Replay ten bounded action sequences
+        shell: bash
+        run: |
+          go test -c -o "$RUNNER_TEMP/mesh-e2e.test" ./e2e
+          for seed in {1..10}; do
+            "$RUNNER_TEMP/mesh-e2e.test" -test.v -test.run '^TestSeededChaos$' -test.timeout 3m -extended -seed "$seed"
+          done

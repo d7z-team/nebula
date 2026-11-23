@@ -1,2 +1,0 @@
-# Goldens are compared byte for byte, so they must come out of git the way they went in.
-*.golden -text
