@@ -63,7 +63,7 @@ IPv6 fd13::2 -> fd13::1 (40 bytes)
 
 ### gVisor 的 IPv4 网关构建
 
-本项目固定的 gVisor 版本 `04d31b385980` 在 IPv4 单播转发复制报文后读取原包头的 TTL。宿主用该版本构建 IPv4 转发网关时，可采用仓库补丁，使 TTL 在复制前读取。在宿主应用的模块根目录执行以下命令，将 `/path/to/gvisor-ipv4-ttl.patch` 换成补丁的实际路径。[IPv4 转发补丁](../patches/gvisor-ipv4-ttl.patch)
+本项目使用 gVisor 的 `go` 分支。当前固定版本 `83df8eae069e` 在 IPv4 单播转发复制报文后，仍从先前取得的原包头读取 TTL。使用该版本构建 IPv4 转发网关时，可应用仓库补丁，在复制前保存 TTL。在宿主应用的模块根目录执行以下命令，将 `/path/to/gvisor-ipv4-ttl.patch` 换成补丁的实际路径。[上游转发实现](https://github.com/google/gvisor/blob/83df8eae069e6c607672f779f63f3538815cc037/pkg/tcpip/network/ipv4/ipv4.go#L788-L835) · [IPv4 转发补丁](../patches/gvisor-ipv4-ttl.patch)
 
 ```sh
 go mod vendor

@@ -1,6 +1,6 @@
 --- a/pkg/tcpip/network/ipv4/ipv4.go
 +++ b/pkg/tcpip/network/ipv4/ipv4.go
-@@ -789,7 +789,7 @@
+@@ -786,7 +786,7 @@
  //
  // This method should be invoked by the endpoint that received the pkt.
  func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketBuffer, updateOptions bool) ip.ForwardingError {
@@ -9,7 +9,7 @@
  	stk := e.protocol.stack
  
  	inNicName := stk.FindNICNameFromID(e.nic.ID())
-@@ -828,7 +828,6 @@
+@@ -825,7 +825,6 @@
  		}
  	}
  

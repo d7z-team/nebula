@@ -63,7 +63,7 @@ func (g gateway) install(t *testing.T, n *network) {
 	n.mu.Lock()
 	n.gates[linkAddress{g.wan, g.public.Addr()}] = &natGate{g.filter, make(map[netip.AddrPort]map[netip.AddrPort]bool)}
 	n.mu.Unlock()
-	// gVisor 04d31b3 reads the ingress TTL after DeepCopyForForwarding,
+	// gVisor reads the ingress TTL after DeepCopyForForwarding,
 	// which may recycle its backing chunk. Retain the header across dispatch.
 	forward := s.IPTables().GetTable(stack.FilterID, false)
 	forward.Rules[forward.BuiltinChains[stack.Forward]].Matchers = []stack.Matcher{forwardHeader{network: n}}
