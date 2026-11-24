@@ -92,24 +92,36 @@ func (n *Node) preferredSessionLocked(paths *peerPaths, direct bool, packet *inn
 // directEndpointLocked returns a reusable connection, or the number of usable
 // outgoing alternatives in the same transport and address family.
 func (n *Node) directEndpointLocked(peer PeerID, ep Endpoint) (*session, int) {
-	paths := n.peers[peer]
-	if paths == nil {
-		return nil, 0
+	match := func(paths *peerPaths) (*session, int) {
+		outgoing := 0
+		for _, s := range paths.sessions {
+			if s.kind != ep.Network || s.closed.Load() || !n.sessionAllowedLocked(s) {
+				continue
+			}
+			remote := s.remoteEndpoint()
+			// A physical endpoint dial authenticates a server. An inbound QUIC
+			// path authenticated the remote client and can serve a known peer.
+			if remote == ep.Address && (s.outgoing || peer != (PeerID{}) && s.q != nil) {
+				return s, 0
+			}
+			if s.outgoing && remote.Addr().BitLen() == ep.Address.Addr().BitLen() {
+				outgoing++
+			}
+		}
+		return nil, outgoing
 	}
-	outgoing := 0
-	for _, s := range paths.sessions {
-		if s.kind != ep.Network || s.closed.Load() || !n.sessionAllowedLocked(s) {
-			continue
+	if peer != (PeerID{}) {
+		if paths := n.peers[peer]; paths != nil {
+			return match(paths)
 		}
-		remote := s.remoteEndpoint()
-		if remote == ep.Address && (s.outgoing || s.q != nil) {
-			return s, 0
-		}
-		if s.outgoing && remote.Addr().BitLen() == ep.Address.Addr().BitLen() {
-			outgoing++
+	} else {
+		for _, paths := range n.peers {
+			if s, _ := match(paths); s != nil {
+				return s, 0
+			}
 		}
 	}
-	return nil, outgoing
+	return nil, 0
 }
 
 func (n *Node) maintain() {
@@ -203,7 +215,7 @@ func (n *Node) probeSession(s *session) {
 		b, err = s.request(n.ctx, opHello, body, maxControlFrame)
 		var remote advert
 		if err == nil && json.Unmarshal(b, &remote) == nil {
-			n.observe(s, remote)
+			n.receiveAdvert(s, remote)
 		}
 	}
 	n.tryTask(n.backgroundSlots, func() { n.probeAlternatePaths(s, failures) })
@@ -243,7 +255,7 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 	}
 	n.mu.Unlock()
 	if candidate.Valid() {
-		if _, err := n.dialEndpoint(n.ctx, s.peer, candidate); err != nil && candidate.Network == "udp" && n.lookup(n.ctx, s.peer) {
+		if _, err := n.dialEndpoint(n.ctx, s.peer, candidate); err != nil && candidate.Network == "udp" && n.rendezvous(n.ctx, s.peer) {
 			n.mu.Lock()
 			var retry Endpoint
 			for _, ep := range n.endpointsLocked(s.peer) {

@@ -18,7 +18,7 @@ func (n *Node) ApplyTopology(ctx context.Context, t Topology) error {
 }
 
 // Revalidate reapplies the host's current chain decisions to local credentials,
-// sessions and cached events. Success means the review completed, including
+// sessions and cached publications. Success means the review completed, including
 // any withdrawals. Use ControlStatus and Paths to inspect the outcome.
 func (n *Node) Revalidate(ctx context.Context) error { return n.updateView(ctx, nil) }
 
@@ -31,7 +31,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		}
 		n.mu.Lock()
 		old, c, seq := n.policy.Load(), n.cred.Load(), n.admissions
-		ss, events := n.sessionListLocked(), maps.Clone(n.events)
+		ss, publications := n.sessionListLocked(), maps.Clone(n.publications)
 		n.mu.Unlock()
 		p := next
 		if p == nil {
@@ -49,14 +49,14 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 				deadlines[i] = d
 			}
 		}
-		for id, ev := range events {
-			_, until, err := n.verifyEvent(ctx, p, ev.record)
+		for id, publication := range publications {
+			_, until, err := n.verifyPublication(ctx, p, publication.record)
 			if err != nil {
-				delete(events, id)
+				delete(publications, id)
 				continue
 			}
-			ev.expires = until
-			events[id] = ev
+			publication.expires = until
+			publications[id] = publication
 		}
 		n.mu.Lock()
 		if n.ctx.Err() != nil {
@@ -74,11 +74,11 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		for i, s := range ss {
 			s.until = deadlines[i]
 		}
-		for id := range n.events {
-			if ev, ok := events[id]; ok {
-				n.events[id] = ev
+		for id := range n.publications {
+			if publication, ok := publications[id]; ok {
+				n.publications[id] = publication
 			} else {
-				delete(n.events, id)
+				delete(n.publications, id)
 			}
 		}
 		updated := *c
@@ -88,6 +88,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		clear(n.routeCursors)
 		clear(n.introduced)
 		clear(n.discovered)
+		clear(n.discoveredOwners)
 		clear(n.observations)
 		if next != nil {
 			n.setShapingRate(p.members[n.id].BytesPerSecond)

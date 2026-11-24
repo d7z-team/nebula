@@ -3,15 +3,11 @@ package nebula
 import (
 	"context"
 	"crypto"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/asn1"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -23,84 +19,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMaximumEventAndInventoryFrames(t *testing.T) {
-	f := newFixture(t, "tcp", "tcp")
-	pair := &f.opts[0].Certificates.Client
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	require.NoError(t, err)
-	leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}, Value: make([]byte, (24<<10)-len(leaf.Raw)-len(leaf.RawIssuer)-128)})
-	pair.Certificate[0], err = x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
-	require.NoError(t, err)
-	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
-	}
-	f.start()
-	// All three default roles must own their certificate data after New.
-	clear(pair.Certificate[0])
-	pair.Certificate[0] = nil
-	n, other := f.nodes[0], f.nodes[1]
-	id, err := n.Publish(t.Context(), "app/test", make([]byte, 4096))
-	require.NoError(t, err)
-	n.mu.Lock()
-	event := n.events[id]
-	for i := 1; i < maxEvents; i++ {
-		n.events[fmt.Sprintf("%064x", i)] = cachedEvent{expires: event.expires}
-	}
-	n.mu.Unlock()
-	s, back := &session{peer: other.id}, &session{peer: n.id}
-	first := n.advert(s)
-	firstBytes, err := json.Marshal(first)
-	require.NoError(t, err)
-	require.LessOrEqual(t, len(firstBytes), 64<<10)
-	require.NotEmpty(t, first.Inventory)
-	require.Less(t, len(first.Inventory), maxEvents)
-
-	ids := map[string]bool{}
-	for _, page := range []advert{first, n.advert(s)} {
-		for _, id := range page.Inventory {
-			ids[id] = true
-		}
-	}
-	require.Len(t, ids, maxEvents)
-	_, ok := other.learn(first.Record)
-	require.True(t, ok)
-	s.acknowledgedIntro.Store(other.advert(back).Seen)
-	steady := n.advert(s)
-	require.Empty(t, steady.Record)
-	require.Len(t, steady.Inventory, maxEvents)
-	steadyBytes, err := json.Marshal(steady)
-	require.NoError(t, err)
-	require.LessOrEqual(t, len(steadyBytes), 64<<10)
-	sub, err := other.Subscribe("app/test")
-	require.NoError(t, err)
-	defer sub.Close()
-	require.NoError(t, n.ConnectPeer(t.Context(), other.id.IPv4()))
-	// Pull the signed maximum-payload event over the real control stream.
-	require.Eventually(t, func() bool { return other.preferredSession(n.id, false) != nil }, time.Second, time.Millisecond)
-	wire, err := other.preferredSession(n.id, false).request(t.Context(), opGetEvent, []byte(id), pki.MaxDocument)
-	require.NoError(t, err)
-	require.Equal(t, []byte(event.record), wire)
-	_, chain, err := pki.VerifyObjectSignature(wire, n.Cluster().Network(), "event")
-	require.NoError(t, err)
-	require.True(t, chain[0].Equal(n.cred.Load().Object.Leaf))
-	// Push the same DER over the opposite stream and observe local delivery.
-	_, err = n.preferredSession(other.id, false).request(t.Context(), opEvent, wire, 0)
-	require.NoError(t, err)
-	select {
-	case received := <-sub.Events():
-		require.Equal(t, id, received.ID)
-		require.Len(t, received.Payload, maxEventPayload)
-	case <-time.After(time.Second):
-		t.Fatal("signed event was not delivered")
-	}
-}
-
 func TestIntroductionAfterSignerReload(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	f.start()
 	sender, receiver := f.nodes[0], f.nodes[1]
 	to := &session{peer: receiver.id}
-	_, ok := receiver.learn(sender.advert(to).Record)
+	_, ok := receiver.learnIntroduction(t.Context(), sender.advert(to).Record, nil)
 	require.True(t, ok)
 	to.acknowledgedIntro.Store(receiver.advert(&session{peer: sender.id}).Seen)
 	require.Empty(t, sender.advert(to).Record)
@@ -112,7 +36,7 @@ func TestIntroductionAfterSignerReload(t *testing.T) {
 	_, chain, err := pki.VerifyObjectSignature(record, sender.Cluster().Network(), "introduction")
 	require.NoError(t, err)
 	require.True(t, set.Object.Leaf.Equal(chain[0]))
-	peer, ok := receiver.learn(record)
+	peer, ok := receiver.learnIntroduction(t.Context(), record, nil)
 	require.True(t, ok)
 	require.Equal(t, sender.id, peer)
 }

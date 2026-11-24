@@ -162,9 +162,8 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	g.bindings[0].port = 45002
 	g.install(t, l.net)
 	require.Eventually(t, func() bool {
-		return slices.ContainsFunc(b.node.Paths(), func(p nebula.PathStatus) bool {
-			return p.Peer == labPeer(a.ip) && p.Active && p.Endpoint.String() == "192.0.2.1:45002"
-		})
+		p, ok := b.node.PreferredPath(a.node.ID())
+		return ok && p.Endpoint.String() == "192.0.2.1:45002"
 	}, 15*time.Second, 50*time.Millisecond)
 	receipt(t, c, d, 1)
 	before := flow{"wan", netip.MustParseAddrPort("192.0.2.1:45002"), netip.MustParseAddrPort("192.0.2.20:4242"), 17}
@@ -247,9 +246,8 @@ func TestChaosMobileHandover(t *testing.T) {
 		t.Logf("handover %d receipt after %s, dropped %d packets during outage", step, time.Since(start), dropped.Load())
 		require.Positive(t, dropped.Load())
 		require.Eventually(t, func() bool {
-			return slices.ContainsFunc(fixed.node.Paths(), func(p nebula.PathStatus) bool {
-				return p.Active && p.Peer == mobile.node.ID() && p.Transport == "udp" && p.Endpoint == endpoint
-			})
+			p, ok := fixed.node.PreferredPath(mobile.node.ID())
+			return ok && p.Transport == "udp" && p.Endpoint == endpoint
 		}, 12*time.Second, 20*time.Millisecond, "handover %d: expected active endpoint %s", step, endpoint)
 	}
 }
@@ -303,12 +301,11 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 	g.bindings[0].port++
 	g.install(t, l.net)
 	next := netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port)
-	eventReceipt(t, mobile, observer, "new mapping")
+	publicationReceipt(t, mobile, observer, "new mapping")
 	// The next healthy canary is at least five seconds away.
 	require.Eventually(t, func() bool {
-		return slices.ContainsFunc(fixed.node.Paths(), func(p nebula.PathStatus) bool {
-			return p.Peer == mobile.node.ID() && p.Active && p.Transport == "udp" && p.Endpoint == next
-		})
+		p, ok := fixed.node.PreferredPath(mobile.node.ID())
+		return ok && p.Transport == "udp" && p.Endpoint == next
 	}, time.Until(started.Add(4500*time.Millisecond)), 15*time.Millisecond)
 	require.True(t, slices.ContainsFunc(observer.node.Paths(), func(p nebula.PathStatus) bool {
 		return p.Peer == mobile.node.ID() && p.Endpoint == next
@@ -363,7 +360,8 @@ func TestChaosRelayPartition(t *testing.T) {
 	})
 	require.NoError(t, primary.node.Close())
 	require.Eventually(t, func() bool {
-		return !slices.ContainsFunc(a.node.Paths(), func(p nebula.PathStatus) bool { return p.Peer == labPeer(b.ip) && p.Active })
+		_, ok := a.node.PreferredPath(b.node.ID())
+		return !ok
 	}, 10*time.Second, 50*time.Millisecond)
 	require.Error(t, a.node.ConnectPeer(t.Context(), b.ip))
 	l.net.disturb(nil)
@@ -382,6 +380,115 @@ func TestChaosRelayPartition(t *testing.T) {
 	require.Zero(t, direct)
 }
 
+// The five-node circuit and withdrawal run in the standard suite. Extended
+// runs also interrupt the NATed relay's right adjacency on the same inner TCP flow.
+func TestChaosHiddenTransit(t *testing.T) {
+	l := newLab(t)
+	nat := edge("lan", "10.1.0.1/24", "192.0.2.30/24", "10.1.0.2:4242", 45001, portFilter)
+	nat.install(t, l.net)
+	a := l.host("wan", "192.0.2.1", "", "udp", true)
+	left := l.host("wan", "192.0.2.2", "", "udp", true)
+	h := l.host("lan", "10.1.0.2", "10.1.0.1", "udp", false)
+	right := l.host("wan", "192.0.2.4", "", "udp", true)
+	b := l.host("wan", "192.0.2.5", "", "udp", true)
+	l.link(a, left)
+	l.link(left, h)
+	l.link(h, right)
+	l.link(right, b)
+	for _, relay := range []*host{left, h, right} {
+		l.top.Members[relay.index].Transit = true
+	}
+	for _, restricted := range []*host{a, h, b} {
+		l.top.Members[restricted.index].Restricted = true
+	}
+	h.options.HideEndpoints = true
+	mapped := netip.AddrPortFrom(nat.public.Addr(), nat.bindings[0].port)
+	h.options.AdvertiseEndpoints = []nebula.Endpoint{{Network: "udp", Address: mapped}}
+	l.start()
+	l.connect(a, left, "udp")
+	l.connect(b, right, "udp")
+	l.connect(h, left, "udp")
+	l.connect(h, right, "udp")
+	require.Equal(t, mapped, waitPath(t, right, h, "udp").Endpoint)
+
+	circuit := []nebula.PeerID{a.node.ID(), left.node.ID(), h.node.ID(), right.node.ID(), b.node.ID()}
+	path := l.connect(a, b, "relay")
+	require.Equal(t, circuit, path.Circuit)
+	path.Circuit[1] = nebula.PeerID{}
+	path, ok := a.node.PreferredPath(b.node.ID())
+	require.True(t, ok)
+	require.Equal(t, circuit, path.Circuit)
+	back := slices.Clone(circuit)
+	slices.Reverse(back)
+	require.Equal(t, back, waitPath(t, b, a, "relay").Circuit)
+
+	var submitted atomic.Bool
+	a.nicOptions.ObserveTransmit = func(r nebula.TransmitResult) {
+		if r.Err == nil && r.Peer == b.node.ID() && r.Transport == "relay" && slices.Equal(r.Circuit, circuit) {
+			submitted.Store(true)
+		}
+	}
+	client, server := l.business(a), l.business(b)
+	c, d := tcpPair(t, client, server, b.node.ID().IPv6().String(), ipv6.ProtocolNumber)
+	receipt(t, c, d, 0)
+	require.Eventually(t, submitted.Load, time.Second, time.Millisecond)
+	c4, d4 := tcpPair(t, client, server, b.ip.String(), ipv4.ProtocolNumber)
+	roundTrip(t, c4, d4)
+
+	if *runExtended {
+		neighbor := l.top.Members[right.index].Endpoints[0].Address
+		var dropped atomic.Uint64
+		l.net.disturb(func(d datagram) disturbance {
+			if (d.from == mapped && d.to == neighbor) || (d.from == neighbor && d.to == mapped) {
+				dropped.Add(1)
+				return disturbance{drop: true}
+			}
+			return disturbance{}
+		})
+		defer l.net.disturb(nil)
+		require.Eventually(t, func() bool {
+			_, leg := h.node.PreferredPath(right.node.ID())
+			_, route := a.node.PreferredPath(b.node.ID())
+			return !leg && !route
+		}, 12*time.Second, 20*time.Millisecond)
+		require.Positive(t, dropped.Load())
+		l.net.disturb(nil)
+		waitPath(t, h, right, "udp")
+		require.Equal(t, circuit, l.connect(a, b, "relay").Circuit)
+		receipt(t, c, d, 1)
+	}
+	matches, err := b.node.ResolveIP(t.Context(), h.ip)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	require.Equal(t, h.node.ID(), matches[0].Peer)
+	require.Empty(t, matches[0].Endpoints)
+
+	// Only H withdraws transit. Its neighbors and its own applications stay reachable.
+	view := l.top
+	view.Members = slices.Clone(view.Members)
+	view.Members[h.index].Transit = false
+	require.NoError(t, h.node.ApplyTopology(t.Context(), view))
+	require.Eventually(t, func() bool {
+		_, ok := a.node.PreferredPath(b.node.ID())
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Error(t, a.node.ConnectPeerID(t.Context(), b.node.ID()))
+	l.connect(a, h, "relay")
+	hc, hd := tcpPair(t, client, l.business(h), h.ip.String(), ipv4.ProtocolNumber)
+	roundTrip(t, hc, hd)
+	leftAddr := l.top.Members[left.index].Endpoints[0].Address
+	rightAddr := l.top.Members[right.index].Endpoints[0].Address
+	var destinations []netip.AddrPort
+	l.net.mu.Lock()
+	for f := range l.net.count {
+		if f.segment == "lan" && f.from.Addr() == nat.bindings[0].inside.Addr() {
+			destinations = append(destinations, f.to)
+		}
+	}
+	l.net.mu.Unlock()
+	require.ElementsMatch(t, []netip.AddrPort{leftAddr, rightAddr}, destinations)
+}
+
 func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	extended(t)
 	l := newLab(t)
@@ -397,7 +504,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	}
 	l.start()
 	l.connect(a, r, "tcp")
-	eventReceipt(t, a, r, "withdrawn publication")
+	publicationReceipt(t, a, r, "withdrawn publication")
 	denied.Store(true)
 	require.NoError(t, r.node.Revalidate(t.Context()))
 	require.Equal(t, a.options.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, r, a, "tcp").Serial)
@@ -408,15 +515,15 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	defer sub.Close()
 	l.connect(c, r, "tcp")
 	select {
-	case event := <-sub.Events():
-		require.Equal(t, id, event.ID)
-		require.Equal(t, labPeer(r.ip), event.Origin)
+	case publication := <-sub.Publications():
+		require.Equal(t, id, publication.ID)
+		require.Equal(t, labPeer(r.ip), publication.Origin)
 	case <-time.After(4 * time.Second):
-		t.Fatal("late subscriber missed the authorized cached event")
+		t.Fatal("late subscriber missed the authorized cached publication")
 	}
 	require.Never(t, func() bool {
 		select {
-		case <-sub.Events():
+		case <-sub.Publications():
 			return true
 		default:
 			return false
@@ -488,7 +595,7 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("dial still waiting after close")
 	}
-	require.Empty(t, sub.Events())
+	require.Empty(t, sub.Publications())
 	require.Zero(t, port.Stats().Queued)
 	require.True(t, a.node.ControlStatus().Closed)
 }

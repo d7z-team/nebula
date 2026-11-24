@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
@@ -91,4 +92,41 @@ func ExampleTopology_Validate() {
 	}
 	fmt.Println("approved neighbor:", topology.Members[0].Links[0])
 	// Output: approved neighbor: 10.13.0.2@fd13::2
+}
+
+func ExampleNode_ResolveIP() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, gateway := demo.NewHost(1), demo.NewHost(2)
+	gateway.RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("172.30.0.0/24")}
+	gateway.CertificateRoutes = gateway.RoutedPrefixes
+	opts, err := demo.NodeOptions(client, gateway)
+	if err != nil {
+		panic(err)
+	}
+	opts[0].Topology.Members = []nebula.Member{client.Member}
+	nodes, err := demo.Listen(ctx, "tcp", opts)
+	if err != nil {
+		panic(err)
+	}
+	for _, node := range nodes {
+		defer node.Close()
+	}
+	for _, node := range nodes {
+		if err := node.Start(); err != nil {
+			panic(err)
+		}
+	}
+	ep := opts[1].Topology.Members[1].Endpoints[0]
+	if _, err := nodes[0].ConnectEndpoint(ctx, ep); err != nil {
+		panic(err)
+	}
+	matches, err := nodes[0].ResolveIP(ctx, netip.MustParseAddr("172.30.0.42"))
+	if err != nil {
+		panic(err)
+	}
+	for _, m := range matches {
+		fmt.Println(m.Peer, m.Prefix)
+	}
+	// Output: 10.13.0.2@fd13::2 172.30.0.0/24
 }

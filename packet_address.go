@@ -51,9 +51,10 @@ func isTunnelUnicast(addr netip.Addr) bool {
 	return !addr.Is4In6() && (addr.IsGlobalUnicast() || addr.IsLinkLocalUnicast())
 }
 
-func (s *topologyView) unicastNextHop(via PeerID, dst netip.Addr) (PeerID, error) {
+func (n *Node) unicastNextHopLocked(via PeerID, dst netip.Addr) (PeerID, error) {
+	s := n.policy.Load()
 	if via != (PeerID{}) {
-		if _, ok := s.members[via]; !ok {
+		if n.ownerLocked(via.IPv4()) != via {
 			return PeerID{}, ErrPeerUnavailable
 		}
 		if !s.allowsAddress(via, dst, nil) {
@@ -61,7 +62,7 @@ func (s *topologyView) unicastNextHop(via PeerID, dst netip.Addr) (PeerID, error
 		}
 		return via, nil
 	}
-	if owner, ok := s.owners[dst]; ok {
+	if owner := n.ownerLocked(dst); owner != (PeerID{}) {
 		return owner, nil
 	}
 	if s.cluster.Subnet(dst).IsValid() && !s.cluster.InAnycastPool(dst) {
@@ -75,6 +76,9 @@ func (s *topologyView) unicastNextHop(via PeerID, dst netip.Addr) (PeerID, error
 func (s *topologyView) allowsAddress(peer PeerID, addr netip.Addr, cert *pki.Scope) bool {
 	if owner, ok := s.owners[addr]; ok {
 		return owner == peer
+	}
+	if addr == peer.IPv4() || addr == peer.IPv6() {
+		return s.acceptsIdentity(peer)
 	}
 	member := s.members[peer]
 	if s.cluster.InAnycastPool(addr) {

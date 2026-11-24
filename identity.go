@@ -14,9 +14,6 @@ import (
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
-// ALPN identifies mesh TLS connections over TCP and QUIC.
-const ALPN = meshwire.ALPN
-
 // LocalCertificates holds leaf-first chains for clientAuth, serverAuth and codeSigning.
 // Empty Server and Object credentials reuse Client.
 type LocalCertificates struct{ Client, Server, Object tls.Certificate }
@@ -80,7 +77,7 @@ func (n *Node) authorizeChain(ctx context.Context, p *topologyView, peer PeerID,
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, err
 	}
-	if _, ok := p.members[peer]; !ok {
+	if _, local := p.members[n.id]; !local || !p.acceptsIdentity(peer) {
 		return time.Time{}, ErrPathPolicy
 	}
 	paths, err := pki.VerifyChain(chain, n.o.Roots, p.cluster, peer, usage, time.Now())
@@ -190,32 +187,46 @@ func (n *Node) ready(p *topologyView) bool {
 func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
 	cfg := &tls.Config{
 		RootCAs: n.o.Roots, ClientCAs: n.o.Roots, ClientAuth: tls.RequireAndVerifyClientCert,
-		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, NextProtos: []string{ALPN}, SessionTicketsDisabled: true, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
+		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, NextProtos: []string{meshwire.ALPN}, SessionTicketsDisabled: true, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
 	}
 	if server {
 		cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &n.cred.Load().Server, nil }
 	} else {
 		cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &n.cred.Load().Client, nil }
-		cfg.ServerName = peer.IPv4().String()
+		if peer == (PeerID{}) {
+			// An endpoint dial learns the certified address pair from the peer.
+			// VerifyConnection builds the PKIX chain against our explicit roots.
+			cfg.InsecureSkipVerify = true
+		} else {
+			cfg.ServerName = peer.IPv4().String()
+		}
 	}
 	cfg.VerifyConnection = func(st tls.ConnectionState) error {
 		p := n.policy.Load()
-		if st.NegotiatedProtocol != ALPN || len(st.VerifiedChains) == 0 || !n.memberOf(p) {
+		if st.NegotiatedProtocol != meshwire.ALPN || len(st.PeerCertificates) == 0 || !n.memberOf(p) {
 			return ErrPathPolicy
 		}
 		usage := x509.ExtKeyUsageServerAuth
 		if server {
 			usage = x509.ExtKeyUsageClientAuth
 		}
+		ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout)
+		defer cancel()
+		if !server && peer == (PeerID{}) {
+			identity, err := pki.ReadIdentity(st.PeerCertificates[0])
+			if err != nil || identity.ID == n.id {
+				return ErrPathPolicy
+			}
+			_, err = n.authorizeChain(ctx, p, identity.ID, st.PeerCertificates, usage)
+			return err
+		}
 		identity, paths, err := pki.VerifiedPeer(st.VerifiedChains, p.cluster, usage)
 		if err != nil {
 			return err
 		}
-		if _, ok := p.members[identity.ID]; !ok || identity.ID == n.id || peer != (PeerID{}) && identity.ID != peer {
+		if !p.acceptsIdentity(identity.ID) || identity.ID == n.id || peer != (PeerID{}) && identity.ID != peer {
 			return ErrPathPolicy
 		}
-		ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout)
-		defer cancel()
 		_, err = n.chainDeadline(ctx, ChainCheck{Member: identity.ID, Usage: usage}, paths)
 		return err
 	}
@@ -225,8 +236,8 @@ func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
 type (
 	statement                 []byte
 	publishedStatement[T any] struct {
-		Publisher PeerID
-		Value     T
+		Publisher PeerID `json:"publisher"`
+		Value     T      `json:"value"`
 	}
 )
 
@@ -238,24 +249,23 @@ func (n *Node) signStatement(kind string, value any, signer tls.Certificate) (st
 	return pki.SignObject(n.Cluster().Network(), kind, b, signer)
 }
 
-func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (PeerID, []byte, time.Time, error) {
-	var a PeerID
+func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (pki.Identity, []byte, time.Time, error) {
+	var identity pki.Identity
 	b, chain, err := pki.VerifyObjectSignature(s, p.cluster.Network(), kind)
 	if err != nil {
-		return a, nil, time.Time{}, err
+		return identity, nil, time.Time{}, err
 	}
-	identity, err := pki.ReadIdentity(chain[0])
-	a = identity.ID
+	identity, err = pki.ReadIdentity(chain[0])
 	if err != nil {
-		return a, nil, time.Time{}, err
+		return identity, nil, time.Time{}, err
 	}
-	end, err := n.authorizeChain(ctx, p, a, chain, x509.ExtKeyUsageCodeSigning)
+	end, err := n.authorizeChain(ctx, p, identity.ID, chain, x509.ExtKeyUsageCodeSigning)
 	if err != nil {
-		return a, nil, time.Time{}, err
+		return identity, nil, time.Time{}, err
 	}
 	var obj publishedStatement[json.RawMessage]
-	if json.Unmarshal(b, &obj) != nil || obj.Publisher != a {
-		return a, nil, time.Time{}, ErrPathPolicy
+	if json.Unmarshal(b, &obj) != nil || obj.Publisher != identity.ID {
+		return identity, nil, time.Time{}, ErrPathPolicy
 	}
-	return a, obj.Value, end, nil
+	return identity, obj.Value, end, nil
 }

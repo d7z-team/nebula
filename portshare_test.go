@@ -164,7 +164,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		get(web1, name, "HTTP/1.1")
 	}
 	get(mkH3(quic.Version2), names[0], "HTTP/3.0")
-	bad := &tls.Config{NextProtos: []string{ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.opts[0].Roots, ServerName: f.ips[1].String()}
+	bad := &tls.Config{NextProtos: []string{meshwire.ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.opts[0].Roots, ServerName: f.ips[1].String()}
 	badCtx, stopBad := context.WithTimeout(t.Context(), 2*time.Second)
 	badConn, badErr := siteTr.Dial(badCtx, f.sockets[1].LocalAddr(), bad, &quic.Config{Versions: []quic.Version{quic.Version1}})
 	if badErr == nil {

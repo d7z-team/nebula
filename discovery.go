@@ -2,9 +2,7 @@ package nebula
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"net"
 	"net/netip"
@@ -15,24 +13,26 @@ import (
 )
 
 type advert struct {
-	Observed  netip.AddrPort
-	Record    statement
-	Seen      int64 `json:",omitempty"`
-	Inventory []string
+	Observed  netip.AddrPort `json:"observed"`
+	Record    statement      `json:"record"`
+	Seen      int64          `json:"seen,omitempty"`
+	Inventory []string       `json:"inventory"`
 }
 
 type introduction struct {
-	Endpoints []Endpoint
-	Expires   time.Time
+	Endpoints      []Endpoint     `json:"endpoints"`
+	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
+	Expires        time.Time      `json:"expires"`
 }
 
 type learnedIntroduction struct {
 	introduction
+	record          statement
 	authorizedUntil time.Time
 }
 
 type cachedIntroduction struct {
-	intro  introduction
+	introduction
 	record statement
 	cred   *x509.Certificate
 	policy *topologyView
@@ -60,33 +60,12 @@ func (n *Node) advert(s *session) advert {
 	if d := n.discovered[s.peer]; now.Before(d.authorizedUntil) {
 		a.Seen = d.Expires.UnixNano()
 	}
-	for id, e := range n.events {
-		if now.Before(e.expires) {
-			a.Inventory = append(a.Inventory, id)
-		} else {
-			delete(n.events, id)
-		}
-	}
 	n.mu.Unlock()
-	a.Record = n.signedIntroduction(p, s.acknowledgedIntro.Load())
-	// All maxEvents IDs fit in one frame without an introduction.
-	if len(a.Record) == 0 || len(a.Inventory) == 0 {
-		return a
+	intro := n.localIntroduction(p)
+	if s.acknowledgedIntro.Load() != intro.Expires.UnixNano() {
+		a.Record = intro.record
 	}
-	ids := a.Inventory
-	a.Inventory = nil
-	base, _ := json.Marshal(a)
-	// Each lowercase SHA-256 ID costs two quotes and one comma.
-	count := max(0, (maxControlFrame-len(base)-2)/67)
-	if count >= len(ids) {
-		a.Inventory = ids
-		return a
-	}
-	slices.Sort(ids)
-	start := int((s.inventoryOffset.Add(uint64(count)) - uint64(count)) % uint64(len(ids)))
-	for i := range count {
-		a.Inventory = append(a.Inventory, ids[(start+i)%len(ids)])
-	}
+	n.addPublicationInventory(s, &a)
 	return a
 }
 
@@ -98,9 +77,8 @@ func (n *Node) endpointsLocked(peer PeerID) []Endpoint {
 	return eps
 }
 
-// signedIntroduction collects current endpoints and reuses the signed record until it needs renewal.
-func (n *Node) signedIntroduction(p *topologyView, acknowledged int64) statement {
-	if !n.ready(p) {
+func (n *Node) introductionEndpoints(p *topologyView, now time.Time) []Endpoint {
+	if n.o.HideEndpoints {
 		return nil
 	}
 	eps := slices.Clone(n.o.AdvertiseEndpoints)
@@ -115,7 +93,6 @@ func (n *Node) signedIntroduction(p *topologyView, acknowledged int64) statement
 			eps = append(eps, Endpoint{"tcp", addrPort(l.Addr())})
 		}
 	}
-	now := time.Now()
 	n.mu.Lock()
 	observedStart := len(eps)
 	for observer, entry := range n.observations {
@@ -133,12 +110,39 @@ func (n *Node) signedIntroduction(p *topologyView, acknowledged int64) statement
 			out = append(out, ep)
 		}
 	}
+	return out
+}
+
+func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
+	if !n.ready(p) {
+		return cachedIntroduction{}
+	}
+	now := time.Now()
+	endpoints := n.introductionEndpoints(p, now)
 	n.introMu.Lock()
 	defer n.introMu.Unlock()
 	cache := &n.introCache
 	signer := n.cred.Load().Object
-	if cache.policy != p || cache.cred != signer.Leaf || now.Add(10*time.Second).After(cache.intro.Expires) || !slices.Equal(out, cache.intro.Endpoints) {
-		intro := introduction{out, now.Add(time.Minute)}
+	if cache.policy != p || cache.cred != signer.Leaf || now.Add(10*time.Second).After(cache.Expires) || !slices.Equal(endpoints, cache.Endpoints) {
+		intro := introduction{Endpoints: endpoints, Expires: now.Add(time.Minute)}
+		scope, _, err := pki.CertificateScope(signer.Leaf)
+		if err != nil {
+			return cachedIntroduction{}
+		}
+		for _, active := range p.members[n.id].RoutedPrefixes {
+			for _, grant := range scope.RoutedPrefixes {
+				if !active.Overlaps(grant) {
+					continue
+				}
+				prefix := active
+				if grant.Bits() > active.Bits() {
+					prefix = grant
+				}
+				if !slices.Contains(intro.RoutedPrefixes, prefix) {
+					intro.RoutedPrefixes = append(intro.RoutedPrefixes, prefix)
+				}
+			}
+		}
 		record, err := n.signStatement("introduction", intro, signer)
 		if err == nil {
 			*cache = cachedIntroduction{intro, record, signer.Leaf, p}
@@ -146,15 +150,13 @@ func (n *Node) signedIntroduction(p *topologyView, acknowledged int64) statement
 			*cache = cachedIntroduction{}
 		}
 	}
-	if acknowledged == cache.intro.Expires.UnixNano() {
-		return nil
-	}
-	return cache.record
+	return *cache
 }
 
-func (n *Node) learn(record statement) (PeerID, bool) {
+func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *query) (PeerID, bool) {
 	p := n.policy.Load()
-	a, body, end, err := n.verifyStatement(n.ctx, "introduction", record, p)
+	identity, body, end, err := n.verifyStatement(ctx, "introduction", record, p)
+	a := identity.ID
 	if err != nil || a == n.id {
 		return a, false
 	}
@@ -163,6 +165,14 @@ func (n *Node) learn(record statement) (PeerID, bool) {
 	if json.Unmarshal(body, &v) != nil || !now.Before(v.Expires) || v.Expires.After(now.Add(65*time.Second)) || len(v.Endpoints) > 16 {
 		return a, false
 	}
+	if reply != nil && !v.match(*reply, a, p.cluster.Subnet(reply.IP).IsValid()).IsValid() {
+		return a, false
+	}
+	for _, prefix := range v.RoutedPrefixes {
+		if !identity.AllowsRoute(prefix) {
+			return a, false
+		}
+	}
 	for _, e := range v.Endpoints {
 		if !e.Valid() || p.isOverlayAddress(e.Address.Addr()) {
 			return a, false
@@ -170,7 +180,7 @@ func (n *Node) learn(record statement) (PeerID, bool) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.policy.Load() != p {
+	if n.policy.Load() != p || n.modes[a] == Blocked || n.conflictingOwnerLocked(a) {
 		return a, false
 	}
 	if v.Expires.Before(end) {
@@ -188,13 +198,20 @@ func (n *Node) learn(record statement) (PeerID, bool) {
 		}
 		n.introduced[e][a] = end
 	}
-	n.discovered[a] = learnedIntroduction{v, end}
+	n.discovered[a] = learnedIntroduction{v, record, end}
+	n.discoveredOwners[a.IPv4()] = a
+	n.discoveredOwners[a.IPv6()] = a
 	return a, true
 }
 
-// Remove both indexes together when replacing or expiring a signed introduction.
+// Remove the derived indexes together when replacing or expiring a signed introduction.
 func (n *Node) forgetIntroductionLocked(peer PeerID, old learnedIntroduction) {
 	delete(n.discovered, peer)
+	for _, addr := range []netip.Addr{peer.IPv4(), peer.IPv6()} {
+		if n.discoveredOwners[addr] == peer {
+			delete(n.discoveredOwners, addr)
+		}
+	}
 	for _, e := range old.Endpoints {
 		delete(n.introduced[e], peer)
 		if len(n.introduced[e]) == 0 {
@@ -203,137 +220,33 @@ func (n *Node) forgetIntroductionLocked(peer PeerID, old learnedIntroduction) {
 	}
 }
 
-func (n *Node) observe(s *session, a advert) {
+func (n *Node) receiveAdvert(s *session, a advert) {
 	p := n.policy.Load()
 	if !n.memberOf(p) {
 		return
 	}
 	s.acknowledgedIntro.Store(a.Seen)
 	if len(a.Record) > 0 {
-		n.learn(a.Record)
+		n.learnIntroduction(n.ctx, a.Record, nil)
 	}
-	if s.q != nil && a.Observed.IsValid() && !p.isOverlayAddress(a.Observed.Addr()) {
+	if !n.o.HideEndpoints && s.q != nil && a.Observed.IsValid() && !p.isOverlayAddress(a.Observed.Addr()) {
 		n.mu.Lock()
 		if p == n.policy.Load() && n.usableLocked(s) {
 			n.observations[observer{s.peer, a.Observed.Addr().Is6()}] = observation{a.Observed, time.Now().Add(time.Minute)}
 		}
 		n.mu.Unlock()
 	}
-	if len(a.Inventory) > maxEvents {
-		return
-	}
-	for _, id := range a.Inventory {
-		if len(id) != 64 {
-			continue
-		}
-		n.mu.Lock()
-		_, known := n.events[id]
-		n.mu.Unlock()
-		if !known {
-			n.tryTask(n.backgroundSlots, func() {
-				record, err := s.request(n.ctx, opGetEvent, []byte(id), pki.MaxDocument)
-				if err == nil {
-					n.acceptEvent(n.ctx, s, record)
-				}
-			})
-		}
-	}
+	n.fetchMissingPublications(s, a.Inventory)
 }
 
-type query struct {
-	ID      string
-	Target  PeerID
-	Origin  statement
-	Visited []PeerID
-}
-
-func (n *Node) lookup(ctx context.Context, target PeerID) bool {
-	origin := n.signedIntroduction(n.policy.Load(), 0)
-	if len(origin) == 0 {
-		return false
+func (n *Node) rendezvous(ctx context.Context, target PeerID) bool {
+	ctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
+	defer cancel()
+	if n.runLookup(ctx, target.IPv4(), &target) {
+		n.punch(target)
+		return true
 	}
-	var nonce [16]byte
-	rand.Read(nonce[:])
-	q := query{hex.EncodeToString(nonce[:]), target, origin, []PeerID{n.id}}
-	return len(n.relayQuery(ctx, q)) != 0
-}
-
-func (n *Node) relayQuery(ctx context.Context, q query) statement {
-	n.mu.Lock()
-	const fanout = 4
-	ss := make([]*session, 0, fanout)
-	if !slices.Contains(q.Visited, q.Target) {
-		if target := n.preferredSessionLocked(n.peers[q.Target], true, nil); target != nil {
-			ss = append(ss, target)
-		}
-	}
-	for id, paths := range n.peers {
-		if len(ss) == fanout {
-			break
-		}
-		if id != q.Target && !slices.Contains(q.Visited, id) {
-			if s := n.preferredSessionLocked(paths, true, nil); s != nil {
-				ss = append(ss, s)
-			}
-		}
-	}
-	n.mu.Unlock()
-	b, _ := json.Marshal(q)
-	for _, s := range ss {
-		if !n.usable(s) {
-			continue
-		}
-		out, err := s.request(ctx, opLookup, b, maxControlFrame)
-		if err != nil {
-			continue
-		}
-		var record statement
-		if json.Unmarshal(out, &record) != nil {
-			continue
-		}
-		if a, ok := n.learn(record); ok && a == q.Target {
-			n.punch(a)
-			return record
-		}
-	}
-	return nil
-}
-
-func (n *Node) handleLookup(s *session, c net.Conn, b []byte) {
-	var q query
-	if json.Unmarshal(b, &q) != nil || len(q.ID) != 32 || len(q.Visited) == 0 || len(q.Visited) >= maxCircuitNodes || q.Visited[len(q.Visited)-1] != s.peer || slices.Contains(q.Visited, n.id) {
-		return
-	}
-	origin, ok := n.learn(q.Origin)
-	if !ok || origin != q.Visited[0] {
-		return
-	}
-	n.mu.Lock()
-	now := time.Now()
-	for k, t := range n.queries {
-		if !now.Before(t) {
-			delete(n.queries, k)
-		}
-	}
-	if _, seen := n.queries[q.ID]; seen || len(n.queries) >= 1024 {
-		n.mu.Unlock()
-		return
-	}
-	n.queries[q.ID] = now.Add(time.Minute)
-	n.mu.Unlock()
-	var record statement
-	if q.Target == n.id {
-		n.punch(origin)
-		record = n.signedIntroduction(n.policy.Load(), 0)
-	} else {
-		q.Visited = append(q.Visited, n.id)
-		record = n.relayQuery(n.ctx, q)
-		if len(record) == 0 {
-			return
-		}
-	}
-	out, _ := json.Marshal(record)
-	writeFrame(c, out)
+	return false
 }
 
 func (n *Node) punch(a PeerID) {

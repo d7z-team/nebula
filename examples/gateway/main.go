@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
@@ -34,7 +35,18 @@ func run() error {
 	lan4, lan6 := netip.MustParsePrefix("172.30.0.0/24"), netip.MustParsePrefix("2001:db8:42::/64")
 	gw.CertificateRoutes = []netip.Prefix{lan4, lan6}
 	gw.RoutedPrefixes = []netip.Prefix{lan4, lan6}
-	nodes, err := demo.NewNodes(context.Background(), "tcp", client, gw)
+	options, err := demo.NodeOptions(client, gw)
+	if err != nil {
+		return err
+	}
+	// The client starts with only its own membership. The host has independently
+	// approved the gateway identity and the two LAN prefixes below.
+	for i := range options {
+		options[i].Topology.Members = []nebula.Member{options[i].Topology.Members[i]}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	nodes, err := demo.Listen(ctx, "tcp", options)
 	if err != nil {
 		return err
 	}
@@ -46,10 +58,27 @@ func run() error {
 			return err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := nodes[0].ConnectPeer(ctx, gw.IPv4); err != nil {
-		return fmt.Errorf("connect to gateway: %w", err)
+	ep := options[1].Topology.Members[0].Endpoints[0]
+	if _, err := nodes[0].ConnectEndpoint(ctx, ep); err != nil {
+		return err
+	}
+	host4, host6 := netip.MustParseAddr("172.30.0.20"), netip.MustParseAddr("2001:db8:42::20")
+	for _, dst := range []netip.Addr{host4, host6} {
+		matches, err := nodes[0].ResolveIP(ctx, dst)
+		if err != nil {
+			return err
+		}
+		approved := slices.ContainsFunc(matches, func(m nebula.IPMatch) bool {
+			return m.Peer.IPv4() == gw.IPv4 && m.Peer.IPv6() == gw.IPv6 && slices.Contains(gw.RoutedPrefixes, m.Prefix)
+		})
+		if !approved {
+			return fmt.Errorf("no approved gateway for %s", dst)
+		}
+	}
+	view := options[0].Topology
+	view.Members = append(view.Members, gw.Member)
+	if err := nodes[0].ApplyTopology(ctx, view); err != nil {
+		return err
 	}
 
 	stackOptions := stack.Options{
@@ -79,7 +108,6 @@ func run() error {
 		defer s.RemoveNIC(vpn)
 	}
 	gw4, gw6 := netip.MustParseAddr("172.30.0.1"), netip.MustParseAddr("2001:db8:42::1")
-	host4, host6 := netip.MustParseAddr("172.30.0.20"), netip.MustParseAddr("2001:db8:42::20")
 	routerLAN, hostLAN := pipe.New("", "", 1500)
 	if err := addNIC(router, lan, routerLAN, netip.PrefixFrom(gw4, lan4.Bits()), netip.PrefixFrom(gw6, lan6.Bits())); err != nil {
 		return err

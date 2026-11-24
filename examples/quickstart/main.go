@@ -48,16 +48,16 @@ func run() error {
 		return err
 	}
 	select {
-	case e, ok := <-sub.Events():
+	case e, ok := <-sub.Publications():
 		if !ok {
 			return fmt.Errorf("subscription closed")
 		}
 		if e.ID != id || e.Origin != bob.ID() || string(e.Payload) != "hello" {
-			return fmt.Errorf("unexpected event %s from %s", e.ID, e.Origin)
+			return fmt.Errorf("unexpected publication %s from %s", e.ID, e.Origin)
 		}
 		fmt.Printf("%s from %v\n", e.Payload, e.Origin)
 	case <-ctx.Done():
-		return fmt.Errorf("wait for event: %w", ctx.Err())
+		return fmt.Errorf("wait for publication: %w", ctx.Err())
 	}
 
 	received := make(chan []byte, 1)

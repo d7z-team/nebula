@@ -20,7 +20,8 @@ type PathStatus struct {
 	TLSVersion          uint16
 	Serial, LocalSerial string
 	Expires             time.Time
-	Endpoint            netip.AddrPort
+	// Endpoint is the physical peer address for a direct path. It is zero for a relay.
+	Endpoint netip.AddrPort
 	// Circuit lists the local endpoint, intermediate relays and peer on a relayed path.
 	Circuit     []PeerID
 	RTT, Jitter time.Duration
@@ -39,31 +40,14 @@ type PathStatus struct {
 // Paths returns a snapshot ordered by peer, preferred path first, then transport.
 func (n *Node) Paths() []PathStatus {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	out := make([]PathStatus, 0, len(n.peers))
 	for _, paths := range n.peers {
 		active := n.preferredSessionLocked(paths, false, nil)
 		for _, s := range paths.sessions {
-			leaf := s.state.PeerCertificates[0]
-			s.healthMu.Lock()
-			st := PathStatus{
-				Peer: s.peer, Transport: s.kind, Endpoint: s.remoteEndpoint(), RemoteIPLimit: s.remoteIPLimit, Circuit: slices.Clone(s.path),
-				AuthorizedUntil: s.until, ALPN: s.state.NegotiatedProtocol, TLSGroup: s.state.CurveID, TLSVersion: s.state.Version,
-				LocalSerial: s.localChain[0].SerialNumber.String(), Serial: leaf.SerialNumber.String(), Expires: leaf.NotAfter, Active: active == s,
-				RTT: s.rtt, Jitter: s.jitter, Failures: s.failures,
-				DatagramSize: s.budget.Load(), StreamFallbacks: s.overflow.Load(),
-			}
-			s.healthMu.Unlock()
-			if s.q != nil {
-				q := s.q.ConnectionStats()
-				st.RTT = q.SmoothedRTT
-				st.Jitter = q.MeanDeviation
-				st.QUICBytesSent, st.QUICBytesReceived = q.BytesSent, q.BytesReceived
-				st.QUICPacketsLost, st.QUICPacketsSent, st.CongestionWindow = q.PacketsLost, q.PacketsSent, q.CongestionWindow
-			}
-			out = append(out, st)
+			out = append(out, s.pathStatusLocked(active == s))
 		}
 	}
+	n.mu.Unlock()
 	slices.SortFunc(out, func(a, b PathStatus) int {
 		if c := comparePeer(a.Peer, b.Peer); c != 0 {
 			return c
@@ -77,6 +61,41 @@ func (n *Node) Paths() []PathStatus {
 		return cmp.Compare(a.Transport, b.Transport)
 	})
 	return out
+}
+
+// PreferredPath returns the currently preferred established path for general traffic
+// to peer. It performs no I/O and returns false if no authorized session is usable.
+// On a direct path Peer is the next hop. On a relay path Circuit[1] is the next hop.
+func (n *Node) PreferredPath(peer PeerID) (PathStatus, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	s := n.preferredSessionLocked(n.peers[peer], false, nil)
+	if s == nil {
+		return PathStatus{}, false
+	}
+	return s.pathStatusLocked(true), true
+}
+
+// The caller holds Node.mu while reading the session's authorization and path.
+func (s *session) pathStatusLocked(active bool) PathStatus {
+	leaf := s.state.PeerCertificates[0]
+	st := PathStatus{
+		Peer: s.peer, Transport: s.kind, Endpoint: s.remoteEndpoint(), RemoteIPLimit: s.remoteIPLimit, Circuit: slices.Clone(s.path),
+		AuthorizedUntil: s.until, ALPN: s.state.NegotiatedProtocol, TLSGroup: s.state.CurveID, TLSVersion: s.state.Version,
+		LocalSerial: s.localChain[0].SerialNumber.String(), Serial: leaf.SerialNumber.String(), Expires: leaf.NotAfter, Active: active,
+		DatagramSize: s.budget.Load(), StreamFallbacks: s.overflow.Load(),
+	}
+	s.healthMu.Lock()
+	st.RTT, st.Jitter, st.Failures = s.rtt, s.jitter, s.failures
+	s.healthMu.Unlock()
+	if s.q != nil {
+		q := s.q.ConnectionStats()
+		st.RTT = q.SmoothedRTT
+		st.Jitter = q.MeanDeviation
+		st.QUICBytesSent, st.QUICBytesReceived = q.BytesSent, q.BytesReceived
+		st.QUICPacketsLost, st.QUICPacketsSent, st.CongestionWindow = q.PacketsLost, q.PacketsSent, q.CongestionWindow
+	}
+	return st
 }
 
 // ControlStatus describes local node readiness and cumulative transport activity.

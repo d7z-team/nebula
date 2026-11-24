@@ -1,6 +1,6 @@
 # 集群地址与 IP 交付
 
-集群 CA 决定可分配的主地址、下游路由上限和服务地址池。拓扑决定哪些成员、网关、服务实例和组订阅在本机生效。传输层对每个实际收发的包核对拓扑与端到端会话证书。以三个节点在本机验证各类目的地址，可以运行下面的示例。[示例源码](../examples/addressing/main.go)
+集群 CA 声明成员子网、下游路由上限和服务地址池。每个成员以叶证书中的一对主地址认证。节点可通过已有邻居发现其他成员的主地址，宿主在本机拓扑中另行批准网关前缀、服务 VIP 和组投递。下面的示例用三个节点验证广播、组播和任播交付。[示例源码](../examples/addressing/main.go)
 
 ```sh
 go run ./examples/addressing
@@ -17,7 +17,7 @@ go run ./examples/addressing
 
 ## 广播与组播
 
-`Topology.EnableBroadcast` 与 `EnableMulticast` 分别控制本机的发送和接收，默认关闭。发布整份新拓扑时调用 `node.ApplyTopology(ctx, topology)`。发送者和接收者按各自的当前视图执行策略。对于组播，在接收成员的 `MulticastGroups` 中列出精确 IP；成员可以订阅多个组。下表的“同子网”指两端成员在相应地址族的主地址位于同一个 CA 子网。[拓扑字段](../topology.go)
+`Topology.EnableBroadcast` 控制广播收发，`EnableMulticast` 控制组播收发，两者默认关闭。用 `node.ApplyTopology(ctx, topology)` 更新本机视图。在接收成员的 `MulticastGroups` 中列出要订阅的组地址。发送方按自己拓扑的 `Members` 展开接收名单，接收方按自己的视图校验交付资格。下表的“同子网”指双方在相应地址族的主地址属于同一个 CA 子网。[拓扑字段](../topology.go)
 
 | 目的地址 | 远端接收者 |
 | --- | --- |
@@ -33,12 +33,12 @@ go run ./examples/addressing
 
 | 目的地址 | 宿主如何写入原始 IP 端口 |
 | --- | --- |
-| 成员主地址 | `port.WriteIP(nebula.PeerID{}, packet)` 按当前拓扑交给该地址的唯一成员。已知主地址可用 `node.LookupPeer(primary)` 取得完整 ID。 |
+| 成员主地址 | `port.WriteIP(nebula.PeerID{}, packet)` 根据本机拓扑、有效签名介绍或认证会话确定地址归属。`node.LookupPeer(primary)` 可从这些本地信息中取得完整 ID。 |
 | 广播、组播 | 传入零 ID，由端口按上表确定远端接收者。 |
 | 服务 VIP | `node.AnycastMembers(vip)` 返回本机拓扑许可的成员副本，其中可以包含本机。选定远端后调用 `port.WriteIP(peerID, packet)`。本机服务由宿主栈交付。 |
 | 下游地址 | 传入有相应路由授权的网关 ID。两个网关承载同一前缀时，原始端口的 `Deliver(from, packet)` 提供入站网关的认证 ID，宿主可以将回包写给该 ID。 |
 
-VIP 或下游地址使用零 ID 时，端口在入队前调用一次可选的 `ResolveNextHop(dst, packet)`。回调收到只读包，可以查询节点或应用的流绑定表。回调结束后，端口用最新拓扑重新检查所选成员；回调返回的错误直接交给写入方。显式下一跳、已归属的主地址和组流量均跳过回调。调用方未配置解析器或解析器返回零 ID 时，写入返回 `ErrNextHopRequired`。成员子网内未分配的普通地址返回 `ErrPeerUnavailable`。[IP 端口](../ip_port.go)
+VIP 或下游地址使用零 ID 时，端口在入队前调用一次可选的 `ResolveNextHop(dst, packet)`。回调收到只读包，可以查询节点或应用的流绑定表。回调结束后，端口用最新拓扑重新检查所选成员；回调返回的错误直接交给写入方。显式下一跳、已归属的主地址和组流量均跳过回调。调用方未配置解析器或解析器返回零 ID 时，写入返回 `ErrNextHopRequired`。目的为本机尚未知的普通主地址时，先显式调用 `ResolveIP(ctx, dst)`，选中结果后可调用 `ConnectPeerID(ctx, match.Peer)`，向该身份写包。查询下游地址可获得多个网关候选，应用可按流选定网关；宿主核准候选网关及其下游前缀后，以 `ApplyTopology` 安装本机视图。实际收发受本地拓扑和会话证书共同约束。[IP 端口](../ip_port.go)
 
 ## 任播服务
 

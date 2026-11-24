@@ -137,7 +137,7 @@ func TestCredentialAndFrameBudgets(t *testing.T) {
 	}
 	f.start()
 	for _, delta := range []int{-1, 0, 1} {
-		_, err := f.nodes[0].Publish(t.Context(), "app/test", make([]byte, maxEventPayload+delta))
+		_, err := f.nodes[0].Publish(t.Context(), "app/test", make([]byte, maxPublicationPayload+delta))
 		if delta > 0 {
 			require.Error(t, err)
 		} else {

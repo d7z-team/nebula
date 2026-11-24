@@ -113,7 +113,7 @@ func TestIntroductionLookupAndAuthorization(t *testing.T) {
 		require.NoError(t, hub.ConnectPeer(t.Context(), n.id.IPv4()))
 	}
 	for _, peer := range f.nodes[1:] {
-		require.True(t, hub.lookup(t.Context(), peer.id))
+		require.True(t, hub.rendezvous(t.Context(), peer.id))
 		hub.mu.Lock()
 		learned := hub.discovered[peer.id]
 		hub.mu.Unlock()
@@ -126,7 +126,7 @@ func TestIntroductionLookupAndAuthorization(t *testing.T) {
 	}
 	peer := f.nodes[1]
 	cutoff.Store(time.Now().Add(150 * time.Millisecond).UnixNano())
-	_, ok := hub.learn(peer.signedIntroduction(peer.policy.Load(), 0))
+	_, ok := hub.learnIntroduction(t.Context(), peer.localIntroduction(peer.policy.Load()).record, nil)
 	require.True(t, ok)
 	require.Eventually(t, func() bool {
 		hub.prunePaths()
@@ -208,6 +208,9 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	require.Len(t, status, 2)
 	require.True(t, status[0].Active)
 	require.Equal(t, ep.Address, status[0].Endpoint)
+	path, ok := a.PreferredPath(b.id)
+	require.True(t, ok)
+	require.Equal(t, status[0], path)
 	require.Equal(t, 1280, a.RecommendedMTU(b.id, true, 1280))
 	setRTTs(11, 10)
 	require.Equal(t, primary.endpoint, send(b.id.IPv4()))

@@ -26,7 +26,7 @@ jobs:
         working-directory: examples
         shell: bash
         run: |
-          for example in quickstart relay gateway pki portshare addressing anycast; do
+          for example in quickstart discovery relay gateway pki portshare addressing anycast; do
             go run "./$example"
           done
 

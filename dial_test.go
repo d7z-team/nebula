@@ -1,0 +1,190 @@
+package nebula
+
+import (
+	"context"
+	"crypto/x509"
+	"errors"
+	"net"
+	"net/netip"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestConnectEndpointTrustAndRestrictions(t *testing.T) {
+	for _, policy := range []string{"trust", "restricted"} {
+		t.Run(policy, func(t *testing.T) {
+			f := newFixture(t, "", "tcp")
+			if policy == "trust" {
+				f.opts[0] = newFixture(t, "").opts[0]
+			} else {
+				f.cfg.Members[1].Restricted = true
+			}
+			f.startDiscovery()
+			_, err := f.nodes[0].ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+			require.Error(t, err)
+			require.Empty(t, f.nodes[1].Paths())
+		})
+	}
+}
+
+func TestConnectEndpointRecoveryAfterUDPBlackout(t *testing.T) {
+	f := newFixture(t, "udp", "udp")
+	for i := range f.opts {
+		f.opts[i].Interval = 40 * time.Millisecond
+		f.opts[i].DialTimeout = 180 * time.Millisecond
+	}
+	f.startDiscovery(1, -1)
+	a, b := f.nodes[0], f.nodes[1]
+	ep := f.cfg.Members[1].Endpoints[0]
+	f.sockets[0].drop.Store(true)
+	require.Eventually(t, func() bool { return len(a.Paths()) == 0 && len(b.Paths()) == 0 }, 4*time.Second, 10*time.Millisecond)
+	_, err := a.ConnectEndpoint(t.Context(), ep)
+	require.ErrorContains(t, err, ep.Address.String())
+	var timeout net.Error
+	require.ErrorAs(t, err, &timeout)
+	require.True(t, timeout.Timeout())
+	f.sockets[0].drop.Store(false)
+	id, err := a.ConnectEndpoint(t.Context(), ep)
+	require.NoError(t, err)
+	require.Equal(t, b.ID(), id)
+	got, err := a.ResolveIP(t.Context(), id.IPv6())
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, id, got[0].Peer)
+
+	reply := make(chan string, 1)
+	_, err = a.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { reply <- string(pkt[20:]) }})
+	require.NoError(t, err)
+	port, err := b.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
+	require.NoError(t, err)
+	require.NoError(t, port.WriteIP(a.ID(), testIPv4(id.IPv4(), a.ID().IPv4(), "after recovery")))
+	select {
+	case msg := <-reply:
+		require.Equal(t, "after recovery", msg)
+	case <-time.After(time.Second):
+		t.Fatal("missing packet on recovered path")
+	}
+}
+
+func TestConnectEndpointSharesDial(t *testing.T) {
+	for _, action := range []string{"complete", "close"} {
+		t.Run(action, func(t *testing.T) {
+			f := newFixture(t, "", "tcp")
+			entered, release := make(chan struct{}, 1), make(chan struct{})
+			var dials atomic.Int32
+			f.opts[0].DialTimeout = 3 * time.Second
+			f.opts[0].DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+				dials.Add(1)
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-release:
+					return (&net.Dialer{}).DialContext(ctx, network, address)
+				}
+			}
+			f.startDiscovery()
+			a, b := f.nodes[0], f.nodes[1]
+			ep := f.cfg.Members[1].Endpoints[0]
+			waiter, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			canceled, stop := context.WithCancel(t.Context())
+			stop()
+			_, err := a.ConnectEndpoint(canceled, ep)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Zero(t, dials.Load())
+
+			first := make(chan error, 1)
+			go func() { _, err := a.ConnectEndpoint(waiter, ep); first <- err }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("dial did not start")
+			}
+			result := make(chan error, 8)
+			for range cap(result) {
+				go func() {
+					id, err := a.ConnectEndpoint(t.Context(), ep)
+					if err == nil && id != b.ID() {
+						err = errors.New("unexpected endpoint identity")
+					}
+					result <- err
+				}()
+			}
+			cancel()
+			require.ErrorIs(t, <-first, context.Canceled)
+			if action == "close" {
+				require.NoError(t, a.Close())
+			} else {
+				close(release)
+			}
+			for range cap(result) {
+				if action == "close" {
+					require.ErrorIs(t, <-result, ErrNodeClosed)
+				} else {
+					require.NoError(t, <-result)
+				}
+			}
+			require.EqualValues(t, 1, dials.Load())
+			if action == "complete" {
+				id, err := a.ConnectEndpoint(t.Context(), ep)
+				require.NoError(t, err)
+				require.Equal(t, b.ID(), id)
+				require.Len(t, a.Paths(), 1)
+				require.EqualValues(t, 1, dials.Load())
+				require.NoError(t, a.SetPeerPathPolicy(id.IPv4(), Blocked))
+				_, err = a.ConnectEndpoint(t.Context(), ep)
+				require.Error(t, err)
+				require.Empty(t, a.Paths())
+			}
+		})
+	}
+}
+
+func TestConnectEndpointOutboundTCP(t *testing.T) {
+	f := newFixture(t, "", "tcp")
+	f.start()
+	client := f.nodes[0]
+	ep := f.cfg.Members[1].Endpoints[0]
+	for _, invalid := range []Endpoint{{}, {"tcp", netip.AddrPortFrom(f.ips[1], 443)}} {
+		_, err := client.ConnectEndpoint(t.Context(), invalid)
+		require.ErrorContains(t, err, "invalid physical endpoint")
+	}
+	_, err := client.ConnectEndpoint(t.Context(), Endpoint{"udp", netip.MustParseAddrPort("[::1]:443")})
+	require.ErrorIs(t, err, ErrPeerUnavailable)
+	require.Contains(t, client.ControlStatus().LastError, "[::1]:443")
+	id, err := client.ConnectEndpoint(t.Context(), ep)
+	require.NoError(t, err)
+	require.Equal(t, f.nodes[1].ID(), id)
+}
+
+func TestConnectEndpointRequiresServerAuthorization(t *testing.T) {
+	for _, transport := range []string{"udp", "tcp"} {
+		t.Run(transport, func(t *testing.T) {
+			f := newFixture(t, transport, transport)
+			bID := labPeer(f.ips[1])
+			denied := errors.New("server use denied")
+			f.opts[0].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+				if c.Member == bID && c.Usage == x509.ExtKeyUsageServerAuth {
+					return time.Time{}, denied
+				}
+				return time.Time{}, nil
+			}
+			f.startDiscovery(-1, 0)
+			a := f.nodes[0]
+			require.Eventually(t, func() bool {
+				_, ok := a.PreferredPath(bID)
+				return ok
+			}, time.Second, time.Millisecond)
+			require.NoError(t, a.ConnectPeerID(t.Context(), bID))
+			_, err := a.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+			require.ErrorIs(t, err, denied)
+		})
+	}
+}

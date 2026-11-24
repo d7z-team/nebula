@@ -99,21 +99,36 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 		cert := f.issue(id, pki.Scope{})
 		o := Options{Roots: roots, ClusterCA: ca, Certificates: LocalCertificates{Client: cert}, Interval: 120 * time.Millisecond, DialTimeout: 700 * time.Millisecond}
 		m := Member{IPv4: a, IPv6: id.IPv6(), Topics: []string{"app/test"}}
-		bind := "127.0.0.1:0"
+		const loopback = "127.0.0.1:0"
 		var sock *meteredSocket
 		if kind == "udp" || kind == "both" {
-			pc, e := net.ListenPacket("udp4", bind)
-			require.NoError(t, e)
+			var pc net.PacketConn
+			for attempt := 1; ; attempt++ {
+				pc, e = net.ListenPacket("udp4", loopback)
+				require.NoError(t, e)
+				if kind == "udp" {
+					break
+				}
+				// An ephemeral port assigned by UDP may already be in use by TCP.
+				o.TCP4, e = net.Listen("tcp4", pc.LocalAddr().String())
+				if e == nil {
+					break
+				}
+				pc.Close()
+				if attempt == 8 {
+					t.Fatal(e)
+				}
+			}
 			sock = &meteredSocket{PacketConn: pc, sent: map[netip.AddrPort]int{}, limit: 1200}
 			o.UDP4 = sock
-			bind = pc.LocalAddr().String()
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "udp", Address: addrPort(pc.LocalAddr())})
 			t.Cleanup(func() { pc.Close() })
 		}
-		if kind == "tcp" || kind == "both" {
-			l, e := net.Listen("tcp4", bind)
+		if kind == "tcp" {
+			o.TCP4, e = net.Listen("tcp4", loopback)
 			require.NoError(t, e)
-			o.TCP4 = l
+		}
+		if l := o.TCP4; l != nil {
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "tcp", Address: addrPort(l.Addr())})
 			t.Cleanup(func() { l.Close() })
 		}
@@ -141,14 +156,33 @@ func (f *fixture) issue(id PeerID, scope pki.Scope) tls.Certificate {
 func (f *fixture) start() {
 	f.t.Helper()
 	for _, o := range f.opts {
-		o.Topology = f.cfg
-		n, e := New(context.Background(), o)
+		if o.Topology.Members == nil {
+			o.Topology = f.cfg
+		}
+		n, e := New(f.t.Context(), o)
 		require.NoError(f.t, e)
 		f.nodes = append(f.nodes, n)
 		f.t.Cleanup(func() { n.Close() })
 	}
 	for _, n := range f.nodes {
 		require.NoError(f.t, n.Start())
+	}
+}
+
+// Each node starts with its own member only. A nonnegative entry makes
+// that node dial the specified neighbor's physical endpoint.
+func (f *fixture) startDiscovery(neighbors ...int) {
+	f.t.Helper()
+	for i := range f.opts {
+		f.opts[i].Topology = Topology{Network: f.cfg.Network, Members: []Member{f.cfg.Members[i]}}
+	}
+	f.start()
+	for i, neighbor := range neighbors {
+		if neighbor >= 0 {
+			id, err := f.nodes[i].ConnectEndpoint(f.t.Context(), f.cfg.Members[neighbor].Endpoints[0])
+			require.NoError(f.t, err)
+			require.Equal(f.t, f.nodes[neighbor].ID(), id)
+		}
 	}
 }
 
@@ -218,6 +252,8 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
 	f.cfg.Members[0].Links = nil
 	require.NoError(t, x.ApplyTopology(t.Context(), f.cfg))
+	require.ErrorIs(t, out.WriteIP(labPeer(b), packets[2]), ErrAddressUnauthorized)
+	require.NoError(t, x.SetPeerPathPolicy(b, Blocked))
 	require.Empty(t, x.Paths())
 	require.NoError(t, y.ApplyTopology(t.Context(), f.cfg))
 	require.False(t, y.ControlStatus().Ready)
@@ -536,7 +572,12 @@ func TestNodeLifecycle(t *testing.T) {
 	checkOperations := func(want error) {
 		t.Helper()
 		require.ErrorIs(t, n.ConnectPeer(t.Context(), peer), want)
-		_, err := n.Publish(t.Context(), "app/test", nil)
+		require.ErrorIs(t, n.ConnectPeerID(t.Context(), labPeer(peer)), want)
+		_, err := n.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+		require.ErrorIs(t, err, want)
+		_, err = n.ResolveIP(t.Context(), peer)
+		require.ErrorIs(t, err, want)
+		_, err = n.Publish(t.Context(), "app/test", nil)
 		require.ErrorIs(t, err, want)
 		require.ErrorIs(t, port.WriteIP(labPeer(peer), ip), want)
 	}
@@ -548,6 +589,6 @@ func TestNodeLifecycle(t *testing.T) {
 	require.NoError(t, n.Close())
 	require.ErrorIs(t, n.Start(), ErrNodeClosed)
 	checkOperations(ErrNodeClosed)
-	_, open := <-sub.Events()
+	_, open := <-sub.Publications()
 	require.False(t, open)
 }

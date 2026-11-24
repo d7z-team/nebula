@@ -8,7 +8,7 @@
 | 根与中间 CA | `CreateRoot`、`Issuer.IssueCA` | 根使用自己的签名器。签发中间 CA 时提供 CSR、获批签发配置和独立批准的 SPKI SHA-256。签发库验证 CSR 签名、公钥指纹及上级约束。 |
 | 申请与签发叶证书 | `CreateCSR`、`Issuer.IssueLeaf` | 申请者提交自签名 CSR。签发者以独立批准的 SPKI SHA-256、一个 IPv4 和一个 IPv6 SAN、网络、下游路由前缀、用途和有效期构造证书。签发端逐一用给定签发链验证所申请的 EKU，可在签发时发现上级 CA 对用途的限制。CA 和叶密钥可以使用不同算法。 |
 | 装载与验证 | `tls.LoadX509KeyPair`、`ParseCertificatesPEM`、`ParseChain`、`VerifyChain` | PEM 文件可包含多张证书；TLS 的 DER 链每个元素恰为一张证书，叶在前。验证时给出可信根、固定的集群 CA 规划、完整地址对、用途和时刻。 |
-| 签发与验证对象 | `pki.SignObject`、`pki.VerifyObjectSignature` | 提供用途、网络名和正文。验证签名后用 `VerifyChain` 建立对签名者的信任，再检查成员绑定和主题授权。节点的事件与介绍接收入口已完成上述检查。 |
+| 签发与验证对象 | `pki.SignObject`、`pki.VerifyObjectSignature` | 提供用途、网络名和正文。验证签名后用 `VerifyChain` 建立对签名者的信任，再检查成员绑定和主题授权。节点的主题消息与介绍接收入口已完成上述检查。 |
 
 ## 进程内签发与验证
 
@@ -92,19 +92,19 @@ opts.CheckChain = func(ctx context.Context, check nebula.ChainCheck) (time.Time,
 }
 ```
 
-取得宿主已核准的撤回决定后，先更新同一份授权数据，再复查节点。`Revalidate` 会重新审核本机凭据、现有会话和缓存事件。`ApplyTopology` 则用于替换整份成员和路由视图。用 `pki.ReadClusterCA` 读取固定 CA 的规划后，独立调用 `pki.VerifyChain` 验证证书地址对、网络、用途和委派，拓扑成员资格由宿主或节点另行核对。
-
-一张仍有效的成员证书可以保有 VIP 授权，而业务已停止接收新连接。计划内排空时，宿主先调整新连接的选择；需要立即停止本机向该成员交付 VIP 流量时，从本机拓扑的该成员上撤回 VIP。会话仍可承载其他获准地址。整张证书失去信任时，使用下方的授权复查流程。[任播授权与排空](addressing.md#任播服务)
+宿主撤回对某张证书的信任后，更新钩子读取的授权数据，再调用 `Revalidate` 复查本机凭据、现有会话和缓存主题消息。
 
 ```go
 denied.Store(sha256.Sum256(withdrawn.Raw), struct{}{})
 return node.Revalidate(ctx)
 ```
 
+只调整网关前缀、VIP 或发布权限时，用 `ApplyTopology` 安装新的成员视图。计划摘除任播实例时，宿主可先将新连接分给其他实例，等旧连接排空后再撤回该成员的 VIP。[任播授权与排空](addressing.md#任播服务)
+
 ## 签名对象
 
-直接消费 CMS 的应用可运行 `go test -v -run '^ExampleVerifyObjectSignature$' ./pki`。先用 `VerifyObjectSignature` 核对正文签名、网络和用途，再用宿主配置的发布者身份、可信根、集群 CA 以及 `codeSigning` 调用 `VerifyChain`，通过该业务的发布者授权后使用正文。通过 `Node.Subscribe` 接收的原生事件已经过节点的证书、成员及主题授权检查。[独立验签示例](../pki/example_test.go)
+节点用 CMS（Cryptographic Message Syntax）的 SignedData 封装签名主题消息和成员介绍。独立验签时，向 `VerifyObjectSignature` 传入预期网络和用途：主题消息使用 `publication`，成员介绍使用 `introduction`。核对签名后，用可信根、集群 CA、预期发布者身份及 `codeSigning` 调用 `VerifyChain`，再检查正文中的成员绑定和业务权限。`Node.Subscribe` 交付的消息已经过节点校验。运行 `go test -v -run '^ExampleVerifyObjectSignature$' ./pki` 可验证独立验签流程。[签名正文格式](mesh.md#控制消息的-json-格式) · [独立验签示例](../pki/example_test.go)
 
-CMS 使用 DER 编码的封装型 SignedData，包含一个 SignerInfo、叶证书和所提供的中间证书。签名属性包含 content-type 与 message-digest。签名正文将网络、用途、叶证书的 SHA-256 和业务内容绑定在一起；发布者的网络成员 ID 位于业务内容中。实现覆盖 Ed25519、ECDSA、RSA 和 ML-DSA。签名证书与签发 CA 可以采用不同的算法。事件接收方逐次验证原发布者，转发者的连接身份只说明直接来源。[CMS 格式](https://www.rfc-editor.org/rfc/rfc5652) · [签名与解析](../pki/cms.go) · [签发与互操作测试](../pki/pki_test.go)
+CMS 使用 DER 编码的封装型 SignedData，包含一个 SignerInfo、叶证书和所提供的中间证书。签名属性包含 content-type 与 message-digest。签名正文将网络、用途、叶证书的 SHA-256 和业务内容绑定在一起；发布者的网络成员 ID 位于业务内容中。实现覆盖 Ed25519、ECDSA、RSA 和 ML-DSA。签名证书与签发 CA 可以采用不同的算法。主题消息接收方逐次验证原发布者，转发者的连接身份只说明直接来源。[CMS 格式](https://www.rfc-editor.org/rfc/rfc5652) · [签名与解析](../pki/cms.go) · [签发与互操作测试](../pki/pki_test.go)
 
 节点在创建或热加载凭据时，要求对象签名证书链中所有 DER 证书的字节数加上叶证书的 `RawIssuer` 长度合计不超过 24 KiB。CMS 也用签发者和序列号标识签名者，因此签发者名称需要单独计入。完整 CMS DER 的上限为 44 KiB。端点介绍随 JSON 通告传送，通告还须容纳观察地址等字段并满足 64 KiB 控制帧预算。使用较长的中间 CA 链或较大的密钥时，应按实际 DER 长度核算。若节点需要独立的发布证书，可通过 `LocalCertificates.Object` 配置。[凭据装载](../identity.go) · [CMS 尺寸限制](../pki/cms.go)

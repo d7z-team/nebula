@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
+	"code.d7z.net/d7z-team/nebula/meshwire"
 	"code.d7z.net/d7z-team/nebula/nebulagvisor"
 	"code.d7z.net/d7z-team/nebula/pki"
 	"code.d7z.net/d7z-team/nebula/portshare"
@@ -215,13 +216,9 @@ func waitPath(t *testing.T, a, b *host, kind string) nebula.PathStatus {
 	t.Helper()
 	var path nebula.PathStatus
 	require.Eventually(t, func() bool {
-		for _, p := range a.node.Paths() {
-			if p.Peer == labPeer(b.ip) && p.Active && p.Transport == kind {
-				path = p
-				return true
-			}
-		}
-		return false
+		var ok bool
+		path, ok = a.node.PreferredPath(b.node.ID())
+		return ok && path.Transport == kind
 	}, 12*time.Second, 15*time.Millisecond, "%s -> %s: expected active %s", a.ip, b.ip, kind)
 	t.Logf("path %s -> %s via %s endpoint=%s circuit=%v serial=%s localSerial=%s", a.ip, b.ip, kind, path.Endpoint, path.Circuit, path.Serial, path.LocalSerial)
 	return path
@@ -273,7 +270,7 @@ func forwardingPair(t *testing.T) (client, gateway *nebula.Node) {
 	return c.node, g.node
 }
 
-func eventReceipt(t *testing.T, a, b *host, payload string) {
+func publicationReceipt(t *testing.T, a, b *host, payload string) {
 	t.Helper()
 	sub, err := b.node.Subscribe("app/test")
 	require.NoError(t, err)
@@ -283,14 +280,14 @@ func eventReceipt(t *testing.T, a, b *host, payload string) {
 	deadline := time.After(4 * time.Second)
 	for {
 		select {
-		case event := <-sub.Events():
-			if event.ID == id {
-				require.Equal(t, labPeer(a.ip), event.Origin)
-				require.Equal(t, payload, string(event.Payload))
+		case publication := <-sub.Publications():
+			if publication.ID == id {
+				require.Equal(t, labPeer(a.ip), publication.Origin)
+				require.Equal(t, payload, string(publication.Payload))
 				return
 			}
 		case <-deadline:
-			t.Fatalf("missing event %s from %s", id, a.ip)
+			t.Fatalf("missing publication %s from %s", id, a.ip)
 		}
 	}
 }
@@ -306,12 +303,12 @@ func TestMixedTLSCredentials(t *testing.T) {
 			l.start()
 			p := l.connect(a, b, tc.transport)
 			require.EqualValues(t, tls.VersionTLS13, p.TLSVersion)
-			require.Equal(t, nebula.ALPN, p.ALPN)
+			require.Equal(t, meshwire.ALPN, p.ALPN)
 			require.Equal(t, tls.X25519MLKEM768, p.TLSGroup)
 			require.Equal(t, b.options.Certificates.Client.Leaf.SerialNumber.String(), p.Serial)
 			require.Equal(t, a.options.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).Serial)
-			eventReceipt(t, a, b, "client publication")
-			eventReceipt(t, b, a, "server publication")
+			publicationReceipt(t, a, b, "client publication")
+			publicationReceipt(t, b, a, "server publication")
 		})
 	}
 }
@@ -335,12 +332,8 @@ func TestDualUnderlayFamilyFailover(t *testing.T) {
 			roundTrip(t, c6, s6)
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.segment == "wan4"} })
 			require.Eventually(t, func() bool {
-				for _, path := range a.node.Paths() {
-					if path.Peer == b.node.ID() && path.Transport == kind && path.Active && path.Endpoint.Addr().Is6() {
-						return true
-					}
-				}
-				return false
+				path, ok := a.node.PreferredPath(b.node.ID())
+				return ok && path.Transport == kind && path.Endpoint.Addr().Is6()
 			}, 12*time.Second, 20*time.Millisecond)
 			roundTrip(t, c4, s4)
 			roundTrip(t, c6, s6)

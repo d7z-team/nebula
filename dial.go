@@ -3,6 +3,7 @@ package nebula
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net"
 	"net/netip"
@@ -34,7 +35,33 @@ type directDial struct {
 // A canceled context cannot start a new dial. Once started, a dial belongs
 // to the node. Canceling ctx ends only this caller's wait.
 func (n *Node) ConnectPeer(ctx context.Context, address netip.Addr) error {
-	return n.connectPeer(ctx, n.policy.Load().owners[address], nil)
+	peer, _ := n.LookupPeer(address)
+	return n.connectPeer(ctx, peer, nil)
+}
+
+// ConnectPeerID waits for a path authenticated as the exact certified address
+// pair. Use it with IPMatch.Peer to keep the selected identity across topology
+// updates. It shares in-flight attempts with ConnectPeer.
+func (n *Node) ConnectPeerID(ctx context.Context, peer PeerID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.Cluster().ValidateMember(peer); err != nil {
+		return errors.Join(ErrPeerUnavailable, err)
+	}
+	return n.connectPeer(ctx, peer, nil)
+}
+
+// ConnectEndpoint connects to a physical TCP or UDP endpoint and returns the
+// authenticated member on the registered direct path. Concurrent calls to the
+// same endpoint share a dial. Canceling ctx ends this caller's wait. The node
+// owns the bounded dial and the resulting session. The caller chooses when to retry.
+func (n *Node) ConnectEndpoint(ctx context.Context, ep Endpoint) (PeerID, error) {
+	s, err := n.dialEndpoint(ctx, PeerID{}, ep)
+	if err != nil {
+		return PeerID{}, fmt.Errorf("connect %s %s: %w", ep.Network, ep.Address, err)
+	}
+	return s.peer, nil
 }
 
 func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}) error {
@@ -177,7 +204,7 @@ func (n *Node) dialDirect(ctx context.Context, peer PeerID) (*session, error) {
 			return s, nil
 		}
 		if pass == 0 {
-			if n.lookup(ctx, peer) {
+			if n.rendezvous(ctx, peer) {
 				// Both peers have had a chance to open their UDP filters.
 				maps.DeleteFunc(tried, func(e Endpoint, _ bool) bool { return e.Network == "udp" })
 			}
@@ -250,7 +277,20 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 	key := directDial{peer, e}
 	for {
 		n.mu.Lock()
-		if !n.modeLocked(peer).allowsDirect() || !n.endpointAllowedLocked(e.Network, e.Address, false) {
+		if err := ctx.Err(); err != nil {
+			n.mu.Unlock()
+			return nil, err
+		}
+		if err := n.state.runningError(); err != nil {
+			n.mu.Unlock()
+			return nil, err
+		}
+		byEndpoint := peer == (PeerID{})
+		if byEndpoint && (!e.Valid() || n.policy.Load().isOverlayAddress(e.Address.Addr())) {
+			n.mu.Unlock()
+			return nil, errors.New("invalid physical endpoint")
+		}
+		if (!byEndpoint && !n.modeLocked(peer).allowsDirect()) || !n.endpointAllowedLocked(e.Network, e.Address, false) {
 			n.mu.Unlock()
 			return nil, ErrPathPolicy
 		}
@@ -258,34 +298,48 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 			n.mu.Unlock()
 			return s, nil
 		}
-		pending := n.directDials[key]
-		if pending == nil {
-			break
+		a := n.directDials[key]
+		if a == nil {
+			a = &endpointAttempt{done: make(chan struct{})}
+			n.directDials[key] = a
+			if !byEndpoint {
+				// A peer dial races transports and cancels the losing candidate.
+				n.mu.Unlock()
+				n.finishEndpointDial(ctx, key, a)
+				return a.session, a.err
+			}
+			n.wg.Go(func() { n.finishEndpointDial(n.ctx, key, a) })
 		}
 		n.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-pending.done:
-			// Another caller may have won its race on the other transport.
-			if !errors.Is(pending.err, context.Canceled) || ctx.Err() != nil {
-				return pending.session, pending.err
+		case <-n.ctx.Done():
+			return nil, ErrNodeClosed
+		case <-a.done:
+			if n.ctx.Err() != nil {
+				return nil, ErrNodeClosed
 			}
+			if byEndpoint || !errors.Is(a.err, context.Canceled) || ctx.Err() != nil {
+				return a.session, a.err
+			}
+			// The originating peer dial won on its other transport. Try again.
 		}
 	}
-	a := &endpointAttempt{done: make(chan struct{})}
-	n.directDials[key] = a
-	n.mu.Unlock()
+}
+
+func (n *Node) finishEndpointDial(ctx context.Context, key directDial, a *endpointAttempt) {
+	e, peer := key.endpoint, key.peer
 	dctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
 	defer cancel()
 	if e.Network == "udp" {
 		if transport := n.transports[e.Address.Addr().Is6()]; transport == nil {
-			a.err = ErrPeerUnavailable
+			a.err = fmt.Errorf("%w: no UDP socket for address family of %s", ErrPeerUnavailable, e.Address.Addr())
 		} else {
 			var q *quic.Conn
 			q, a.err = transport.Dial(dctx, net.UDPAddrFromAddrPort(e.Address), n.tlsConfig(peer, false), transport.config)
 			if a.err == nil {
-				a.session, a.err = n.attachQUIC(dctx, q, peer)
+				a.session, a.err = n.attachQUIC(dctx, q, peer, true)
 			}
 		}
 	} else {
@@ -307,8 +361,10 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 		}
 	}
 	n.mu.Lock()
+	if peer == (PeerID{}) && a.err != nil && n.ctx.Err() == nil {
+		n.lastConnectError = fmt.Sprintf("connect %s %s: %v", e.Network, e.Address, a.err)
+	}
 	delete(n.directDials, key)
 	close(a.done)
 	n.mu.Unlock()
-	return a.session, a.err
 }

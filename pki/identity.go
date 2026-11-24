@@ -60,6 +60,10 @@ type Scope struct {
 	AnycastPools []netip.Prefix
 	AnycastIPs   []netip.Addr
 }
+
+// AllowsRoute reports whether the scope delegates all of p.
+func (s Scope) AllowsRoute(p netip.Prefix) bool { return covers(s.RoutedPrefixes, p) }
+
 type scopeDER struct {
 	Network  string `asn1:"utf8"`
 	Prefixes []prefixDER
@@ -194,7 +198,7 @@ func checkDelegation(leaf Scope, ancestors []*x509.Certificate) (*x509.Certifica
 			return nil, errors.New("issuer network mismatch")
 		}
 		for _, p := range leaf.RoutedPrefixes {
-			if !covers(s.RoutedPrefixes, p) {
+			if !s.AllowsRoute(p) {
 				return nil, fmt.Errorf("issuer does not delegate route %s", p)
 			}
 		}

@@ -102,49 +102,6 @@ func TestLiveCertificateExpiry(t *testing.T) {
 	require.Equal(t, fresh.Leaf.SerialNumber.String(), f.nodes[0].Paths()[0].Serial)
 }
 
-func TestEventRepairAndPolicyWithdrawal(t *testing.T) {
-	f := newFixture(t, "tcp", "tcp", "tcp")
-	// The first delivery uses push. Only the late joiner polls for inventory.
-	f.opts[0].Interval, f.opts[1].Interval = time.Hour, time.Hour
-	f.start()
-	a, mid, b := f.nodes[0], f.nodes[1], f.nodes[2]
-	require.NoError(t, a.ConnectPeer(t.Context(), mid.id.IPv4()))
-	sub, err := b.Subscribe("app/test/update")
-	require.NoError(t, err)
-	defer sub.Close()
-	id, err := a.Publish(t.Context(), "app/test/update", []byte("revision"))
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		mid.mu.Lock()
-		defer mid.mu.Unlock()
-		_, ok := mid.events[id]
-		return ok
-	}, 2*time.Second, 10*time.Millisecond)
-	require.NoError(t, b.ConnectPeer(t.Context(), mid.id.IPv4()))
-	select {
-	case event := <-sub.Events():
-		require.Equal(t, id, event.ID)
-		require.Equal(t, a.id, event.Origin)
-	case <-time.After(3 * time.Second):
-		t.Fatal("inventory did not repair missed event")
-	}
-	mid.mu.Lock()
-	cached := mid.events[id].record
-	mid.mu.Unlock()
-	duplicate, err := b.acceptEvent(t.Context(), nil, cached)
-	require.NoError(t, err)
-	require.Equal(t, id, duplicate)
-	require.Empty(t, sub.Events())
-	f.cfg.Members[0].Topics = []string{"app/metrics"}
-	require.NoError(t, b.ApplyTopology(t.Context(), f.cfg))
-	_, err = b.acceptEvent(t.Context(), nil, cached)
-	require.ErrorIs(t, err, ErrPathPolicy)
-	b.mu.Lock()
-	_, ok := b.events[id]
-	b.mu.Unlock()
-	require.False(t, ok)
-}
-
 func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	a, b := f.ips[0], f.ips[1]
@@ -184,16 +141,16 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	id, err := x.Publish(t.Context(), "app/test/control", []byte("host decision"))
 	require.NoError(t, err)
 	select {
-	case got := <-sub.Events():
+	case got := <-sub.Publications():
 		require.Equal(t, id, got.ID)
 	case <-time.After(time.Second):
-		t.Fatal("missing signed event")
+		t.Fatal("missing signed publication")
 	}
 	deny.Store(true)
 	require.NoError(t, y.Revalidate(t.Context()))
 	require.Same(t, s, y.preferredSession(labPeer(a), false))
 	y.mu.Lock()
-	_, cached := y.events[id]
+	_, cached := y.publications[id]
 	y.mu.Unlock()
 	require.False(t, cached)
 	// A peer's TLS key cannot stand in for this member's delegated object key.
@@ -394,6 +351,7 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	owner, ok := a.LookupPeer(b.id.IPv4())
 	require.True(t, ok)
 	require.Equal(t, next, owner)
+	require.ErrorIs(t, a.ConnectPeerID(t.Context(), b.id), ErrPathPolicy)
 	require.ErrorIs(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), next.IPv4(), "stale binding")), ErrPeerUnavailable)
 	require.Error(t, a.ConnectPeer(t.Context(), next.IPv4()))
 	require.Error(t, port.WriteIP(b.id, testIPv6(a.id.IPv6(), b.id.IPv6(), 1280)))

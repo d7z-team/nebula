@@ -79,8 +79,8 @@ func NewNodes(ctx context.Context, transport string, hosts ...Host) ([]*nebula.N
 }
 
 // Listen binds loopback sockets and constructs the nodes prepared by NodeOptions.
-// On success it records the sockets and bound endpoints in options. Each view
-// can list a different set of members in any order.
+// On success it records the sockets in options. For each host with HideEndpoints
+// unset, it adds its bound address to each topology that lists the host.
 func Listen(ctx context.Context, transport string, options []nebula.Options) (nodes []*nebula.Node, err error) {
 	var owners []io.Closer
 	defer func() {
@@ -126,7 +126,11 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 		default:
 			return nil, fmt.Errorf("unknown transport %q", transport)
 		}
-		endpoints[identity.ID] = nebula.Endpoint{Network: transport, Address: address}
+		ep := nebula.Endpoint{}
+		if !o.HideEndpoints {
+			ep = nebula.Endpoint{Network: transport, Address: address}
+		}
+		endpoints[identity.ID] = ep
 	}
 	nodes = make([]*nebula.Node, len(options))
 	for i := range prepared {
@@ -138,7 +142,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 			if err != nil {
 				return nil, err
 			}
-			if ep, ok := endpoints[id]; ok && !slices.Contains(m.Endpoints, ep) {
+			if ep := endpoints[id]; ep.Valid() && !slices.Contains(m.Endpoints, ep) {
 				m.Endpoints = append([]nebula.Endpoint{ep}, m.Endpoints...)
 			}
 		}

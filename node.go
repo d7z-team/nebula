@@ -53,6 +53,12 @@ type Options struct {
 	DialTCP func(context.Context, string, string) (net.Conn, error)
 	// AdvertiseEndpoints adds reachable physical addresses to signed introductions.
 	AdvertiseEndpoints []Endpoint
+	// HideEndpoints omits all physical endpoints from this node's signed introductions,
+	// including AdvertiseEndpoints, local topology entries, listeners and NAT mappings.
+	// Incoming rendezvous requests receive the signed record without a UDP punch.
+	// Direct neighbors still see the connection address. Use Member.Restricted
+	// and Member.Links to limit which members may connect directly.
+	HideEndpoints bool
 	// Interval is the path maintenance interval. The default is two seconds.
 	Interval time.Duration
 	// DialTimeout bounds individual dial and control exchanges. The default is four seconds.
@@ -80,18 +86,20 @@ type Node struct {
 	done                   chan struct{}
 	cred                   atomic.Pointer[credentials]
 	policy                 atomic.Pointer[topologyView]
-	admissions             uint64 // increments when a session or event joins the live set
+	admissions             uint64 // increments when a session or publication joins the live set
 	introMu                sync.Mutex
 	introCache             cachedIntroduction
 	transports             map[bool]*udpTransport
 	peers                  map[PeerID]*peerPaths
 	modes                  map[PeerID]PathMode
 	discovered             map[PeerID]learnedIntroduction
+	discoveredOwners       map[netip.Addr]PeerID
 	attempts               map[PeerID]*peerAttempt
 	directDials            map[directDial]*endpointAttempt
 	observations           map[observer]observation
 	introduced             map[Endpoint]map[PeerID]time.Time
 	deniedUDP              map[netip.AddrPort]deniedEndpoint
+	resolutions            map[netip.Addr]*ipResolution
 	queries                map[string]time.Time
 	backgroundSlots        chan struct{}
 	sharedAddressDialSlots chan struct{}
@@ -106,7 +114,7 @@ type Node struct {
 	rateCancel             context.CancelFunc
 	bytesScheduled         atomic.Uint64
 	dialFailures           atomic.Uint64
-	events                 map[string]cachedEvent
+	publications           map[string]cachedPublication
 	subscriptions          map[*Subscription]struct{}
 	lastConnectError       string
 	listenerErrors         map[string]string
@@ -133,10 +141,11 @@ func (s lifecycle) runningError() error {
 
 // New creates a node with the supplied credentials and topology. On success,
 // the node owns the supplied sockets and listeners. Close releases them even before Start.
+// With no sockets or listeners the node can still dial outbound TCP.
 // Canceling parent shuts down a started node.
 func New(parent context.Context, o Options) (*Node, error) {
-	if parent == nil || (o.UDP4 == nil && o.UDP6 == nil && o.TCP4 == nil && o.TCP6 == nil && o.DialTCP == nil) {
-		return nil, errors.New("context and transport required")
+	if parent == nil {
+		return nil, errors.New("parent context required")
 	}
 	if o.Roots == nil {
 		return nil, errors.New("explicit trust roots required")
@@ -201,10 +210,12 @@ func New(parent context.Context, o Options) (*Node, error) {
 		probeSlots:             make(chan struct{}, 4),
 		circuits:               make(map[*circuitLease]struct{}),
 		discovered:             make(map[PeerID]learnedIntroduction),
+		discoveredOwners:       make(map[netip.Addr]PeerID),
 		introduced:             make(map[Endpoint]map[PeerID]time.Time),
 		observations:           make(map[observer]observation),
+		resolutions:            make(map[netip.Addr]*ipResolution),
 		queries:                make(map[string]time.Time),
-		events:                 make(map[string]cachedEvent),
+		publications:           make(map[string]cachedPublication),
 		subscriptions:          make(map[*Subscription]struct{}),
 		handshakeSlots:         make(chan struct{}, 128),
 		backgroundSlots:        make(chan struct{}, 12),
@@ -292,7 +303,7 @@ func (n *Node) Start() error {
 				if err != nil {
 					return
 				}
-				if !n.tryTask(n.handshakeSlots, func() { n.attachQUIC(n.ctx, q, PeerID{}) }) {
+				if !n.tryTask(n.handshakeSlots, func() { n.attachQUIC(n.ctx, q, PeerID{}, false) }) {
 					q.CloseWithError(0, "closing")
 				}
 			}
@@ -349,7 +360,7 @@ func (n *Node) Close() error {
 	clear(n.peers)
 	p := n.port
 	for sub := range n.subscriptions {
-		close(sub.events)
+		close(sub.publications)
 		delete(n.subscriptions, sub)
 	}
 	n.mu.Unlock()

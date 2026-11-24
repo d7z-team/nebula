@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
-	"strings"
+	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
 )
@@ -30,7 +30,8 @@ type Member struct {
 	IPv6 netip.Addr `json:"ipv6"`
 	// Links declares reciprocal neighbors to maintain and use as circuit hops.
 	Links []PeerID `json:"links,omitempty"`
-	// Endpoints lists reachable physical addresses of this member.
+	// Endpoints lists host-configured physical addresses. A member that dials
+	// its neighbors can serve as a circuit hop with an empty list.
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 	// RoutedPrefixes enables downstream prefixes within the session certificate's authority.
 	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
@@ -149,19 +150,6 @@ func (s *topologyView) groupRecipients(from PeerID, dst netip.Addr) ([]PeerID, b
 
 func comparePeer(a, b PeerID) int { return bytes.Compare(a[:], b[:]) }
 
-// ValidTopic reports whether s is a valid application event topic.
-func ValidTopic(s string) bool {
-	if len(s) > 128 || !strings.HasPrefix(s, "app/") {
-		return false
-	}
-	for p := range strings.SplitSeq(s, "/") {
-		if !pki.ValidName(p) {
-			return false
-		}
-	}
-	return true
-}
-
 // Validate checks the topology using the same rules as New and ApplyTopology.
 func (c Topology) Validate(cluster pki.Cluster) error {
 	_, err := c.compile(cluster)
@@ -266,10 +254,50 @@ func (s *topologyView) indexMember(m Member) error {
 	return nil
 }
 
-// LookupPeer returns the member owning the exact primary address in the local topology.
+// acceptsIdentity prevents dynamic discovery from overriding a configured primary address.
+func (s *topologyView) acceptsIdentity(id PeerID) bool {
+	for _, addr := range []netip.Addr{id.IPv4(), id.IPv6()} {
+		if owner, ok := s.owners[addr]; ok && owner != id {
+			return false
+		}
+	}
+	return true
+}
+
+// LookupPeer returns the configured or authenticated owner of a primary address from local state.
 func (n *Node) LookupPeer(primary netip.Addr) (PeerID, bool) {
-	id, ok := n.policy.Load().owners[primary]
-	return id, ok
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	id := n.ownerLocked(primary)
+	return id, id != (PeerID{})
+}
+
+func (n *Node) conflictingOwnerLocked(id PeerID) bool {
+	for _, addr := range []netip.Addr{id.IPv4(), id.IPv6()} {
+		if owner := n.ownerLocked(addr); owner != (PeerID{}) && owner != id {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *Node) ownerLocked(addr netip.Addr) PeerID {
+	p := n.policy.Load()
+	if id, ok := p.owners[addr]; ok {
+		return id
+	}
+	if !p.cluster.Subnet(addr).IsValid() {
+		return PeerID{}
+	}
+	if id, ok := n.discoveredOwners[addr]; ok && time.Now().Before(n.discovered[id].authorizedUntil) {
+		return id
+	}
+	for id, paths := range n.peers {
+		if (addr == id.IPv4() || addr == id.IPv6()) && n.preferredSessionLocked(paths, false, nil) != nil {
+			return id
+		}
+	}
+	return PeerID{}
 }
 
 // AnycastMembers returns a copy of the members permitted to carry vip in the

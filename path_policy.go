@@ -53,7 +53,7 @@ func (n *Node) modeLocked(a PeerID) PathMode {
 		return Blocked
 	}
 	m := p.members[n.id]
-	if _, ok := p.members[a]; !ok {
+	if !p.acceptsIdentity(a) {
 		return Blocked
 	}
 	if (m.Restricted || p.members[a].Restricted) && !slices.Contains(m.Links, a) {
@@ -69,7 +69,19 @@ func (n *Node) modeLocked(a PeerID) PathMode {
 // disallowed paths. It may be called before Start.
 func (n *Node) SetPeerPathPolicy(address netip.Addr, mode PathMode) error {
 	n.mu.Lock()
-	a := n.policy.Load().owners[address]
+	a := n.ownerLocked(address)
+	if a == (PeerID{}) {
+		// A blocked peer can outlive its signed introduction.
+		for id := range n.modes {
+			if address == id.IPv4() || address == id.IPv6() {
+				if a != (PeerID{}) {
+					n.mu.Unlock()
+					return ErrPathPolicy
+				}
+				a = id
+			}
+		}
+	}
 	if a == (PeerID{}) || a == n.id || mode > Blocked {
 		n.mu.Unlock()
 		return ErrPathPolicy
@@ -78,7 +90,11 @@ func (n *Node) SetPeerPathPolicy(address netip.Addr, mode PathMode) error {
 		n.mu.Unlock()
 		return ErrNodeClosed
 	}
-	n.modes[a] = mode
+	if mode == Auto {
+		delete(n.modes, a)
+	} else {
+		n.modes[a] = mode
+	}
 	n.mu.Unlock()
 	n.enforcePathPolicy()
 	return nil

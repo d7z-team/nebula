@@ -12,13 +12,15 @@ import (
 )
 
 const (
+	circuitReady byte = 0x01
+
 	maxCircuitNodes    = 16
 	maxCircuitAttempts = 8
 	maxSearchEdges     = 4096
 )
 
 type circuitRequest struct {
-	Path []PeerID
+	Path []PeerID `json:"path"`
 }
 
 type circuitLease struct {
@@ -267,7 +269,7 @@ func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.C
 	if _, err = io.ReadFull(c, ack[:]); err != nil {
 		return nil, err
 	}
-	if ack[0] != 1 {
+	if ack[0] != circuitReady {
 		return nil, ErrPathPolicy
 	}
 	c.SetDeadline(time.Time{})
@@ -324,7 +326,7 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 	n.circuits[l] = struct{}{}
 	n.mu.Unlock()
 	if pos == len(req.Path)-1 {
-		if _, err := c.Write([]byte{1}); err != nil {
+		if _, err := c.Write([]byte{circuitReady}); err != nil {
 			l.close()
 			return true
 		}
@@ -341,7 +343,7 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 	if !l.bind(next) {
 		return true
 	}
-	if _, err = c.Write([]byte{1}); err != nil {
+	if _, err = c.Write([]byte{circuitReady}); err != nil {
 		l.close()
 		return true
 	}

@@ -191,7 +191,7 @@ func (p *IPPort) enqueue(via PeerID, ip innerPacket, b []byte) error {
 		return ErrAddressUnauthorized
 	}
 	if !group {
-		peer, err := cfg.unicastNextHop(via, ip.destination)
+		peer, err := n.unicastNextHopLocked(via, ip.destination)
 		if err != nil {
 			return err
 		}

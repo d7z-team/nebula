@@ -21,14 +21,15 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
+// The first byte on each application stream selects its wire format.
 const (
-	opPing byte = iota + 1
-	opHello
-	opEvent
-	opCircuit
-	opIP
-	opLookup
-	opGetEvent
+	opPing            byte = 0x01
+	opHello           byte = 0x02
+	opLookup          byte = 0x03
+	opCircuit         byte = 0x04
+	opIP              byte = 0x05
+	opPushPublication byte = 0x06
+	opGetPublication  byte = 0x07
 )
 
 const (
@@ -139,13 +140,13 @@ func (s *session) close() {
 	}
 }
 
-func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID) (*session, error) {
+func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, outgoing bool) (*session, error) {
 	st := q.ConnectionState()
 	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
 		q.CloseWithError(1, "datagrams required")
 		return nil, ErrPathPolicy
 	}
-	s := &session{n: n, q: q, kind: "udp", endpoint: addrPort(q.RemoteAddr()), state: st.TLS, outgoing: peer != (PeerID{}), peer: peer}
+	s := &session{n: n, q: q, kind: "udp", endpoint: addrPort(q.RemoteAddr()), state: st.TLS, outgoing: outgoing, peer: peer}
 	ctx, cancel := context.WithTimeout(parent, n.o.DialTimeout)
 	defer cancel()
 	var stream *quic.Stream
@@ -282,7 +283,7 @@ func (n *Node) register(s *session) (*session, error) {
 		}
 		n.mu.Unlock()
 	}
-	if n.state != running || !n.sessionAllowedLocked(s) {
+	if n.state != running || !n.sessionAllowedLocked(s) || n.conflictingOwnerLocked(s.peer) {
 		n.mu.Unlock()
 		s.close()
 		return nil, ErrPathPolicy
@@ -404,23 +405,32 @@ func readFrame(r io.Reader, limit int) ([]byte, error) {
 }
 
 func (s *session) request(ctx context.Context, op byte, body []byte, limit int) ([]byte, error) {
-	c, err := s.open(ctx)
+	c, err := s.openRequest(ctx, op, body)
 	if err != nil {
 		return nil, err
 	}
 	defer c.Close()
+	return readFrame(c, limit)
+}
+
+func (s *session) openRequest(ctx context.Context, op byte, body []byte) (net.Conn, error) {
+	c, err := s.open(ctx)
+	if err != nil {
+		return nil, err
+	}
 	deadline := time.Now().Add(s.n.o.DialTimeout)
 	if t, ok := ctx.Deadline(); ok && t.Before(deadline) {
 		deadline = t
 	}
 	c.SetDeadline(deadline)
-	if _, err = c.Write([]byte{op}); err != nil {
+	if _, err = c.Write([]byte{op}); err == nil {
+		err = writeFrame(c, body)
+	}
+	if err != nil {
+		c.Close()
 		return nil, err
 	}
-	if err = writeFrame(c, body); err != nil {
-		return nil, err
-	}
-	return readFrame(c, limit)
+	return c, nil
 }
 
 func (n *Node) handleStream(s *session, c net.Conn) {
@@ -461,26 +471,17 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 		if json.Unmarshal(b, &a) != nil {
 			return
 		}
-		n.observe(s, a)
+		n.receiveAdvert(s, a)
 		out, _ := json.Marshal(n.advert(s))
 		writeFrame(c, out)
 	case opPing:
 		if len(b) <= 32 {
 			writeFrame(c, b)
 		}
-	case opEvent:
-		if _, err := n.acceptEvent(n.ctx, s, b); err == nil {
-			writeFrame(c, nil)
-		}
 	case opLookup:
 		n.handleLookup(s, c, b)
-	case opGetEvent:
-		n.mu.Lock()
-		e, ok := n.events[string(b)]
-		n.mu.Unlock()
-		if ok && time.Now().Before(e.expires) && n.allowEventSend(s, string(b), e.record) {
-			writeFrame(c, e.record)
-		}
+	case opPushPublication, opGetPublication:
+		n.handlePublication(s, c, op[0], b)
 	case opCircuit:
 		if len(s.path) == 0 {
 			owned = !n.forwardCircuit(s, c, b)
