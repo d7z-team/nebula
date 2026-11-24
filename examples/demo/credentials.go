@@ -12,6 +12,7 @@ import (
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
+// NewIssuer creates an in-memory Ed25519 CA valid for one hour.
 func NewIssuer() (pki.Issuer, error) {
 	key, err := pki.GenerateKey("ed25519")
 	if err != nil {
@@ -19,7 +20,13 @@ func NewIssuer() (pki.Issuer, error) {
 	}
 	now := time.Now()
 	root, err := pki.CreateRoot(key, pki.CAProfile{
-		Subject: pkix.Name{CommonName: "Demo CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
+		Scope: &pki.Scope{
+			Network: "demo", Cluster: true,
+			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("172.30.0.0/24"), netip.MustParsePrefix("2001:db8:42::/64")},
+			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27")},
+		},
+		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd13::/64")},
+		Subject:      pkix.Name{CommonName: "Demo CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
 	})
 	if err != nil {
 		return pki.Issuer{}, err

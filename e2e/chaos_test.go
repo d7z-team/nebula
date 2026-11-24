@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -121,7 +122,7 @@ func TestChaosFailoverAndRenewal(t *testing.T) {
 	old := l.connect(a, b, "udp")
 	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, c, d, 0)
-	fresh := l.credentials(b.ip, "ed25519")
+	fresh := l.credentials(l.top.Members[b.index], "ed25519")
 	require.NoError(t, b.node.ReloadCertificates(t.Context(), fresh))
 	require.Equal(t, old.Serial, waitPath(t, a, b, "udp").Serial)
 	// Isolate one direction after renewal. A TCP standby must authenticate
@@ -197,6 +198,127 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	receipt(t, c, d, 2)
 }
 
+func TestChaosMobileHandover(t *testing.T) {
+	extended(t)
+	l := newLab(t)
+	g := edge("lan", "10.1.0.1/24", "192.0.2.1/24", "10.1.0.2:4242", 45001, portFilter)
+	g.install(t, l.net)
+	mobile := l.host("lan", "10.1.0.2", "10.1.0.1", "udp", false)
+	fixed := l.host("wan", "192.0.2.20", "", "udp", true)
+	for _, h := range l.hosts {
+		// Exercise the node's production probe and dial timing.
+		h.options.Interval, h.options.DialTimeout = 0, 0
+	}
+	l.start()
+	l.connect(mobile, fixed, "udp")
+	initial := waitPath(t, fixed, mobile, "udp")
+	require.Equal(t, netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port), initial.Endpoint)
+	client, server := tcpPair(t, l.business(mobile), l.business(fixed), fixed.ip.String(), ipv4.ProtocolNumber)
+	receipt(t, client, server, 0)
+
+	for step := 1; step <= 4; step++ {
+		g.public = netip.PrefixFrom(g.public.Addr().Next(), g.public.Bits())
+		g.bindings[0].port++
+		endpoint := netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port)
+		t.Logf("handover %d to %s", step, endpoint)
+		var reopen time.Time // Fault callbacks run under the network lock.
+		var dropped atomic.Int32
+		start := time.Now()
+		l.net.disturb(func(d datagram) disturbance {
+			if d.segment != "wan" {
+				return disturbance{}
+			}
+			if d.from != endpoint && d.to != endpoint {
+				return disturbance{drop: true}
+			}
+			// Start the outage on the first packet using the new mapping.
+			now := time.Now()
+			if reopen.IsZero() {
+				reopen = now.Add(400 * time.Millisecond)
+			}
+			if now.Before(reopen) {
+				dropped.Add(1)
+				return disturbance{drop: true}
+			}
+			return disturbance{delay: time.Duration(1+d.number%4) * 20 * time.Millisecond}
+		})
+		g.install(t, l.net)
+		receipt(t, client, server, step)
+		t.Logf("handover %d receipt after %s, dropped %d packets during outage", step, time.Since(start), dropped.Load())
+		require.Positive(t, dropped.Load())
+		require.Eventually(t, func() bool {
+			return slices.ContainsFunc(fixed.node.Paths(), func(p nebula.PathStatus) bool {
+				return p.Active && p.Peer == mobile.node.ID() && p.Transport == "udp" && p.Endpoint == endpoint
+			})
+		}, 12*time.Second, 20*time.Millisecond, "handover %d: expected active endpoint %s", step, endpoint)
+	}
+}
+
+func TestChaosCanaryAfterNATRebind(t *testing.T) {
+	extended(t)
+	l := newLab(t)
+	g := edge("lan", "10.1.0.1/24", "192.0.2.1/24", "10.1.0.2:4242", 45001, portFilter)
+	g.install(t, l.net)
+	mobile := l.host("lan", "10.1.0.2", "10.1.0.1", "udp", false)
+	fixed := l.host("wan", "192.0.2.20", "", "udp", true)
+	observer := l.host("wan", "192.0.2.50", "", "udp", true)
+	old := netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port)
+	l.top.Members[observer.index].Transit = true
+	l.link(fixed, observer)
+	l.link(mobile, observer)
+	// The mobile peer answers rendezvous but leaves direct dialing to the fixed peer.
+	mobile.options.Interval = time.Minute
+	fixed.options.DialTimeout = 2 * time.Second
+	l.start()
+	l.top.Members[mobile.index].Endpoints = []nebula.Endpoint{{Network: "udp", Address: old}}
+	require.NoError(t, fixed.node.ApplyTopology(t.Context(), l.top))
+	l.connect(mobile, observer, "udp")
+	l.connect(fixed, observer, "udp")
+	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.ip, nebula.RelayOnly))
+	l.connect(fixed, mobile, "relay")
+	c, d := tcpPair(t, l.business(fixed), l.business(mobile), mobile.ip.String(), ipv4.ProtocolNumber)
+	receipt(t, c, d, 0)
+
+	first := make(chan time.Time, 1)
+	from := l.top.Members[fixed.index].Endpoints[0].Address
+	l.net.disturb(func(d datagram) disturbance {
+		if d.from == from && d.to == old && d.protocol == 17 {
+			if d.size >= 1200 {
+				select {
+				case first <- time.Now():
+				default:
+				}
+			}
+			return disturbance{drop: true}
+		}
+		return disturbance{}
+	})
+	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.ip, nebula.Auto))
+	var started time.Time
+	select {
+	case started = <-first:
+	case <-time.After(12 * time.Second):
+		t.Fatal("no QUIC handshake to the old mapping")
+	}
+	g.bindings[0].port++
+	g.install(t, l.net)
+	next := netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port)
+	eventReceipt(t, mobile, observer, "new mapping")
+	// The next healthy canary is at least five seconds away.
+	require.Eventually(t, func() bool {
+		return slices.ContainsFunc(fixed.node.Paths(), func(p nebula.PathStatus) bool {
+			return p.Peer == mobile.node.ID() && p.Active && p.Transport == "udp" && p.Endpoint == next
+		})
+	}, time.Until(started.Add(4500*time.Millisecond)), 15*time.Millisecond)
+	require.True(t, slices.ContainsFunc(observer.node.Paths(), func(p nebula.PathStatus) bool {
+		return p.Peer == mobile.node.ID() && p.Endpoint == next
+	}))
+	require.Positive(t, l.net.punches(flow{"wan", from, next, 17}))
+	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.ip, nebula.DirectOnly))
+	require.NoError(t, mobile.node.SetPeerPathPolicy(fixed.ip, nebula.DirectOnly))
+	receipt(t, c, d, 1)
+}
+
 func TestChaosRelayPartition(t *testing.T) {
 	extended(t)
 	l := newLab(t)
@@ -268,7 +390,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	c := l.host("wan", "192.0.2.3", "", "tcp", true)
 	var denied atomic.Bool
 	r.options.CheckChain = func(_ context.Context, check nebula.ChainCheck) (time.Time, error) {
-		if denied.Load() && check.Object && check.Member == labPeer(a.ip) {
+		if denied.Load() && check.Usage == x509.ExtKeyUsageCodeSigning && check.Member == labPeer(a.ip) {
 			return time.Time{}, errors.New("publisher withdrawn")
 		}
 		return time.Time{}, nil
@@ -312,9 +434,9 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 	l.start()
 	l.connect(a, b, "udp")
 	var received atomic.Int32
-	_, err := b.node.OpenIPPort(func([]byte) { received.Add(1) })
+	_, err := b.node.OpenIPPort(nebula.IPPortOptions{Deliver: func(nebula.PeerID, []byte) { received.Add(1) }})
 	require.NoError(t, err)
-	port, err := a.node.OpenIPPort(func([]byte) {})
+	port, err := a.node.OpenIPPort(nebula.IPPortOptions{Deliver: func(nebula.PeerID, []byte) {}})
 	require.NoError(t, err)
 	pkt := make([]byte, 16000)
 	pkt[0], pkt[8], pkt[9] = 0x45, 64, 253
@@ -322,7 +444,7 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 	copy(pkt[12:16], a.ip.AsSlice())
 	copy(pkt[16:20], b.ip.AsSlice())
 	for range 12 {
-		require.NoError(t, port.WriteIP(b.ip, pkt))
+		require.NoError(t, port.WriteIP(b.node.ID(), pkt))
 	}
 	require.Eventually(t, func() bool { return received.Load() >= 4 && port.Stats().Queued > 0 }, 3*time.Second, 10*time.Millisecond)
 	sub, err := b.node.Subscribe("app/test")
@@ -338,9 +460,20 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 		}
 		return disturbance{}
 	})
-	dial := make(chan error, 1)
-	go func() { dial <- a.node.ConnectPeer(t.Context(), c.ip) }()
+	waiter, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first := make(chan error, 1)
+	go func() { first <- a.node.ConnectPeer(waiter, c.ip) }()
 	require.Eventually(t, func() bool { return attempts.Load() > 0 }, time.Second, time.Millisecond)
+	dial := make(chan error, 1)
+	go func() { dial <- a.node.ConnectPeer(t.Context(), c.node.ID().IPv6()) }()
+	cancel()
+	select {
+	case err := <-first:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller still waiting for the unreachable peer")
+	}
 	done := make(chan error, 1)
 	go func() { done <- a.node.Close() }()
 	select {
@@ -395,7 +528,7 @@ func TestSeededChaos(t *testing.T) {
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.protocol == 17} })
 			waitPath(t, a, b, "tcp")
 		case 2:
-			fresh := l.credentials(b.ip, "ed25519")
+			fresh := l.credentials(l.top.Members[b.index], "ed25519")
 			require.NoError(t, b.node.ReloadCertificates(t.Context(), fresh))
 			require.Equal(t, fresh.Client.Leaf.SerialNumber.String(), b.node.ControlStatus().Serial)
 		case 3:

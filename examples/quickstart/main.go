@@ -6,10 +6,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/netip"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/examples/internal/demo"
+	"code.d7z.net/d7z-team/nebula"
+	"code.d7z.net/d7z-team/nebula/examples/demo"
 )
 
 func main() {
@@ -61,17 +61,17 @@ func run() error {
 	}
 
 	received := make(chan []byte, 1)
-	rx, err := alice.OpenIPPort(func(b []byte) {
+	rx, err := alice.OpenIPPort(nebula.IPPortOptions{Deliver: func(_ nebula.PeerID, b []byte) {
 		select {
 		case received <- bytes.Clone(b):
 		case <-ctx.Done():
 		}
-	})
+	}})
 	if err != nil {
 		return err
 	}
 	defer rx.Close()
-	tx, err := bob.OpenIPPort(func([]byte) {})
+	tx, err := bob.OpenIPPort(nebula.IPPortOptions{Deliver: func(nebula.PeerID, []byte) {}})
 	if err != nil {
 		return err
 	}
@@ -82,7 +82,7 @@ func run() error {
 	packet[0], packet[6], packet[7] = 0x60, 59, 64
 	copy(packet[8:24], b.IPv6.AsSlice())
 	copy(packet[24:40], a.IPv6.AsSlice())
-	if err := tx.WriteIP(netip.Addr{}, packet); err != nil {
+	if err := tx.WriteIP(nebula.PeerID{}, packet); err != nil {
 		return err
 	}
 	select {

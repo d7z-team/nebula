@@ -32,8 +32,9 @@ const (
 )
 
 const (
-	maxSessionStreams = 64
-	maxControlFrame   = 64 << 10
+	maxDirectPerFamily = 2 // per peer, transport and direction
+	maxSessionStreams  = 64
+	maxControlFrame    = 64 << 10
 )
 
 type qStream struct {
@@ -52,11 +53,13 @@ type session struct {
 	inventoryOffset               atomic.Uint64
 	localChain                    []*x509.Certificate
 	until                         time.Time // protected by n.mu
-	probing                       atomic.Bool
+	probing                       bool      // protected by n.mu
 	n                             *Node
 	lease                         *circuitLease
 	peer                          PeerID
 	localIdentity, remoteIdentity pki.Identity
+	remoteIPLimit                 int
+	localEndpoint                 netip.AddrPort
 	kind                          string
 	endpoint                      netip.AddrPort
 	path                          []PeerID
@@ -70,15 +73,42 @@ type session struct {
 	failures                      int
 	loss                          float64
 	sent, lost                    uint64
-	lastProbe                     time.Time
+	lastProbe                     time.Time // protected by n.mu
 	dataMu                        sync.Mutex
 	data                          net.Conn
 	budget                        atomic.Int64
 	overflow                      atomic.Uint64
 }
 
-func (s *session) matchesTransport(network string, endpoint netip.AddrPort) bool {
-	return s.kind == network && s.endpoint.Addr().BitLen() == endpoint.Addr().BitLen()
+func (s *session) remoteEndpoint() netip.AddrPort {
+	if s.q != nil {
+		return addrPort(s.q.RemoteAddr())
+	}
+	return s.endpoint
+}
+
+// exchangeIPLimit runs on the first QUIC bidirectional stream or directly on TLS before yamux.
+func exchangeIPLimit(c io.ReadWriter, local int, outgoing bool) (int, error) {
+	var send, recv [2]byte
+	binary.BigEndian.PutUint16(send[:], uint16(local))
+	if outgoing {
+		if _, err := c.Write(send[:]); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := io.ReadFull(c, recv[:]); err != nil {
+		return 0, err
+	}
+	limit := int(binary.BigEndian.Uint16(recv[:]))
+	if limit < 1280 {
+		return 0, errors.New("invalid peer IP receive limit")
+	}
+	if !outgoing {
+		if _, err := c.Write(send[:]); err != nil {
+			return 0, err
+		}
+	}
+	return limit, nil
 }
 
 func (s *session) open(ctx context.Context) (net.Conn, error) {
@@ -109,18 +139,47 @@ func (s *session) close() {
 	}
 }
 
-func (n *Node) attachQUIC(q *quic.Conn, peer PeerID) (*session, error) {
+func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID) (*session, error) {
 	st := q.ConnectionState()
 	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
 		q.CloseWithError(1, "datagrams required")
 		return nil, ErrPathPolicy
 	}
 	s := &session{n: n, q: q, kind: "udp", endpoint: addrPort(q.RemoteAddr()), state: st.TLS, outgoing: peer != (PeerID{}), peer: peer}
+	ctx, cancel := context.WithTimeout(parent, n.o.DialTimeout)
+	defer cancel()
+	var stream *quic.Stream
+	var err error
+	if s.outgoing {
+		stream, err = q.OpenStreamSync(ctx)
+	} else {
+		stream, err = q.AcceptStream(ctx)
+	}
+	if err == nil {
+		deadline, _ := ctx.Deadline()
+		stream.SetDeadline(deadline)
+		stop := context.AfterFunc(ctx, func() { stream.CancelRead(0); stream.CancelWrite(0) })
+		s.remoteIPLimit, err = exchangeIPLimit(stream, n.o.MaxIPSize, s.outgoing)
+		stop()
+		// Release any unread bytes on the reserved stream.
+		qStream{stream, q}.Close()
+	}
+	if err != nil {
+		s.close()
+		return nil, err
+	}
+	s.localEndpoint = addrPort(q.LocalAddr())
 	return n.register(s)
 }
 
 func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []PeerID, out bool, lease *circuitLease) (*session, error) {
-	_ = raw.SetDeadline(time.Now().Add(n.o.DialTimeout))
+	deadline := time.Now().Add(n.o.DialTimeout)
+	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
+	_ = raw.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { raw.Close() })
+	defer stop()
 	cfg := n.tlsConfig(peer, !out)
 	var t *tls.Conn
 	if out {
@@ -133,6 +192,13 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 		return nil, err
 	}
 	s := &session{n: n, kind: "tcp", state: t.ConnectionState(), endpoint: addrPort(raw.RemoteAddr()), path: path, peer: peer, outgoing: out, lease: lease}
+	s.localEndpoint = addrPort(raw.LocalAddr())
+	limit, err := exchangeIPLimit(t, n.o.MaxIPSize, out)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	s.remoteIPLimit = limit
 	raw.SetDeadline(time.Time{})
 	cfgMux := yamux.DefaultConfig()
 	cfgMux.LogOutput = io.Discard
@@ -140,7 +206,6 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	cfgMux.AcceptBacklog = maxSessionStreams
 	cfgMux.StreamOpenTimeout = n.o.DialTimeout
 	cfgMux.ConnectionWriteTimeout = n.o.DialTimeout
-	var err error
 	if out {
 		s.mux, err = yamux.Client(t, cfgMux)
 	} else {
@@ -153,6 +218,11 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	if len(path) > 0 {
 		s.kind = "relay"
 		s.endpoint = netip.AddrPort{}
+	}
+	// The registered session owns the connection once dialing ends.
+	if !stop() {
+		s.close()
+		return nil, ctx.Err()
 	}
 	return n.register(s)
 }
@@ -222,22 +292,40 @@ func (n *Node) register(s *session) (*session, error) {
 		paths = &peerPaths{lastCanary: time.Now()}
 		n.peers[s.peer] = paths
 	}
-	var replaced *session
+	var replaced, standby *session
+	sameFamily := 0
+	remote := s.remoteEndpoint()
 	for _, old := range paths.sessions {
-		if !old.matchesTransport(s.kind, s.endpoint) || old.outgoing != s.outgoing || !slices.Equal(old.path, s.path) || old.closed.Load() || !n.sessionAllowedLocked(old) {
+		if old.kind != s.kind || old.outgoing != s.outgoing || !slices.Equal(old.path, s.path) || old.closed.Load() || !n.sessionAllowedLocked(old) {
 			continue
 		}
-		if !s.outgoing && len(s.path) == 0 {
-			// A reconnecting peer may have lost its old path silently. Once
-			// authenticated, its new direct connection supersedes that path.
+		previous := old.remoteEndpoint()
+		if s.kind == "relay" || s.outgoing && previous == remote {
+			n.mu.Unlock()
+			s.close()
+			return old, nil
+		}
+		if previous.Addr().BitLen() != remote.Addr().BitLen() {
+			continue
+		}
+		// Distinct source ports on one listener can represent different NAT paths.
+		if !s.outgoing && previous == remote && old.localEndpoint == s.localEndpoint {
 			replaced = old
 			break
 		}
-		n.mu.Unlock()
-		s.close()
-		return old, nil
+		sameFamily++
+		if standby == nil || standby == paths.active {
+			standby = old
+		}
+	}
+	if replaced == nil && sameFamily >= maxDirectPerFamily {
+		replaced = standby
 	}
 	paths.sessions = append(paths.sessions, s)
+	if a := n.attempts[s.peer]; a != nil {
+		close(a.changed)
+		a.changed = make(chan struct{})
+	}
 	if replaced != nil {
 		n.removeSessionLocked(replaced)
 	}
@@ -353,7 +441,7 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 	if op[0] == opIP {
 		c.SetDeadline(time.Time{})
 		for {
-			b, err := readFrame(c, n.o.MaxIPSize)
+			b, err := readFrame(c, MaxIPPacketSize)
 			if err != nil {
 				return
 			}
@@ -409,40 +497,4 @@ func (s *session) refreshBudget() {
 			s.budget.Store(limit.MaxDatagramPayloadSize)
 		}
 	}
-}
-
-func (s *session) sendIP(b []byte) error {
-	if s.q != nil {
-		err := s.q.SendDatagram(b)
-		var size *quic.DatagramTooLargeError
-		if err == nil {
-			return nil
-		}
-		if !errors.As(err, &size) {
-			return err
-		}
-		s.budget.Store(size.MaxDatagramPayloadSize)
-		s.overflow.Add(1)
-	}
-	s.dataMu.Lock()
-	defer s.dataMu.Unlock()
-	if s.data == nil {
-		c, err := s.open(s.n.ctx)
-		if err != nil {
-			return err
-		}
-		c.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout))
-		if _, err = c.Write([]byte{opIP}); err != nil {
-			c.Close()
-			return err
-		}
-		s.data = c
-	}
-	s.data.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout))
-	if err := writeFrame(s.data, b); err != nil {
-		s.data.Close()
-		s.data = nil
-		return err
-	}
-	return nil
 }

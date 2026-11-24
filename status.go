@@ -1,9 +1,9 @@
 package nebula
 
 import (
-	"bytes"
 	"cmp"
 	"crypto/tls"
+	"maps"
 	"net/netip"
 	"slices"
 	"time"
@@ -25,6 +25,8 @@ type PathStatus struct {
 	Circuit     []PeerID
 	RTT, Jitter time.Duration
 	Failures    int
+	// RemoteIPLimit is the peer's authenticated receive ceiling for complete IP packets.
+	RemoteIPLimit int
 	// DatagramSize is the current directional QUIC payload budget in bytes.
 	DatagramSize                     int64
 	QUICBytesSent, QUICBytesReceived uint64
@@ -45,7 +47,7 @@ func (n *Node) Paths() []PathStatus {
 			leaf := s.state.PeerCertificates[0]
 			s.healthMu.Lock()
 			st := PathStatus{
-				Peer: s.peer, Transport: s.kind, Endpoint: s.endpoint, Circuit: slices.Clone(s.path),
+				Peer: s.peer, Transport: s.kind, Endpoint: s.remoteEndpoint(), RemoteIPLimit: s.remoteIPLimit, Circuit: slices.Clone(s.path),
 				AuthorizedUntil: s.until, ALPN: s.state.NegotiatedProtocol, TLSGroup: s.state.CurveID, TLSVersion: s.state.Version,
 				LocalSerial: s.localChain[0].SerialNumber.String(), Serial: leaf.SerialNumber.String(), Expires: leaf.NotAfter, Active: active == s,
 				RTT: s.rtt, Jitter: s.jitter, Failures: s.failures,
@@ -53,7 +55,6 @@ func (n *Node) Paths() []PathStatus {
 			}
 			s.healthMu.Unlock()
 			if s.q != nil {
-				st.Endpoint = addrPort(s.q.RemoteAddr())
 				q := s.q.ConnectionStats()
 				st.RTT = q.SmoothedRTT
 				st.Jitter = q.MeanDeviation
@@ -64,7 +65,7 @@ func (n *Node) Paths() []PathStatus {
 		}
 	}
 	slices.SortFunc(out, func(a, b PathStatus) int {
-		if c := bytes.Compare(a.Peer[:], b.Peer[:]); c != 0 {
+		if c := comparePeer(a.Peer, b.Peer); c != 0 {
 			return c
 		}
 		if a.Active != b.Active {
@@ -86,6 +87,8 @@ type ControlStatus struct {
 	Started, Closed    bool
 	// LastError records the most recent failed peer connection attempt.
 	LastError string
+	// ListenerErrors records terminal TCP accept errors by address family.
+	ListenerErrors map[string]string
 	// Ready means local membership and credentials are valid, including before Start.
 	Ready    bool
 	Circuits int
@@ -97,7 +100,7 @@ type ControlStatus struct {
 func (n *Node) ControlStatus() ControlStatus {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	v := ControlStatus{Circuits: len(n.circuits), BytesScheduled: n.bytesScheduled.Load(), DialFailures: n.dialFailures.Load(), LastError: n.lastConnectError}
+	v := ControlStatus{Circuits: len(n.circuits), BytesScheduled: n.bytesScheduled.Load(), DialFailures: n.dialFailures.Load(), LastError: n.lastConnectError, ListenerErrors: maps.Clone(n.listenerErrors)}
 	credentials := n.cred.Load()
 	leaf := credentials.Client.Leaf
 	v.Peer, v.Serial, v.CertificateExpires = n.id, leaf.SerialNumber.String(), leaf.NotAfter

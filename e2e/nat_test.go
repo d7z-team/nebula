@@ -111,8 +111,6 @@ func (g gateway) install(t *testing.T, n *network) {
 	s.IPTables().ReplaceTable(stack.NATID, table, false)
 }
 
-func gvisorAddr(ip netip.Addr) tcpip.Address { return tcpip.AddrFromSlice(ip.AsSlice()) }
-
 func edge(lan, private, public, inside string, port uint16, filter natFilter) gateway {
 	return gateway{
 		lan: lan, wan: "wan", private: netip.MustParsePrefix(private), public: netip.MustParsePrefix(public), filter: filter,

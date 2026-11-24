@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/examples/internal/demo"
+	"code.d7z.net/d7z-team/nebula/examples/demo"
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
@@ -49,7 +49,11 @@ func run() error {
 
 	roots := x509.NewCertPool()
 	roots.AddCert(issuer.Chain[0])
-	_, err = pki.VerifyChain([]*x509.Certificate{leaf}, roots, "demo", id, x509.ExtKeyUsageServerAuth, time.Now())
+	cluster, err := pki.ReadClusterCA(issuer.Chain[0])
+	if err != nil {
+		return err
+	}
+	_, err = pki.VerifyChain([]*x509.Certificate{leaf}, roots, cluster, id, x509.ExtKeyUsageServerAuth, time.Now())
 	if err != nil {
 		return fmt.Errorf("verify server identity: %w", err)
 	}

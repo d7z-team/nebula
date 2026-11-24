@@ -6,19 +6,20 @@ import (
 	"time"
 )
 
-// ApplyTopology installs a private copy of the host-approved view.
+// ApplyTopology installs a private copy of the complete host-approved view.
+// An invalid view leaves the current one in place. A valid view can withdraw
+// the local member, in which case it succeeds and ControlStatus().Ready is false.
 func (n *Node) ApplyTopology(ctx context.Context, t Topology) error {
-	p, err := t.compile()
+	p, err := t.compile(n.Cluster())
 	if err != nil {
 		return err
-	}
-	if p.Network != n.network {
-		return ErrPathPolicy
 	}
 	return n.updateView(ctx, p)
 }
 
-// Revalidate reapplies the host's current chain decisions to live state.
+// Revalidate reapplies the host's current chain decisions to local credentials,
+// sessions and cached events. Success means the review completed, including
+// any withdrawals. Use ControlStatus and Paths to inspect the outcome.
 func (n *Node) Revalidate(ctx context.Context) error { return n.updateView(ctx, nil) }
 
 // Evaluate application callbacks outside node locks. Admissions and credential
@@ -84,6 +85,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		updated.until = end
 		n.cred.Store(&updated)
 		n.policy.Store(p)
+		clear(n.routeCursors)
 		clear(n.introduced)
 		clear(n.discovered)
 		clear(n.observations)
@@ -91,9 +93,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 			n.setShapingRate(p.members[n.id].BytesPerSecond)
 		}
 		n.mu.Unlock()
-		n.prunePaths()
-		n.udpWrites.Lock()
-		n.udpWrites.Unlock()
+		n.enforcePathPolicy()
 		return nil
 	}
 }

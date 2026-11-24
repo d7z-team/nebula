@@ -3,6 +3,7 @@ package nebula
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"slices"
@@ -10,7 +11,11 @@ import (
 	"time"
 )
 
-const maxCircuitNodes = 16
+const (
+	maxCircuitNodes    = 16
+	maxCircuitAttempts = 8
+	maxSearchEdges     = 4096
+)
 
 type circuitRequest struct {
 	Path []PeerID
@@ -57,7 +62,7 @@ func (l *circuitLease) close() {
 }
 
 func (l *circuitLease) allowedLocked() bool {
-	if l.ctx.Err() != nil || !l.n.permitCircuit(l.path) {
+	if l.ctx.Err() != nil || !l.n.circuitAllowedLocked(l.path) {
 		return false
 	}
 	for _, s := range l.legs {
@@ -69,7 +74,7 @@ func (l *circuitLease) allowedLocked() bool {
 }
 
 // Called under n.mu. Each relay checks the route against its local topology and its adjacent peers.
-func (n *Node) permitCircuit(path []PeerID) bool {
+func (n *Node) circuitAllowedLocked(path []PeerID) bool {
 	p := n.policy.Load()
 	if !n.memberOf(p) || len(path) < 3 || len(path) > maxCircuitNodes {
 		return false
@@ -99,64 +104,129 @@ func (n *Node) permitCircuit(path []PeerID) bool {
 	return true
 }
 
-func (n *Node) routes(target PeerID) [][]PeerID {
+// routeCursor enumerates simple paths in increasing hop count. Only the bounded
+// traversal stack survives between attempts; the topology owns the adjacency lists.
+type routeCursor struct {
+	mu    sync.Mutex
+	depth int
+	path  []PeerID
+	edge  [maxCircuitNodes]int
+}
+
+// next resumes after the last examined edge, even when a work budget expires.
+func (r *routeCursor) next(p *topologyView, source, target PeerID, distance map[PeerID]int, work *int) []PeerID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.depth == 0 {
+		r.depth = 3
+	}
+	for r.depth <= min(maxCircuitNodes, len(p.members)) {
+		if len(r.path) == 0 {
+			r.path = append(r.path, source)
+		}
+		for len(r.path) > 0 {
+			i := len(r.path) - 1
+			links := p.members[r.path[i]].Links
+			if r.edge[i] >= len(links) {
+				r.edge[i] = 0
+				r.path = r.path[:i]
+				continue
+			}
+			if *work == 0 {
+				return nil
+			}
+			(*work)--
+			next := links[r.edge[i]]
+			r.edge[i]++
+			left := r.depth - i - 2
+			if next == target {
+				if left == 0 {
+					return append(slices.Clone(r.path), next)
+				}
+				continue
+			}
+			hops, reachable := distance[next]
+			if reachable && hops <= left && p.members[next].Transit && !slices.Contains(r.path, next) {
+				r.path = append(r.path, next)
+			}
+		}
+		r.depth++
+	}
+	r.depth = 0
+	return nil
+}
+
+func (n *Node) dialRelay(ctx context.Context, target PeerID, attempts int) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	p := n.policy.Load()
 	if !n.memberOf(p) || !n.modeLocked(target).allowsRelay() {
-		return nil
+		n.mu.Unlock()
+		return ErrPathPolicy
 	}
-	var out [][]PeerID
-	for _, first := range p.members[n.id].Links {
-		if first == target || !p.members[first].Transit {
+	cursor := n.routeCursors[target]
+	if cursor == nil {
+		cursor = &routeCursor{}
+		n.routeCursors[target] = cursor
+	}
+	n.mu.Unlock()
+
+	// Reverse distances prune branches that cannot reach the destination
+	// within the remaining depth. Never route back through the origin.
+	distance := map[PeerID]int{target: 0}
+	queue := []PeerID{target}
+	for len(queue) > 0 {
+		peer := queue[0]
+		queue = queue[1:]
+		if distance[peer] >= maxCircuitNodes-2 {
 			continue
 		}
-		// Retain a second route through the same first hop when an interior edge can be bypassed.
-		shortest := func(skipA, skipB PeerID) []PeerID {
-			visited := map[PeerID]bool{n.id: true, first: true}
-			q := [][]PeerID{{n.id, first}}
-			for len(q) > 0 {
-				path := q[0]
-				q = q[1:]
-				last := path[len(path)-1]
-				if len(path) >= maxCircuitNodes {
-					continue
-				}
-				for _, a := range p.members[last].Links {
-					if visited[a] || last == skipA && a == skipB || last == skipB && a == skipA {
-						continue
-					}
-					visited[a] = true
-					next := append(slices.Clone(path), a)
-					if a == target {
-						return next
-					}
-					if p.members[a].Transit {
-						q = append(q, next)
-					}
-				}
+		for _, id := range p.members[peer].Links {
+			if _, seen := distance[id]; !seen && id != n.id && p.members[id].Transit {
+				distance[id] = distance[peer] + 1
+				queue = append(queue, id)
 			}
+		}
+	}
+	work := maxSearchEdges
+	var last error
+	for attempts > 0 && work > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		path := cursor.next(p, n.id, target, distance, &work)
+		if n.policy.Load() != p {
+			return ErrPathPolicy
+		}
+		if path == nil {
+			break
+		}
+		n.mu.Lock()
+		paths := n.peers[target]
+		established := paths != nil && slices.ContainsFunc(paths.sessions, func(s *session) bool {
+			return slices.Equal(s.path, path) && !s.closed.Load() && n.sessionAllowedLocked(s)
+		})
+		n.mu.Unlock()
+		if established {
+			continue
+		}
+		attempts--
+		dialCtx, cancel := context.WithTimeout(ctx, n.o.DialTimeout*time.Duration(len(path)))
+		last = n.startCircuit(dialCtx, path)
+		cancel()
+		if last == nil {
+			n.mu.Lock()
+			if n.routeCursors[target] == cursor {
+				delete(n.routeCursors, target)
+			}
+			n.mu.Unlock()
 			return nil
 		}
-		path := shortest(PeerID{}, PeerID{})
-		if !n.permitCircuit(path) {
-			continue
-		}
-		out = append(out, path)
-		for i := 1; i < len(path)-1; i++ {
-			alt := shortest(path[i], path[i+1])
-			if n.permitCircuit(alt) {
-				out = append(out, alt)
-				break
-			}
-		}
 	}
-	slices.SortStableFunc(out, func(a, b []PeerID) int { return len(a) - len(b) })
-	return out
+	return errors.Join(ErrPeerUnavailable, last)
 }
 
 func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.Conn, error) {
-	s := n.selectSession(next, true)
+	s := n.preferredSession(next, true)
 	if s == nil {
 		var err error
 		s, err = n.dialDirect(ctx, next)
@@ -205,11 +275,11 @@ func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.C
 	return c, nil
 }
 
-func (n *Node) startCircuit(ctx context.Context, path []PeerID) (*session, error) {
+func (n *Node) startCircuit(ctx context.Context, path []PeerID) error {
 	n.mu.Lock()
-	if !n.permitCircuit(path) || path[0] != n.id || len(n.circuits) >= n.o.MaxCircuits {
+	if !n.circuitAllowedLocked(path) || path[0] != n.id || len(n.circuits) >= n.o.MaxCircuits {
 		n.mu.Unlock()
-		return nil, ErrPathPolicy
+		return ErrPathPolicy
 	}
 	l := &circuitLease{n: n, path: path}
 	l.ctx, l.cancel = context.WithCancel(n.ctx)
@@ -218,15 +288,15 @@ func (n *Node) startCircuit(ctx context.Context, path []PeerID) (*session, error
 	c, err := n.openLeg(ctx, path[1], l)
 	if err != nil {
 		l.close()
-		return nil, err
+		return err
 	}
 	if !l.bind(c) {
-		return nil, ErrPathPolicy
+		return ErrPathPolicy
 	}
 	return n.attachCircuit(ctx, c, l, true)
 }
 
-func (n *Node) attachCircuit(ctx context.Context, c net.Conn, l *circuitLease, out bool) (*session, error) {
+func (n *Node) attachCircuit(ctx context.Context, c net.Conn, l *circuitLease, out bool) error {
 	path := slices.Clone(l.path)
 	if !out {
 		slices.Reverse(path)
@@ -235,7 +305,7 @@ func (n *Node) attachCircuit(ctx context.Context, c net.Conn, l *circuitLease, o
 	if err != nil || s.lease != l {
 		l.close()
 	}
-	return s, err
+	return err
 }
 
 func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
@@ -245,7 +315,7 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 	}
 	n.mu.Lock()
 	pos := slices.Index(req.Path, n.id)
-	if !n.sessionAllowedLocked(s) || !n.permitCircuit(req.Path) || pos <= 0 || s.peer != req.Path[pos-1] || len(n.circuits) >= n.o.MaxCircuits {
+	if !n.sessionAllowedLocked(s) || !n.circuitAllowedLocked(req.Path) || pos <= 0 || s.peer != req.Path[pos-1] || len(n.circuits) >= n.o.MaxCircuits {
 		n.mu.Unlock()
 		return false
 	}
@@ -300,10 +370,10 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 			}
 		}
 	}
-	if !n.task(func() { pump(next, c) }) {
-		l.close()
-		return true
-	}
+	// Either direction closes both streams; the handler waits for both copies.
+	var wg sync.WaitGroup
+	wg.Go(func() { pump(next, c) })
 	pump(c, next)
+	wg.Wait()
 	return true
 }

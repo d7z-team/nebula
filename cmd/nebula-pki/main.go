@@ -74,7 +74,7 @@ func readChain(path string) ([]*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pki.ParseCertificates(b)
+	return pki.ParseCertificatesPEM(b)
 }
 
 func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
@@ -89,8 +89,11 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	op := args[0]
 	fs := flag.NewFlagSet(op, flag.ContinueOnError)
 	fs.SetOutput(diagnostics)
-	var key, caFile, caKey, src, dst, alg, name, network, ipv4, ipv6, routed, permitted, role, approved, roots string
-	var days, pathLen int
+	var key, caFile, caKey, src, dst, alg, name, role, approved, roots, pin string
+	var v4, v6 netip.Addr
+	var scope pki.Scope
+	var profile pki.CAProfile
+	var days int
 	var fingerprint bool
 	fs.StringVar(&src, "in", "-", "input path or stdin")
 	fs.StringVar(&dst, "out", "-", "new output file or stdout")
@@ -105,25 +108,27 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		fs.StringVar(&caKey, "ca-key", "", "issuing CA key")
 		fs.StringVar(&name, "name", "", "approved subject common name")
 		fs.StringVar(&approved, "approved-key", "", "approved SHA-256 SPKI in hex")
+		fs.Func("anycast-ips", "exact service addresses for a leaf", listFlag(&scope.AnycastIPs, netip.ParseAddr))
 	case "inspect":
 		fs.BoolVar(&fingerprint, "fingerprint", false, "print the SPKI SHA-256 digest")
 	case "verify":
+		fs.StringVar(&pin, "cluster-ca", "", "pinned cluster CA PEM certificate")
 		fs.StringVar(&roots, "roots", "", "trusted root PEM bundle")
 	default:
 		return fmt.Errorf("unknown command %q", op)
 	}
 	if op == "root" || op == "issue" {
+		fs.StringVar(&scope.Network, "network", "", "mesh network")
 		fs.IntVar(&days, "days", 30, "validity in days")
-		fs.IntVar(&pathLen, "path-len", 0, "allowed intermediate CA depth")
-		fs.StringVar(&routed, "routes", "", "approved routed prefixes, comma separated")
-		fs.StringVar(&permitted, "permit-ips", "", "permitted IP SAN ranges for a CA")
-	}
-	if op == "issue" || op == "verify" || op == "root" {
-		fs.StringVar(&network, "network", "", "mesh network")
+		fs.IntVar(&profile.MaxPathLen, "path-len", 0, "allowed intermediate CA depth")
+		fs.BoolVar(&scope.Cluster, "cluster", false, "define the cluster address plan on this CA")
+		fs.Func("routes", "approved routed prefixes, comma separated", listFlag(&scope.RoutedPrefixes, netip.ParsePrefix))
+		fs.Func("anycast-pools", "delegated service prefixes for a CA", listFlag(&scope.AnycastPools, netip.ParsePrefix))
+		fs.Func("permit-ips", "permitted IP SAN ranges for a CA", listFlag(&profile.PermittedIPs, netip.ParsePrefix))
 	}
 	if op == "issue" || op == "verify" {
-		fs.StringVar(&ipv4, "ipv4", "", "overlay IPv4 address")
-		fs.StringVar(&ipv6, "ipv6", "", "overlay IPv6 address")
+		fs.TextVar(&v4, "ipv4", netip.Addr{}, "overlay IPv4 address")
+		fs.TextVar(&v6, "ipv6", netip.Addr{}, "overlay IPv6 address")
 		fs.StringVar(&role, "role", "node", "node, server, client, object or ca (issue only)")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -138,30 +143,16 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	now := time.Now().UTC().Truncate(time.Second)
 	var data []byte
 	var label string
-	profile := pki.CAProfile{Subject: pkix.Name{CommonName: name}, NotBefore: now, NotAfter: now.AddDate(0, 0, days), MaxPathLen: pathLen}
-	if network != "" || routed != "" {
-		routes, err := parsePrefixes(routed)
-		if err != nil {
-			return err
-		}
-		profile.Scope = &pki.Scope{Network: network, RoutedPrefixes: routes}
+	profile.Subject = pkix.Name{CommonName: name}
+	profile.NotBefore, profile.NotAfter = now, now.AddDate(0, 0, days)
+	if scope.Network != "" || scope.Cluster || len(scope.RoutedPrefixes)+len(scope.AnycastPools)+len(scope.AnycastIPs) != 0 {
+		profile.Scope = &scope
 	}
 	var err error
-	if profile.PermittedIPs, err = parsePrefixes(permitted); err != nil {
-		return err
-	}
 	var peer pki.PeerID
 	if op == "verify" || op == "issue" && role != "ca" {
-		if permitted != "" {
+		if len(profile.PermittedIPs) != 0 {
 			return errors.New("-permit-ips requires a CA")
-		}
-		v4, err := netip.ParseAddr(ipv4)
-		if err != nil {
-			return err
-		}
-		v6, err := netip.ParseAddr(ipv6)
-		if err != nil {
-			return err
 		}
 		peer, err = pki.NewPeerID(v4, v6)
 		if err != nil {
@@ -222,6 +213,17 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		}
 		data, label = c.Raw, "CERTIFICATE"
 	case "verify":
+		pins, e := readChain(pin)
+		if e != nil {
+			return e
+		}
+		if len(pins) != 1 {
+			return errors.New("one cluster CA certificate required")
+		}
+		cluster, e := pki.ReadClusterCA(pins[0])
+		if e != nil {
+			return e
+		}
 		cs, e := readChain(roots)
 		if e != nil {
 			return e
@@ -234,7 +236,7 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		if e != nil {
 			return e
 		}
-		chain, e := pki.ParseCertificates(b)
+		chain, e := pki.ParseCertificatesPEM(b)
 		if e != nil {
 			return e
 		}
@@ -243,21 +245,17 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 			return e
 		}
 		for _, u := range purposes {
-			if _, e = pki.VerifyChain(chain, pool, network, peer, u, now); e != nil {
+			if _, e = pki.VerifyChain(chain, pool, cluster, peer, u, now); e != nil {
 				return e
 			}
 		}
-		data = fmt.Appendf(nil, "%s network=%s peer=%s\n", chain[0].Subject, network, peer)
+		data = fmt.Appendf(nil, "%s network=%s peer=%s\n", chain[0].Subject, cluster.Network(), peer)
 	case "inspect":
 		b, e := input(src, in)
 		if e != nil {
 			return e
 		}
-		var result bytes.Buffer
-		if err := inspect(b, fingerprint, &result); err != nil {
-			return err
-		}
-		data = result.Bytes()
+		data, err = inspect(b, fingerprint)
 	}
 	if err != nil {
 		return err
@@ -268,19 +266,21 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	return save(dst, data, out)
 }
 
-func parsePrefixes(list string) ([]netip.Prefix, error) {
-	if list == "" {
-		return nil, nil
-	}
-	var prefixes []netip.Prefix
-	for value := range strings.SplitSeq(list, ",") {
-		p, err := netip.ParsePrefix(value)
-		if err != nil {
-			return nil, err
+func listFlag[T any](dst *[]T, parse func(string) (T, error)) func(string) error {
+	return func(list string) error {
+		var values []T
+		if list != "" {
+			for value := range strings.SplitSeq(list, ",") {
+				v, err := parse(value)
+				if err != nil {
+					return err
+				}
+				values = append(values, v)
+			}
 		}
-		prefixes = append(prefixes, p)
+		*dst = values
+		return nil
 	}
-	return prefixes, nil
 }
 
 func usages(role string) ([]x509.ExtKeyUsage, error) {
@@ -310,12 +310,12 @@ func issueCertificate(ca pki.Issuer, request []byte, profile pki.CAProfile, peer
 		return nil, err
 	}
 	hash, err := hex.DecodeString(approved)
-	sum := sha256.Sum256(csr.RawSubjectPublicKeyInfo)
-	if err != nil || !bytes.Equal(hash, sum[:]) {
-		return nil, errors.New("CSR does not match -approved-key")
+	if err != nil || len(hash) != sha256.Size {
+		return nil, errors.New("-approved-key requires a hex-encoded SHA-256 SPKI fingerprint")
 	}
+	approvedKeyHash := [sha256.Size]byte(hash)
 	if role == "ca" {
-		return ca.IssueCA(csr, profile)
+		return ca.IssueCA(csr, profile, approvedKeyHash)
 	}
 	purposes, err := usages(role)
 	if err != nil {
@@ -326,60 +326,57 @@ func issueCertificate(ca pki.Issuer, request []byte, profile pki.CAProfile, peer
 	}
 	return ca.IssueLeaf(csr, pki.Enrollment{
 		Name: profile.Subject.CommonName, IPv4: peer.IPv4(), IPv6: peer.IPv6(), Scope: *profile.Scope,
-		NotBefore: profile.NotBefore, NotAfter: profile.NotAfter, PublicKeyHash: sum, Usages: purposes,
+		NotBefore: profile.NotBefore, NotAfter: profile.NotAfter, PublicKeyHash: approvedKeyHash, Usages: purposes,
 	})
 }
 
-func inspect(b []byte, fingerprint bool, out io.Writer) error {
+func inspect(b []byte, fingerprint bool) ([]byte, error) {
 	block, _ := pem.Decode(b)
 	if block != nil {
 		b = block.Bytes
 	}
-	var pub crypto.PublicKey
+	var spki []byte
 	var detail string
 	if c, e := x509.ParseCertificate(b); e == nil {
-		pub = c.PublicKey
+		spki = c.RawSubjectPublicKeyInfo
 		detail = fmt.Sprintf("certificate subject=%s issuer=%s serial=%s expires=%s", c.Subject, c.Issuer, c.SerialNumber, c.NotAfter)
 		if c.IsCA {
 			scope, present, err := pki.CertificateScope(c)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if present {
-				detail += fmt.Sprintf(" network=%s routes=%v", scope.Network, scope.RoutedPrefixes)
+				detail += fmt.Sprintf(" network=%s cluster=%t routes=%v anycastPools=%v", scope.Network, scope.Cluster, scope.RoutedPrefixes, scope.AnycastPools)
 			}
 			detail += fmt.Sprintf(" permittedIPs=%v", c.PermittedIPRanges)
 		} else {
 			identity, err := pki.ReadIdentity(c)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			detail += fmt.Sprintf(" network=%s peer=%s routes=%v", identity.Network, identity.ID, identity.RoutedPrefixes)
+			detail += fmt.Sprintf(" network=%s peer=%s routes=%v anycastIPs=%v", identity.Network, identity.ID, identity.RoutedPrefixes, identity.AnycastIPs)
 		}
 	} else if r, e := x509.ParseCertificateRequest(b); e == nil {
-		pub = r.PublicKey
+		spki = r.RawSubjectPublicKeyInfo
 		detail = "CSR " + r.Subject.String()
 	} else if k, e := x509.ParsePKCS8PrivateKey(b); e == nil {
 		signer, ok := k.(crypto.Signer)
 		if !ok {
-			return errors.New("unsupported key")
+			return nil, errors.New("unsupported key")
 		}
-		pub = signer.Public()
+		spki, e = x509.MarshalPKIXPublicKey(signer.Public())
+		if e != nil {
+			return nil, e
+		}
 		detail = "private key"
-	} else if k, e := x509.ParsePKIXPublicKey(b); e == nil {
-		pub = k
+	} else if _, e := x509.ParsePKIXPublicKey(b); e == nil {
+		spki = b
 		detail = "public key"
 	} else {
-		return errors.New("unrecognized certificate, CSR, or key")
-	}
-	spki, e := x509.MarshalPKIXPublicKey(pub)
-	if e != nil {
-		return e
+		return nil, errors.New("unrecognized certificate, CSR, or key")
 	}
 	if fingerprint {
-		_, e = fmt.Fprintf(out, "%x\n", sha256.Sum256(spki))
-	} else {
-		_, e = fmt.Fprintf(out, "%s SPKI-SHA256=%x\n", detail, sha256.Sum256(spki))
+		return fmt.Appendf(nil, "%x\n", sha256.Sum256(spki)), nil
 	}
-	return e
+	return fmt.Appendf(nil, "%s SPKI-SHA256=%x\n", detail, sha256.Sum256(spki)), nil
 }

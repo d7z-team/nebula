@@ -1,29 +1,11 @@
 package nebula
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
-	"maps"
-	"net"
-	"net/netip"
 	"slices"
 	"time"
-
-	quic "github.com/quic-go/quic-go"
 )
-
-type attempt struct {
-	done    chan struct{}
-	err     error
-	session *session
-}
-
-type directDial struct {
-	peer     PeerID
-	endpoint Endpoint
-}
 
 // Node.mu protects the registered paths and the hysteresis choice for each peer.
 type peerPaths struct {
@@ -73,22 +55,10 @@ func (s *session) cost() time.Duration {
 	return base
 }
 
-func (n *Node) selectSession(peer PeerID, direct bool) *session {
+func (n *Node) preferredSession(peer PeerID, direct bool) *session {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.selectSessionLocked(peer, direct)
-}
-
-func (n *Node) selectSessionLocked(peer PeerID, direct bool) *session {
-	paths := n.peers[peer]
-	if paths == nil {
-		return nil
-	}
-	best := n.preferredSessionLocked(paths, direct, nil)
-	if !direct {
-		paths.active = best
-	}
-	return best
+	return n.preferredSessionLocked(n.peers[peer], direct, nil)
 }
 
 // preferredSessionLocked applies health scores and hysteresis without changing the selection.
@@ -102,7 +72,7 @@ func (n *Node) preferredSessionLocked(paths *peerPaths, direct bool, packet *inn
 		if s.closed.Load() || direct && len(s.path) > 0 || !n.sessionAllowedLocked(s) {
 			continue
 		}
-		if packet != nil && (!s.localIdentity.AllowsIP(packet.source) || !s.remoteIdentity.AllowsIP(packet.destination)) {
+		if packet != nil && !packet.authorizedOn(n.policy.Load(), s.localIdentity, s.remoteIdentity) {
 			continue
 		}
 		cost := s.cost()
@@ -113,223 +83,74 @@ func (n *Node) preferredSessionLocked(paths *peerPaths, direct bool, packet *inn
 			best, lowest = s, cost
 		}
 	}
-	if direct {
-		return best
-	}
-	if activeCost > 0 && activeCost <= lowest+lowest/5 {
+	if !direct && activeCost > 0 && activeCost <= lowest+lowest/5 {
 		return paths.active
 	}
 	return best
 }
 
-// ConnectPeer waits for a usable path to the member owning either overlay address.
-// Canceling ctx ends this wait. The node owns the shared dial attempt.
-func (n *Node) ConnectPeer(ctx context.Context, address netip.Addr) error {
-	return n.connectPeer(ctx, n.policy.Load().owners[address])
-}
-
-func (n *Node) connectPeer(ctx context.Context, peer PeerID) error {
-	if peer == (PeerID{}) || peer == n.id {
-		return ErrPeerUnavailable
+// directEndpointLocked returns a reusable connection, or the number of usable
+// outgoing alternatives in the same transport and address family.
+func (n *Node) directEndpointLocked(peer PeerID, ep Endpoint) (*session, int) {
+	paths := n.peers[peer]
+	if paths == nil {
+		return nil, 0
 	}
-	n.mu.Lock()
-	if err := n.state.runningError(); err != nil {
-		n.mu.Unlock()
-		return err
-	}
-	if n.modeLocked(peer) == Blocked {
-		n.mu.Unlock()
-		return ErrPathPolicy
-	}
-	if n.selectSessionLocked(peer, false) != nil {
-		n.mu.Unlock()
-		return nil
-	}
-	a := n.attempts[peer]
-	if a == nil {
-		a = &attempt{done: make(chan struct{})}
-		n.attempts[peer] = a
-		n.wg.Go(func() {
-			err := n.establishPath(peer)
-			n.mu.Lock()
-			a.err = err
-			if err != nil {
-				n.lastConnectError = err.Error()
-			}
-			delete(n.attempts, peer)
-			close(a.done)
-			n.mu.Unlock()
-		})
-	}
-	n.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-n.ctx.Done():
-		return ErrNodeClosed
-	case <-a.done:
-		return a.err
-	}
-}
-
-func (n *Node) establishPath(peer PeerID) error {
-	n.mu.Lock()
-	mode := n.modeLocked(peer)
-	n.mu.Unlock()
-	if mode == Blocked {
-		return ErrPathPolicy
-	}
-	var directErr, relayErr error
-	if mode.allowsDirect() {
-		_, directErr = n.dialDirect(n.ctx, peer)
-		if directErr == nil {
-			return nil
+	outgoing := 0
+	for _, s := range paths.sessions {
+		if s.kind != ep.Network || s.closed.Load() || !n.sessionAllowedLocked(s) {
+			continue
+		}
+		remote := s.remoteEndpoint()
+		if remote == ep.Address && (s.outgoing || s.q != nil) {
+			return s, 0
+		}
+		if s.outgoing && remote.Addr().BitLen() == ep.Address.Addr().BitLen() {
+			outgoing++
 		}
 	}
-	if mode.allowsRelay() {
-		for _, path := range n.routes(peer) {
-			ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout*time.Duration(len(path)))
-			_, err := n.startCircuit(ctx, path)
-			cancel()
-			if err == nil {
-				return nil
-			}
-			relayErr = err
-		}
-	}
-	return errors.Join(ErrPeerUnavailable, directErr, relayErr)
-}
-
-func (n *Node) endpointsLocked(peer PeerID) []Endpoint {
-	eps := slices.Clone(n.policy.Load().members[peer].Endpoints)
-	if a := n.discovered[peer]; time.Now().Before(a.Expires) {
-		eps = append(eps, a.Endpoints...)
-	}
-	return eps
-}
-
-func (n *Node) dialDirect(ctx context.Context, peer PeerID) (*session, error) {
-	n.mu.Lock()
-	eps := n.endpointsLocked(peer)
-	mode := n.modeLocked(peer)
-	n.mu.Unlock()
-	if !mode.allowsDirect() {
-		return nil, ErrPathPolicy
-	}
-	var last error
-	tried := make(map[Endpoint]bool)
-	for pass := 0; pass < 2; pass++ {
-		for _, kind := range []string{"udp", "tcp"} {
-			for _, e := range eps {
-				if e.Network != kind || tried[e] {
-					continue
-				}
-				tried[e] = true
-				s, err := n.dialEndpoint(ctx, peer, e)
-				if err == nil {
-					return s, nil
-				}
-				last = err
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-			}
-		}
-		if pass == 0 {
-			if n.lookup(ctx, peer) {
-				// Both peers have had a chance to open their UDP filters.
-				maps.DeleteFunc(tried, func(e Endpoint, _ bool) bool { return e.Network == "udp" })
-			}
-			n.mu.Lock()
-			eps = n.endpointsLocked(peer)
-			n.mu.Unlock()
-		}
-	}
-	return nil, errors.Join(ErrPeerUnavailable, last)
-}
-
-func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*session, error) {
-	n.mu.Lock()
-	mode := n.modeLocked(peer)
-	if !mode.allowsDirect() || !n.endpointAllowedLocked(e.Network, e.Address, false) {
-		n.mu.Unlock()
-		return nil, ErrPathPolicy
-	}
-	if paths := n.peers[peer]; paths != nil {
-		for _, s := range paths.sessions {
-			if s.matchesTransport(e.Network, e.Address) && !s.closed.Load() && n.sessionAllowedLocked(s) {
-				n.mu.Unlock()
-				return s, nil
-			}
-		}
-	}
-	key := directDial{peer, e}
-	if pending := n.directDials[key]; pending != nil {
-		n.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-pending.done:
-			return pending.session, pending.err
-		}
-	}
-	a := &attempt{done: make(chan struct{})}
-	n.directDials[key] = a
-	n.mu.Unlock()
-	dctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
-	defer cancel()
-	if e.Network == "udp" {
-		if transport := n.transports[e.Address.Addr().Is6()]; transport == nil {
-			a.err = ErrPeerUnavailable
-		} else {
-			var q *quic.Conn
-			q, a.err = transport.Dial(dctx, net.UDPAddrFromAddrPort(e.Address), n.tlsConfig(peer, false), n.quicConfig())
-			if a.err == nil {
-				a.session, a.err = n.attachQUIC(q, peer)
-			}
-		}
-	} else {
-		var c net.Conn
-		network := "tcp4"
-		if e.Address.Addr().Is6() {
-			network = "tcp6"
-		}
-		c, a.err = n.o.DialTCP(dctx, network, e.Address.String())
-		if a.err == nil {
-			a.session, a.err = n.attachTLS(dctx, c, peer, nil, true, nil)
-		}
-	}
-	if a.err != nil {
-		n.dialFailures.Add(1)
-	}
-	n.mu.Lock()
-	delete(n.directDials, key)
-	close(a.done)
-	n.mu.Unlock()
-	return a.session, a.err
+	return nil, outgoing
 }
 
 func (n *Node) maintain() {
 	tick := time.NewTicker(n.o.Interval)
 	defer tick.Stop()
+	next := 0
 	for {
 		n.prunePaths()
 		n.mu.Lock()
 		ss := n.sessionListLocked()
-		var targets []PeerID
 		p := n.policy.Load()
-		if n.ready(p) {
-			targets = append(targets, p.members[n.id].Links...)
-		}
-		n.mu.Unlock()
-		for _, a := range targets {
-			if n.selectSession(a, false) == nil {
-				n.tryTask(n.backgroundSlots, func() { _ = n.connectPeer(n.ctx, a) })
+		if n.state == running && n.ready(p) {
+			targets := p.members[n.id].Links
+		schedule:
+			for range targets {
+				next %= len(targets)
+				peer := targets[next]
+				if n.modeLocked(peer) != Blocked && n.attempts[peer] == nil && n.preferredSessionLocked(n.peers[peer], false, nil) == nil {
+					select {
+					case n.backgroundSlots <- struct{}{}:
+						n.startDialLocked(peer, n.backgroundSlots)
+					default:
+						break schedule
+					}
+				}
+				next++
 			}
 		}
+		slices.SortFunc(ss, func(a, b *session) int { return a.lastProbe.Compare(b.lastProbe) })
+		now := time.Now()
 		for _, s := range ss {
-			n.tryTask(n.backgroundSlots, func() { n.probeSession(s) })
+			if s.probing || now.Sub(s.lastProbe) < n.o.Interval*3/4 {
+				continue
+			}
+			if !n.tryTaskLocked(n.probeSlots, func() { n.probeSession(s) }) {
+				break
+			}
+			s.probing = true
+			s.lastProbe = now
 		}
+		n.mu.Unlock()
 		select {
 		case <-n.ctx.Done():
 			return
@@ -339,14 +160,7 @@ func (n *Node) maintain() {
 }
 
 func (n *Node) probeSession(s *session) {
-	if !s.probing.CompareAndSwap(false, true) {
-		return
-	}
-	defer s.probing.Store(false)
-	if time.Since(s.lastProbe) < n.o.Interval*3/4 {
-		return
-	}
-	s.lastProbe = time.Now()
+	defer func() { n.mu.Lock(); s.probing = false; n.mu.Unlock() }()
 	s.refreshBudget()
 	var nonce [8]byte
 	rand.Read(nonce[:])
@@ -392,7 +206,7 @@ func (n *Node) probeSession(s *session) {
 			n.observe(s, remote)
 		}
 	}
-	n.probeAlternatePaths(s, failures)
+	n.tryTask(n.backgroundSlots, func() { n.probeAlternatePaths(s, failures) })
 }
 
 // Establish a missing path before considering it for active traffic.
@@ -403,24 +217,24 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 	if failures == 1 {
 		interval = n.o.Interval
 	}
-	if paths == nil || time.Since(paths.lastCanary) < interval {
+	if paths == nil || !n.usableLocked(s) || time.Since(paths.lastCanary) < interval {
 		n.mu.Unlock()
 		return
 	}
 	paths.lastCanary = time.Now()
 	var candidate Endpoint
+	var eps []Endpoint
 	direct := n.modeLocked(s.peer).allowsDirect()
 	if direct {
-		eps := n.endpointsLocked(s.peer)
+		eps = n.endpointsLocked(s.peer)
 		for i := range eps {
 			index := (paths.nextEndpoint + i) % len(eps)
 			ep := eps[index]
 			if ep.Network == "udp" && n.transports[ep.Address.Addr().Is6()] == nil {
 				continue
 			}
-			if !slices.ContainsFunc(paths.sessions, func(other *session) bool {
-				return other.matchesTransport(ep.Network, ep.Address) && !other.closed.Load()
-			}) {
+			matched, outgoing := n.directEndpointLocked(s.peer, ep)
+			if matched == nil && (failures > 0 || outgoing < maxDirectPerFamily) {
 				candidate = ep
 				paths.nextEndpoint = (index + 1) % len(eps)
 				break
@@ -430,38 +244,51 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 	n.mu.Unlock()
 	if candidate.Valid() {
 		if _, err := n.dialEndpoint(n.ctx, s.peer, candidate); err != nil && candidate.Network == "udp" && n.lookup(n.ctx, s.peer) {
-			_, _ = n.dialEndpoint(n.ctx, s.peer, candidate)
+			n.mu.Lock()
+			var retry Endpoint
+			for _, ep := range n.endpointsLocked(s.peer) {
+				if ep.Network != "udp" || n.transports[ep.Address.Addr().Is6()] == nil || !n.endpointAllowedLocked("udp", ep.Address, false) {
+					continue
+				}
+				if !slices.Contains(eps, ep) {
+					retry = ep
+					break
+				}
+				if ep == candidate {
+					retry = ep
+				}
+			}
+			n.mu.Unlock()
+			if retry.Valid() {
+				_, _ = n.dialEndpoint(n.ctx, s.peer, retry)
+			}
 		}
-	} else if direct && s.kind == "relay" && n.selectSession(s.peer, true) == nil {
+	} else if direct && s.kind == "relay" && n.preferredSession(s.peer, true) == nil {
 		_, _ = n.dialDirect(n.ctx, s.peer)
 	}
 	if s.kind != "relay" && failures == 0 {
 		return
 	}
-	for _, path := range n.routes(s.peer) {
-		if !n.hasCircuit(s.peer, path) {
-			ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout*time.Duration(len(path)))
-			n.startCircuit(ctx, path)
-			cancel()
-			break
+	n.mu.Lock()
+	relays := 0
+	if paths := n.peers[s.peer]; paths != nil {
+		for _, s := range paths.sessions {
+			if s.kind == "relay" && n.usableLocked(s) {
+				relays++
+			}
 		}
+	}
+	n.mu.Unlock()
+	if relays < 2 {
+		_ = n.dialRelay(n.ctx, s.peer, 1)
 	}
 }
 
-func (n *Node) hasCircuit(peer PeerID, route []PeerID) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	paths := n.peers[peer]
-	return paths != nil && slices.ContainsFunc(paths.sessions, func(s *session) bool {
-		return !s.closed.Load() && s.kind == "relay" && slices.Equal(s.path, route)
-	})
-}
-
 // RecommendedMTU returns a route MTU in bytes for the given inner address family.
-// A nonpositive limit selects MaxIPSize. With no known QUIC budget it returns
-// the capped limit. An IPv6 limit below 1280 yields zero.
-func (n *Node) RecommendedMTU(address netip.Addr, ipv6 bool, limit int) int {
-	peer := n.policy.Load().owners[address]
+// A nonpositive limit selects MaxIPSize. An established path also caps the
+// result at its remote receive limit and QUIC budget, subject to the IPv6
+// minimum. Without a path only local limits apply. An IPv6 limit below 1280 yields zero.
+func (n *Node) RecommendedMTU(peer PeerID, ipv6 bool, limit int) int {
 	if limit <= 0 || limit > n.o.MaxIPSize {
 		limit = n.o.MaxIPSize
 	}
@@ -470,7 +297,8 @@ func (n *Node) RecommendedMTU(address netip.Addr, ipv6 bool, limit int) int {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if s := n.preferredSessionLocked(n.peers[peer], false, nil); s != nil && s.q != nil {
+	if s := n.preferredSessionLocked(n.peers[peer], false, nil); s != nil {
+		limit = min(limit, s.remoteIPLimit)
 		if b := int(s.budget.Load()); b > 0 {
 			if ipv6 {
 				b = max(1280, b)

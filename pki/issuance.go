@@ -69,12 +69,27 @@ func issue(template, parent *x509.Certificate, pub crypto.PublicKey, key crypto.
 	if err != nil {
 		return nil, err
 	}
-	return x509.ParseCertificate(der)
+	c, err := x509.ParseCertificate(der)
+	if err == nil && c.IsCA {
+		scope, _, e := CertificateScope(c)
+		if e != nil {
+			return nil, e
+		}
+		if scope.Cluster {
+			if _, e := clusterFromScope(c, scope); e != nil {
+				return nil, e
+			}
+		}
+	}
+	return c, err
 }
 
 func caTemplate(p CAProfile) (*x509.Certificate, error) {
 	c := &x509.Certificate{Subject: p.Subject, NotBefore: p.NotBefore, NotAfter: p.NotAfter, IsCA: true, BasicConstraintsValid: true, MaxPathLen: p.MaxPathLen, MaxPathLenZero: p.MaxPathLen == 0, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
 	if p.Scope != nil {
+		if len(p.Scope.AnycastIPs) > 0 {
+			return nil, errors.New("CA cannot hold service addresses")
+		}
 		e, err := p.Scope.extension()
 		if err != nil {
 			return nil, err
@@ -136,13 +151,30 @@ func (ca Issuer) checkIPRanges(prefixes []netip.Prefix) error {
 	return nil
 }
 
-// IssueCA signs a subordinate CA request. The caller approves the CSR public key.
-func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile) (*x509.Certificate, error) {
+func verifyRequest(csr *x509.CertificateRequest, approvedKeyHash [sha256.Size]byte) error {
+	if csr == nil {
+		return errors.New("certificate request required")
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return fmt.Errorf("CSR signature: %w", err)
+	}
+	if sha256.Sum256(csr.RawSubjectPublicKeyInfo) != approvedKeyHash {
+		return errors.New("CSR public key does not match approved SPKI fingerprint")
+	}
+	return nil
+}
+
+// IssueCA verifies the CSR signature and independently approved SHA-256 digest
+// of its SubjectPublicKeyInfo, then signs a subordinate CA with the supplied profile.
+func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile, approvedKeyHash [sha256.Size]byte) (*x509.Certificate, error) {
 	parent, err := ca.authority(time.Now())
 	if err != nil {
 		return nil, err
 	}
-	if csr == nil || csr.CheckSignature() != nil || p.Subject.String() == "" || p.MaxPathLen < -1 {
+	if err := verifyRequest(csr, approvedKeyHash); err != nil {
+		return nil, err
+	}
+	if p.Subject.String() == "" || p.MaxPathLen < -1 {
 		return nil, errors.New("invalid CA request")
 	}
 	for i, c := range ca.Chain {
@@ -151,7 +183,7 @@ func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile) (*x509.Certi
 		}
 	}
 	if p.Scope != nil {
-		if err := checkDelegation(*p.Scope, ca.Chain); err != nil {
+		if _, err := checkDelegation(*p.Scope, ca.Chain); err != nil {
 			return nil, err
 		}
 	}
@@ -172,14 +204,26 @@ func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Ce
 	if err != nil {
 		return nil, err
 	}
-	if csr == nil || csr.CheckSignature() != nil || sha256.Sum256(csr.RawSubjectPublicKeyInfo) != e.PublicKeyHash || len(e.Usages) == 0 {
-		return nil, errors.New("incomplete or mismatched enrollment")
-	}
-	t := &x509.Certificate{Subject: pkix.Name{CommonName: e.Name}, NotBefore: e.NotBefore, NotAfter: e.NotAfter, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: e.Usages}
-	if _, err := NewPeerID(e.IPv4, e.IPv6); err != nil {
+	if err := verifyRequest(csr, e.PublicKeyHash); err != nil {
 		return nil, err
 	}
-	if err := checkDelegation(e.Scope, ca.Chain); err != nil {
+	if len(e.Usages) == 0 {
+		return nil, errors.New("enrollment must specify certificate usages")
+	}
+	t := &x509.Certificate{Subject: pkix.Name{CommonName: e.Name}, NotBefore: e.NotBefore, NotAfter: e.NotAfter, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: e.Usages}
+	id, err := NewPeerID(e.IPv4, e.IPv6)
+	if err != nil {
+		return nil, err
+	}
+	clusterCA, err := checkDelegation(e.Scope, ca.Chain)
+	if err != nil {
+		return nil, err
+	}
+	cluster, err := ReadClusterCA(clusterCA)
+	if err != nil {
+		return nil, err
+	}
+	if err := cluster.validateIdentity(Identity{id, e.Scope}); err != nil {
 		return nil, err
 	}
 	ext, err := e.Scope.extension()
@@ -191,5 +235,25 @@ func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Ce
 	if err := ca.checkIPRanges([]netip.Prefix{netip.PrefixFrom(e.IPv4, 32), netip.PrefixFrom(e.IPv6, 128)}); err != nil {
 		return nil, err
 	}
-	return issue(t, parent, csr.PublicKey, ca.Signer)
+	leaf, err := issue(t, parent, csr.PublicKey, ca.Signer)
+	if err != nil {
+		return nil, err
+	}
+	// Use the supplied issuance path as the local trust decision. PKIX treats
+	// multiple requested usages as alternatives, so verify each separately.
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.Chain[len(ca.Chain)-1])
+	chain := append([]*x509.Certificate{leaf}, ca.Chain[:len(ca.Chain)-1]...)
+	at := leaf.NotBefore
+	for _, issuer := range ca.Chain {
+		if issuer.NotBefore.After(at) {
+			at = issuer.NotBefore
+		}
+	}
+	for _, usage := range e.Usages {
+		if _, err := VerifyChain(chain, roots, cluster, id, usage, at); err != nil {
+			return nil, fmt.Errorf("issue leaf for %v: %w", usage, err)
+		}
+	}
+	return leaf, nil
 }

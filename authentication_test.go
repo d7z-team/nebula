@@ -76,15 +76,15 @@ func TestMaximumEventAndInventoryFrames(t *testing.T) {
 	defer sub.Close()
 	require.NoError(t, n.ConnectPeer(t.Context(), other.id.IPv4()))
 	// Pull the signed maximum-payload event over the real control stream.
-	require.Eventually(t, func() bool { return other.selectSession(n.id, false) != nil }, time.Second, time.Millisecond)
-	wire, err := other.selectSession(n.id, false).request(t.Context(), opGetEvent, []byte(id), pki.MaxDocument)
+	require.Eventually(t, func() bool { return other.preferredSession(n.id, false) != nil }, time.Second, time.Millisecond)
+	wire, err := other.preferredSession(n.id, false).request(t.Context(), opGetEvent, []byte(id), pki.MaxDocument)
 	require.NoError(t, err)
 	require.Equal(t, []byte(event.record), wire)
-	_, chain, err := pki.VerifyObjectSignature(wire, n.network, "event")
+	_, chain, err := pki.VerifyObjectSignature(wire, n.Cluster().Network(), "event")
 	require.NoError(t, err)
 	require.True(t, chain[0].Equal(n.cred.Load().Object.Leaf))
 	// Push the same DER over the opposite stream and observe local delivery.
-	_, err = n.selectSession(other.id, false).request(t.Context(), opEvent, wire, 0)
+	_, err = n.preferredSession(other.id, false).request(t.Context(), opEvent, wire, 0)
 	require.NoError(t, err)
 	select {
 	case received := <-sub.Events():
@@ -105,14 +105,13 @@ func TestIntroductionAfterSignerReload(t *testing.T) {
 	to.acknowledgedIntro.Store(receiver.advert(&session{peer: sender.id}).Seen)
 	require.Empty(t, sender.advert(to).Record)
 
-	leaf, key := f.issue(sender.id)
 	set := f.opts[0].Certificates
-	set.Object = tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: key}
+	set.Object = f.issue(sender.id, pki.Scope{})
 	require.NoError(t, sender.ReloadCertificates(t.Context(), set))
 	record := sender.advert(to).Record
-	_, chain, err := pki.VerifyObjectSignature(record, sender.network, "introduction")
+	_, chain, err := pki.VerifyObjectSignature(record, sender.Cluster().Network(), "introduction")
 	require.NoError(t, err)
-	require.True(t, leaf.Equal(chain[0]))
+	require.True(t, set.Object.Leaf.Equal(chain[0]))
 	peer, ok := receiver.learn(record)
 	require.True(t, ok)
 	require.Equal(t, sender.id, peer)
@@ -196,7 +195,7 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			require.NoError(t, err)
 			root := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
 			now := time.Now().Truncate(time.Second)
-			inter, err := root.IssueCA(req, pki.CAProfile{Subject: req.Subject, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour / 2)})
+			inter, err := root.IssueCA(req, pki.CAProfile{Subject: req.Subject, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour / 2)}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 			require.NoError(t, err)
 			key, err := pki.GenerateKey("ed25519")
 			require.NoError(t, err)
@@ -215,8 +214,8 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			require.NoError(t, b.ReloadCertificates(t.Context(), replacement))
 			release()
 			require.NoError(t, <-dial)
-			require.Eventually(t, func() bool { return b.selectSession(a.id, false) != nil }, time.Second, 5*time.Millisecond)
-			s := a.selectSession(labPeer(addr), false)
+			require.Eventually(t, func() bool { return b.preferredSession(a.id, false) != nil }, time.Second, 5*time.Millisecond)
+			s := a.preferredSession(labPeer(addr), false)
 			require.NotNil(t, s)
 			require.Equal(t, kind, s.kind)
 			require.True(t, s.state.PeerCertificates[0].Equal(old))
@@ -226,9 +225,9 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			denied.Store(true)
 			require.NoError(t, b.Revalidate(t.Context()))
 			require.True(t, b.ControlStatus().Ready)
-			require.Eventually(t, func() bool { return a.selectSession(labPeer(addr), false) == nil }, 2*time.Second, 5*time.Millisecond)
+			require.Eventually(t, func() bool { return a.preferredSession(labPeer(addr), false) == nil }, 2*time.Second, 5*time.Millisecond)
 			require.NoError(t, a.ConnectPeer(t.Context(), addr))
-			require.True(t, a.selectSession(labPeer(addr), false).state.PeerCertificates[0].Equal(leaf))
+			require.True(t, a.preferredSession(labPeer(addr), false).state.PeerCertificates[0].Equal(leaf))
 		})
 	}
 }
@@ -241,7 +240,7 @@ func TestReloadRejectsExpiredHostDecision(t *testing.T) {
 		if !renew.Load() {
 			return time.Time{}, nil
 		}
-		if c.Usage == x509.ExtKeyUsageClientAuth && !c.Object {
+		if c.Usage == x509.ExtKeyUsageClientAuth {
 			cut = time.Now().Add(25 * time.Millisecond)
 			return cut, nil
 		}
@@ -257,10 +256,12 @@ func TestReloadRejectsExpiredHostDecision(t *testing.T) {
 	f.start()
 	n := f.nodes[0]
 	before := n.ControlStatus()
-	leaf, key := f.issue(n.id)
+	cert := f.issue(n.id, pki.Scope{})
 	renew.Store(true)
-	err := n.ReloadCertificates(t.Context(), LocalCertificates{Client: tls.Certificate{PrivateKey: key, Certificate: [][]byte{leaf.Raw}}})
+	err := n.ReloadCertificates(t.Context(), LocalCertificates{Client: cert})
 	require.ErrorIs(t, err, ErrPathPolicy)
 	require.Equal(t, before.Serial, n.ControlStatus().Serial)
 	require.True(t, n.ControlStatus().Ready)
+	require.NoError(t, n.Revalidate(t.Context()))
+	require.False(t, n.ControlStatus().Ready)
 }

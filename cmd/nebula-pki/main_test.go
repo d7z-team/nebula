@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -24,16 +25,26 @@ func TestOfflinePKI(t *testing.T) {
 	command("request", "-key", "issuer.key", "-out", "issuer.csr")
 	issuerHash := strings.TrimSpace(command("inspect", "-in", "issuer.csr", "-fingerprint"))
 	issuer := command("issue", "-role", "ca", "-name", "Lab CA", "-in", "issuer.csr", "-approved-key", issuerHash,
-		"-ca", "ca.pem", "-ca-key", "ca.key", "-network", "lab", "-routes", "192.0.2.0/24", "-permit-ips", "10.0.0.0/24,fd42::/64")
+		"-ca", "ca.pem", "-ca-key", "ca.key", "-network", "lab", "-routes", "192.0.2.0/24", "-cluster", "-anycast-pools", "10.0.0.128/26", "-permit-ips", "10.0.0.0/24,fd42::/64")
 	require.NoError(t, os.WriteFile("issuer.pem", []byte(issuer), 0o600))
 	command("keygen", "-out", "node.key")
 	command("request", "-key", "node.key", "-name", "client", "-out", "node.csr")
 	hash := strings.TrimSpace(command("inspect", "-in", "node.csr", "-fingerprint"))
+	for _, role := range []string{"node", "ca"} {
+		err := run([]string{
+			"issue", "-role", role, "-in", "node.csr", "-approved-key", issuerHash,
+			"-name", "node", "-ca", "ca.pem", "-ca-key", "ca.key", "-network", "lab",
+			"-ipv4", "10.0.0.1", "-ipv6", "fd42::1",
+		}, nil, io.Discard, io.Discard)
+		require.ErrorContains(t, err, "fingerprint")
+	}
 	leaf := command("issue", "-in", "node.csr", "-name", "node", "-approved-key", hash, "-ca", "issuer.pem", "-ca-key", "issuer.key",
-		"-network", "lab", "-routes", "192.0.2.0/25", "-ipv4", "10.0.0.1", "-ipv6", "fd42::1")
+		"-network", "lab", "-anycast-ips", "10.0.0.130,10.0.0.131", "-routes", "192.0.2.0/25", "-ipv4", "10.0.0.1", "-ipv6", "fd42::1")
 	require.NoError(t, os.WriteFile("chain.pem", []byte(leaf+issuer), 0o600))
-	require.Contains(t, command("inspect", "-in", "chain.pem"), "routes=[192.0.2.0/25]")
-	require.Contains(t, command("verify", "-roots", "ca.pem", "-network", "lab", "-ipv4", "10.0.0.1", "-ipv6", "fd42::1", "-in", "chain.pem"), "node")
+	details := command("inspect", "-in", "chain.pem")
+	require.Contains(t, details, "routes=[192.0.2.0/25]")
+	require.Contains(t, details, "anycastIPs=[10.0.0.130 10.0.0.131]")
+	require.Contains(t, command("verify", "-roots", "ca.pem", "-cluster-ca", "issuer.pem", "-ipv4", "10.0.0.1", "-ipv6", "fd42::1", "-in", "chain.pem"), "node")
 }
 
 func TestHelp(t *testing.T) {

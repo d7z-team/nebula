@@ -10,10 +10,12 @@ import (
 	"slices"
 	"time"
 
+	"code.d7z.net/d7z-team/nebula/meshwire"
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
-const ALPN = "nebula-mesh"
+// ALPN identifies mesh TLS connections over TCP and QUIC.
+const ALPN = meshwire.ALPN
 
 // LocalCertificates holds leaf-first chains for clientAuth, serverAuth and codeSigning.
 // Empty Server and Object credentials reuse Client.
@@ -30,7 +32,6 @@ type ChainCheck struct {
 	Member PeerID
 	Local  bool
 	Usage  x509.ExtKeyUsage
-	Object bool
 	Chain  []*x509.Certificate
 }
 
@@ -82,11 +83,11 @@ func (n *Node) authorizeChain(ctx context.Context, p *topologyView, peer PeerID,
 	if _, ok := p.members[peer]; !ok {
 		return time.Time{}, ErrPathPolicy
 	}
-	paths, err := pki.VerifyChain(chain, n.o.Roots, p.Network, peer, usage, time.Now())
+	paths, err := pki.VerifyChain(chain, n.o.Roots, p.cluster, peer, usage, time.Now())
 	if err != nil {
 		return time.Time{}, err
 	}
-	return n.chainDeadline(ctx, ChainCheck{Member: peer, Local: peer == n.id, Usage: usage, Object: usage == x509.ExtKeyUsageCodeSigning}, paths)
+	return n.chainDeadline(ctx, ChainCheck{Member: peer, Local: peer == n.id, Usage: usage}, paths)
 }
 
 // A hook can shorten a PKIX path's lifetime or deny that particular path.
@@ -135,7 +136,10 @@ func (n *Node) credentialDeadline(ctx context.Context, p *topologyView, c *crede
 	return end, nil
 }
 
-// ReloadCertificates installs a complete local credential set for future handshakes.
+// ReloadCertificates verifies and atomically installs a complete credential set
+// for the same member. An error leaves the current set in place. New handshakes
+// and signatures use the new credentials. Paths reports the certificates
+// actually used by established sessions.
 func (n *Node) ReloadCertificates(ctx context.Context, in LocalCertificates) error {
 	c, err := prepareCertificates(in)
 	if err != nil {
@@ -203,7 +207,7 @@ func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
 		if server {
 			usage = x509.ExtKeyUsageClientAuth
 		}
-		identity, paths, err := pki.VerifiedPeer(st.VerifiedChains, p.Network, usage)
+		identity, paths, err := pki.VerifiedPeer(st.VerifiedChains, p.cluster, usage)
 		if err != nil {
 			return err
 		}
@@ -231,12 +235,12 @@ func (n *Node) signStatement(kind string, value any, signer tls.Certificate) (st
 	if err != nil {
 		return nil, err
 	}
-	return pki.SignObject(n.network, kind, b, signer)
+	return pki.SignObject(n.Cluster().Network(), kind, b, signer)
 }
 
 func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (PeerID, []byte, time.Time, error) {
 	var a PeerID
-	b, chain, err := pki.VerifyObjectSignature(s, n.network, kind)
+	b, chain, err := pki.VerifyObjectSignature(s, p.cluster.Network(), kind)
 	if err != nil {
 		return a, nil, time.Time{}, err
 	}

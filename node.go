@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"code.d7z.net/d7z-team/nebula/meshwire"
 	"code.d7z.net/d7z-team/nebula/pki"
 
 	quic "github.com/quic-go/quic-go"
@@ -25,24 +26,28 @@ var (
 	ErrNodeClosed          = errors.New("node closed")
 	ErrPeerUnavailable     = errors.New("peer unavailable")
 	ErrPathPolicy          = errors.New("path denied")
+	ErrPacketTooLarge      = errors.New("packet exceeds receive limit")
 	ErrQueueFull           = errors.New("queue full")
 	ErrPortClosed          = errors.New("IP port closed")
 	ErrAddressUnauthorized = errors.New("address unauthorized")
-	ErrMissingGateway      = errors.New("next hop required")
+	ErrNextHopRequired     = errors.New("next hop required")
 )
 
 // Options configures a node's transports, credentials and initial topology.
 type Options struct {
 	// Roots is the explicit trust store. New takes a private copy.
-	Roots        *x509.CertPool
+	Roots *x509.CertPool
+	// ClusterCA pins the certificate defining this mesh within Roots.
+	ClusterCA    *x509.Certificate
 	Certificates LocalCertificates
 	Topology     Topology
 	// CheckChain may deny a verified chain or shorten its lifetime. A zero deadline
 	// accepts the chain until expiry. Calls may run concurrently.
 	CheckChain func(context.Context, ChainCheck) (time.Time, error)
 	// UDP sockets carry QUIC and hole punches for their respective address families.
+	// Sockets implementing meshwire.SharedSocket configure the node's QUIC transport at startup.
 	UDP4, UDP6 net.PacketConn
-	// TCP listeners accept inbound TLS connections.
+	// TCP listeners accept inbound TLS connections, including from portshare.TCP.Mesh.
 	TCP4, TCP6 net.Listener
 	// DialTCP opens outbound TCP connections. The default is net.Dialer.DialContext.
 	DialTCP func(context.Context, string, string) (net.Conn, error)
@@ -54,7 +59,8 @@ type Options struct {
 	DialTimeout time.Duration
 	// MaxCircuits limits concurrent circuits at this node. The default is 128.
 	MaxCircuits int
-	// MaxIPSize bounds a complete inner packet in bytes (1280 through 65535). Zero selects 65535.
+	// MaxIPSize bounds a complete inner packet in bytes and is advertised to authenticated peers.
+	// The range is 1280 through 65535. Zero selects 65535.
 	MaxIPSize int
 	// InboundPolicy optionally filters authenticated, address-authorized IP packets.
 	// Calls run on receive tasks and may overlap.
@@ -63,45 +69,47 @@ type Options struct {
 
 // Node manages the transports and peer sessions for one mesh identity.
 type Node struct {
-	o                Options
-	id               PeerID
-	network          string
-	ctx              context.Context
-	cancel           context.CancelFunc
-	mu               sync.Mutex
-	udpWrites        sync.RWMutex
-	state            lifecycle
-	wg               sync.WaitGroup
-	done             chan struct{}
-	cred             atomic.Pointer[credentials]
-	policy           atomic.Pointer[topologyView]
-	admissions       uint64 // increments when a session or event joins the live set
-	introMu          sync.Mutex
-	introCache       cachedIntroduction
-	transports       map[bool]*quic.Transport
-	listeners        []*quic.Listener
-	peers            map[PeerID]*peerPaths
-	modes            map[PeerID]PathMode
-	discovered       map[PeerID]introduction
-	attempts         map[PeerID]*attempt
-	directDials      map[directDial]*attempt
-	observations     map[observer]observation
-	introduced       map[Endpoint]map[PeerID]time.Time
-	deniedUDP        map[netip.AddrPort]deniedEndpoint
-	queries          map[string]time.Time
-	backgroundSlots  chan struct{}
-	port             *IPPort
-	handshakeSlots   chan struct{}
-	sizeQuery        []byte
-	circuits         map[*circuitLease]struct{}
-	limiter          *rate.Limiter
-	rateCtx          context.Context
-	rateCancel       context.CancelFunc
-	bytesScheduled   atomic.Uint64
-	dialFailures     atomic.Uint64
-	events           map[string]cachedEvent
-	subscriptions    map[*Subscription]struct{}
-	lastConnectError string
+	o                      Options
+	id                     PeerID
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	mu                     sync.Mutex
+	udpWrites              sync.RWMutex
+	state                  lifecycle
+	wg                     sync.WaitGroup
+	done                   chan struct{}
+	cred                   atomic.Pointer[credentials]
+	policy                 atomic.Pointer[topologyView]
+	admissions             uint64 // increments when a session or event joins the live set
+	introMu                sync.Mutex
+	introCache             cachedIntroduction
+	transports             map[bool]*udpTransport
+	peers                  map[PeerID]*peerPaths
+	modes                  map[PeerID]PathMode
+	discovered             map[PeerID]learnedIntroduction
+	attempts               map[PeerID]*peerAttempt
+	directDials            map[directDial]*endpointAttempt
+	observations           map[observer]observation
+	introduced             map[Endpoint]map[PeerID]time.Time
+	deniedUDP              map[netip.AddrPort]deniedEndpoint
+	queries                map[string]time.Time
+	backgroundSlots        chan struct{}
+	sharedAddressDialSlots chan struct{}
+	port                   *IPPort
+	handshakeSlots         chan struct{}
+	sizeQuery              []byte
+	routeCursors           map[PeerID]*routeCursor
+	probeSlots             chan struct{}
+	circuits               map[*circuitLease]struct{}
+	limiter                *rate.Limiter
+	rateCtx                context.Context
+	rateCancel             context.CancelFunc
+	bytesScheduled         atomic.Uint64
+	dialFailures           atomic.Uint64
+	events                 map[string]cachedEvent
+	subscriptions          map[*Subscription]struct{}
+	lastConnectError       string
+	listenerErrors         map[string]string
 }
 
 type lifecycle uint8
@@ -134,7 +142,12 @@ func New(parent context.Context, o Options) (*Node, error) {
 		return nil, errors.New("explicit trust roots required")
 	}
 	o.Roots = o.Roots.Clone()
-	view, err := o.Topology.compile()
+	cluster, err := pki.ReadClusterCA(o.ClusterCA)
+	if err != nil {
+		return nil, err
+	}
+	o.ClusterCA = nil
+	view, err := o.Topology.compile(cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -174,26 +187,28 @@ func New(parent context.Context, o Options) (*Node, error) {
 	o.AdvertiseEndpoints = slices.Clone(o.AdvertiseEndpoints)
 	ctx, cancel := context.WithCancel(parent)
 	n := &Node{
-		o:               o,
-		network:         view.Network,
-		id:              identity.ID,
-		ctx:             ctx,
-		cancel:          cancel,
-		done:            make(chan struct{}),
-		peers:           make(map[PeerID]*peerPaths),
-		modes:           make(map[PeerID]PathMode),
-		attempts:        make(map[PeerID]*attempt),
-		directDials:     make(map[directDial]*attempt),
-		deniedUDP:       make(map[netip.AddrPort]deniedEndpoint),
-		circuits:        make(map[*circuitLease]struct{}),
-		discovered:      make(map[PeerID]introduction),
-		introduced:      make(map[Endpoint]map[PeerID]time.Time),
-		observations:    make(map[observer]observation),
-		queries:         make(map[string]time.Time),
-		events:          make(map[string]cachedEvent),
-		subscriptions:   make(map[*Subscription]struct{}),
-		handshakeSlots:  make(chan struct{}, 128),
-		backgroundSlots: make(chan struct{}, 16),
+		o:                      o,
+		id:                     identity.ID,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		done:                   make(chan struct{}),
+		peers:                  make(map[PeerID]*peerPaths),
+		modes:                  make(map[PeerID]PathMode),
+		attempts:               make(map[PeerID]*peerAttempt),
+		directDials:            make(map[directDial]*endpointAttempt),
+		deniedUDP:              make(map[netip.AddrPort]deniedEndpoint),
+		routeCursors:           make(map[PeerID]*routeCursor),
+		probeSlots:             make(chan struct{}, 4),
+		circuits:               make(map[*circuitLease]struct{}),
+		discovered:             make(map[PeerID]learnedIntroduction),
+		introduced:             make(map[Endpoint]map[PeerID]time.Time),
+		observations:           make(map[observer]observation),
+		queries:                make(map[string]time.Time),
+		events:                 make(map[string]cachedEvent),
+		subscriptions:          make(map[*Subscription]struct{}),
+		handshakeSlots:         make(chan struct{}, 128),
+		backgroundSlots:        make(chan struct{}, 12),
+		sharedAddressDialSlots: make(chan struct{}, 8),
 	}
 	c.until, err = n.credentialDeadline(ctx, view, c)
 	if err != nil {
@@ -214,30 +229,24 @@ func New(parent context.Context, o Options) (*Node, error) {
 	return n, nil
 }
 
-func (n *Node) task(fn func()) bool {
+// tryTask reserves capacity before scheduling work, and releases it on shutdown.
+func (n *Node) tryTask(slots chan struct{}, fn func()) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.tryTaskLocked(slots, fn)
+}
+
+func (n *Node) tryTaskLocked(slots chan struct{}, fn func()) bool {
 	if n.state != running {
 		return false
 	}
-	n.wg.Go(fn)
-	return true
-}
-
-// tryTask reserves capacity before scheduling work, and releases it on shutdown.
-func (n *Node) tryTask(slots chan struct{}, fn func()) bool {
 	select {
 	case slots <- struct{}{}:
-		if n.task(func() {
-			defer func() { <-slots }()
-			fn()
-		}) {
-			return true
-		}
-		<-slots
+		n.wg.Go(func() { defer func() { <-slots }(); fn() })
+		return true
 	default:
+		return false
 	}
-	return false
 }
 
 // Start begins accepting peer connections and maintaining authorized paths.
@@ -260,61 +269,51 @@ func (n *Node) Start() error {
 	if n.o.UDP4 != nil || n.o.UDP6 != nil {
 		n.sizeQuery = make([]byte, MaxIPPacketSize+1)
 	}
-	n.transports = make(map[bool]*quic.Transport, 2)
+	n.transports = make(map[bool]*udpTransport, 2)
+	var listeners []*quic.Listener
 	for ipv6, udp := range map[bool]net.PacketConn{false: n.o.UDP4, true: n.o.UDP6} {
 		if udp == nil {
 			continue
 		}
-		socket := &policySocket{PacketConn: udp, n: n}
-		var pc net.PacketConn = socket
-		type bufferedSocket interface {
-			syscall.Conn
-			SetReadBuffer(int) error
-			SetWriteBuffer(int) error
-		}
-		if raw, ok := udp.(bufferedSocket); ok {
-			pc = &struct {
-				*policySocket
-				bufferedSocket
-			}{socket, raw}
-		} else if raw, ok := udp.(syscall.Conn); ok {
-			pc = &struct {
-				*policySocket
-				syscall.Conn
-			}{socket, raw}
-		}
-		transport := &quic.Transport{Conn: pc}
+		transport := n.newUDPTransport(udp)
 		n.transports[ipv6] = transport
-		listener, err := transport.Listen(n.tlsConfig(PeerID{}, true), n.quicConfig())
+		listener, err := transport.Listen(n.tlsConfig(PeerID{}, true), transport.config)
 		if err != nil {
 			n.mu.Unlock()
 			n.Close()
 			return err
 		}
-		n.listeners = append(n.listeners, listener)
+		listeners = append(listeners, listener)
 	}
-	n.mu.Unlock()
-	for _, listener := range n.listeners {
-		n.task(func() {
+	for _, listener := range listeners {
+		n.wg.Go(func() {
 			for {
 				q, err := listener.Accept(n.ctx)
 				if err != nil {
 					return
 				}
-				if !n.tryTask(n.handshakeSlots, func() { n.attachQUIC(q, PeerID{}) }) {
+				if !n.tryTask(n.handshakeSlots, func() { n.attachQUIC(n.ctx, q, PeerID{}) }) {
 					q.CloseWithError(0, "closing")
 				}
 			}
 		})
 	}
-	for _, listener := range []net.Listener{n.o.TCP4, n.o.TCP6} {
+	for family, listener := range map[string]net.Listener{"tcp4": n.o.TCP4, "tcp6": n.o.TCP6} {
 		if listener == nil {
 			continue
 		}
-		n.task(func() {
+		n.wg.Go(func() {
 			for {
-				c, err := listener.Accept()
+				c, err := meshwire.AcceptTCP(listener, n.ctx.Done())
 				if err != nil {
+					n.mu.Lock()
+					if n.state == running && n.ctx.Err() == nil {
+						if n.listenerErrors == nil {
+							n.listenerErrors = make(map[string]string)
+						}
+						n.listenerErrors[family] = err.Error()
+					}
+					n.mu.Unlock()
 					return
 				}
 				ep := addrPort(c.RemoteAddr())
@@ -328,13 +327,15 @@ func (n *Node) Start() error {
 			}
 		})
 	}
-	n.task(n.maintain)
+	n.wg.Go(n.maintain)
+	n.mu.Unlock()
 	go func() { <-n.ctx.Done(); n.Close() }()
 	return nil
 }
 
 // Close shuts down the node and waits for its background tasks to finish.
-// Call Close outside the IP receive callback, which runs on one of those tasks.
+// From a callback running on a node task, signal the owner to close the node
+// after the callback returns.
 func (n *Node) Close() error {
 	n.mu.Lock()
 	if n.state == closed {
@@ -352,6 +353,15 @@ func (n *Node) Close() error {
 		delete(n.subscriptions, sub)
 	}
 	n.mu.Unlock()
+	// Let QUIC flush its close frame, even when another service has the
+	// physical writer. A stalled write must not hold up shutdown indefinitely.
+	sockets := [...]net.PacketConn{n.o.UDP4, n.o.UDP6}
+	deadline := time.Now().Add(n.o.DialTimeout)
+	for _, pc := range sockets {
+		if pc != nil {
+			pc.SetWriteDeadline(deadline)
+		}
+	}
 	for _, s := range sessions {
 		s.close()
 	}
@@ -360,13 +370,11 @@ func (n *Node) Close() error {
 			l.Close()
 		}
 	}
-	for _, l := range n.listeners {
-		l.Close()
-	}
 	for _, t := range n.transports {
+		// Closing a QUIC transport also releases its listener.
 		t.Close()
 	}
-	for _, pc := range []net.PacketConn{n.o.UDP4, n.o.UDP6} {
+	for _, pc := range sockets {
 		if pc != nil {
 			pc.Close()
 		}
@@ -379,11 +387,38 @@ func (n *Node) Close() error {
 	return nil
 }
 
-func (n *Node) quicConfig() *quic.Config {
-	return &quic.Config{
+type udpTransport struct {
+	*quic.Transport
+	config *quic.Config
+}
+
+func (n *Node) newUDPTransport(udp net.PacketConn) *udpTransport {
+	socket := &policySocket{PacketConn: udp, n: n}
+	var pc net.PacketConn = socket
+	type bufferedSocket interface {
+		syscall.Conn
+		SetReadBuffer(int) error
+		SetWriteBuffer(int) error
+	}
+	if raw, ok := udp.(bufferedSocket); ok {
+		pc = &struct {
+			*policySocket
+			bufferedSocket
+		}{socket, raw}
+	} else if raw, ok := udp.(syscall.Conn); ok {
+		pc = &struct {
+			*policySocket
+			syscall.Conn
+		}{socket, raw}
+	}
+	t := &udpTransport{Transport: &quic.Transport{Conn: pc}, config: &quic.Config{
 		Versions: []quic.Version{quic.Version1}, EnableDatagrams: true, InitialPacketSize: 1200,
 		HandshakeIdleTimeout: n.o.DialTimeout, MaxIncomingStreams: maxSessionStreams, MaxIncomingUniStreams: -1,
+	}}
+	if shared, ok := udp.(meshwire.SharedSocket); ok {
+		shared.ConfigureMeshQUIC(t.Transport, t.config)
 	}
+	return t
 }
 
 // ID returns the certified overlay address pair.
@@ -408,3 +443,6 @@ func addrPort(a net.Addr) netip.AddrPort {
 	ap, _ := netip.ParseAddrPort(a.String())
 	return ap
 }
+
+// Cluster returns the immutable certified address plan.
+func (n *Node) Cluster() pki.Cluster { return n.policy.Load().cluster }

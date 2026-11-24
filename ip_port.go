@@ -6,12 +6,15 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
-
-	"code.d7z.net/d7z-team/nebula/pki"
 )
 
 // MaxIPPacketSize is the largest inner packet accepted by a node, in bytes.
 const MaxIPPacketSize = 65535
+
+const (
+	maxPortQueue   = 512
+	maxTargetQueue = 64
+)
 
 // PortStats holds counters for this attachment. Queued excludes in-flight packets.
 type PortStats struct {
@@ -22,34 +25,67 @@ type PortStats struct {
 	LastDrop                          string
 }
 
+// TransmitResult describes a dequeued packet's local submission attempt.
+// A nil Err means the local transport accepted the packet. Transport is "udp",
+// "tcp", or "relay" when a path was selected, including a remote size-limit
+// rejection. It is empty if no path was selected.
+type TransmitResult struct {
+	Peer                PeerID
+	Source, Destination netip.Addr
+	Transport           string
+	// Endpoint reports the remote address observed on a direct transport.
+	Endpoint netip.AddrPort
+	// Circuit contains both endpoints and the intermediate members on a relay.
+	Circuit []PeerID
+	Err     error
+}
+
+// IPPortOptions attaches host callbacks. They run without node or port locks
+// and may overlap. Call Node.Close outside receive and transmit callbacks.
+type IPPortOptions struct {
+	// Deliver receives a complete packet and its authenticated end-to-end sender.
+	Deliver func(from PeerID, packet []byte)
+	// ResolveNextHop chooses a member synchronously for a VIP or downstream
+	// destination when WriteIP has no explicit next hop. The packet is read-only
+	// for the duration of the call. Return a nonzero ID or a routing error.
+	ResolveNextHop func(destination netip.Addr, packet []byte) (PeerID, error)
+	// ObserveTransmit receives the result of each dequeued attempt. Stats counts
+	// queue overflow and policy drops while waiting. Keep the callback brief.
+	ObserveTransmit func(TransmitResult)
+}
+
+type outboundPacket struct {
+	innerPacket
+	data []byte
+}
+
 type ipQueue struct {
-	packets     [][]byte
-	current     []byte
+	packets     []*outboundPacket
+	current     *outboundPacket
 	stopCurrent context.CancelFunc
 }
 
 // IPPort delivers complete IPv4 and IPv6 packets for one attachment.
 type IPPort struct {
-	node    *Node
-	deliver func([]byte)
-	mu      sync.Mutex
-	closed  bool
-	queues  map[PeerID]*ipQueue
-	stats   PortStats
+	node   *Node
+	opts   IPPortOptions
+	mu     sync.Mutex
+	closed bool
+	queues map[PeerID]*ipQueue
+	stats  PortStats
 }
 
-// OpenIPPort attaches the sole IP receiver, including before Start. The callback
-// can run concurrently on receive tasks. Call Node.Close outside the callback.
-func (n *Node) OpenIPPort(deliver func([]byte)) (*IPPort, error) {
+// OpenIPPort attaches the sole IP receiver, including before Start.
+func (n *Node) OpenIPPort(opts IPPortOptions) (*IPPort, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.state == closed {
 		return nil, ErrNodeClosed
 	}
-	if n.port != nil || deliver == nil {
+	if n.port != nil || opts.Deliver == nil {
 		return nil, errors.New("IP receiver already attached or nil")
 	}
-	p := &IPPort{node: n, deliver: deliver, queues: map[PeerID]*ipQueue{}}
+	p := &IPPort{node: n, opts: opts, queues: make(map[PeerID]*ipQueue)}
 	n.port = p
 	return p, nil
 }
@@ -70,10 +106,9 @@ func (p *IPPort) Close() {
 	n.mu.Unlock()
 }
 
-// ClearPending discards the peer's backlog and cancels a send waiting for a path or bandwidth.
-// The count includes only packets that were still waiting in the queue.
-func (p *IPPort) ClearPending(address netip.Addr) int {
-	peer := p.node.policy.Load().owners[address]
+// ClearPending discards the member's backlog and cancels its in-flight packet.
+// The returned count excludes the in-flight packet.
+func (p *IPPort) ClearPending(peer PeerID) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.discardQueueLocked(peer)
@@ -101,153 +136,106 @@ func (p *IPPort) Stats() PortStats {
 	return p.stats
 }
 
-func (ip innerPacket) authorizedBy(cfg *topologyView, from, to PeerID) bool {
-	return cfg.authorizes(from, ip.source) && cfg.authorizes(to, ip.destination)
-}
-
-func (ip innerPacket) authorizedOn(cfg *topologyView, from, to pki.Identity) bool {
-	return ip.authorizedBy(cfg, from.ID, to.ID) && from.AllowsIP(ip.source) && to.AllowsIP(ip.destination)
-}
-
-// WriteIP queues a copy of a complete IP packet. A zero via selects the member
-// that owns the destination address. For a downstream subnet, pass its gateway.
-func (p *IPPort) WriteIP(via netip.Addr, b []byte) error {
-	n := p.node
+// WriteIP queues a copy for the specified member. With a zero next hop, primary
+// addresses and groups resolve locally. VIPs and downstream destinations use
+// ResolveNextHop. Group delivery can succeed for a subset when queues fill.
+// A packet exceeding the selected peer's receive limit reports ErrPacketTooLarge
+// through ObserveTransmit when dequeued.
+func (p *IPPort) WriteIP(via PeerID, b []byte) error {
+	if len(b) > p.node.o.MaxIPSize {
+		return ErrPacketTooLarge
+	}
 	ip, err := parseInnerPacket(b)
-	if err != nil || len(b) > n.o.MaxIPSize {
-		return ErrInvalidPacketAddress
-	}
-	if !via.IsValid() {
-		via = ip.destination
-	}
-	n.mu.Lock()
-	cfg := n.policy.Load()
-	peer := cfg.owners[via]
-	state := n.state
-	blocked := n.modeLocked(peer) == Blocked || !n.ready(cfg) && n.selectSessionLocked(peer, false) == nil
-	n.mu.Unlock()
-	if err := state.runningError(); err != nil {
+	if err != nil {
 		return err
 	}
-	authorized := ip.authorizedBy(cfg, n.id, peer)
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	switch {
-	case p.closed:
-		return ErrPortClosed
-	case !n.memberOf(cfg):
-		return ErrPathPolicy
-	case peer == (PeerID{}):
-		return ErrMissingGateway
-	case !authorized:
-		return ErrAddressUnauthorized
-	case blocked:
-		return ErrPathPolicy
+	err = p.enqueue(via, ip, b)
+	if err != ErrNextHopRequired || p.opts.ResolveNextHop == nil {
+		return err
 	}
-	q := p.queues[peer]
-	if p.stats.Queued >= 512 || q != nil && len(q.packets) >= 64 {
-		p.stats.RejectedOutbound++
-		return ErrQueueFull
+	via, err = p.opts.ResolveNextHop(ip.destination, b)
+	if err != nil {
+		return err
 	}
-	if q == nil {
-		q = &ipQueue{}
-		p.queues[peer] = q
-		if !n.task(func() { p.drain(peer, q) }) {
-			delete(p.queues, peer)
-			return ErrNodeClosed
-		}
+	if via == (PeerID{}) {
+		return ErrNextHopRequired
 	}
-	q.packets = append(q.packets, slices.Clone(b))
-	p.stats.Queued++
-	return nil
+	// A callback may have installed a new topology or closed this port.
+	return p.enqueue(via, ip, b)
 }
 
-func (p *IPPort) drain(peer PeerID, q *ipQueue) {
+func (p *IPPort) enqueue(via PeerID, ip innerPacket, b []byte) error {
 	n := p.node
-	for {
-		p.mu.Lock()
-		if p.queues[peer] != q {
-			p.mu.Unlock()
-			return
-		}
-		if len(q.packets) == 0 {
-			delete(p.queues, peer)
-			p.mu.Unlock()
-			return
-		}
-		b := q.packets[0]
-		packetCtx, stop := context.WithCancel(n.ctx)
-		q.current, q.stopCurrent = b, stop
-		q.packets[0] = nil
-		q.packets = q.packets[1:]
-		p.stats.Queued--
-		p.mu.Unlock()
-		err := n.connectPeer(packetCtx, peer)
-		if err == nil {
-			err = n.shape(packetCtx, len(b))
-		}
-		if err == nil {
-			ip, _ := parseInnerPacket(b)
-			n.mu.Lock()
-			cfg := n.policy.Load()
-			var s *session
-			if n.memberOf(cfg) && ip.authorizedBy(cfg, n.id, peer) {
-				s = n.preferredSessionLocked(n.peers[peer], false, &ip)
-			}
-			n.mu.Unlock()
-			if s == nil || packetCtx.Err() != nil {
-				err = ErrAddressUnauthorized
-			} else {
-				err = s.sendIP(b)
-			}
-		}
-		p.mu.Lock()
-		interrupted := packetCtx.Err() != nil
-		stop()
-		q.current, q.stopCurrent = nil, nil
-		if err == nil {
-			p.stats.SentPackets++
-			p.stats.SentBytes += uint64(len(b))
-		} else {
-			p.stats.RejectedOutbound++
-			p.stats.LastDrop = err.Error()
-			if !errors.Is(err, ErrAddressUnauthorized) && !interrupted && p.queues[peer] == q {
-				p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer))
-			}
-		}
-		p.mu.Unlock()
-	}
-}
-
-func (p *IPPort) revalidateQueues(disconnected map[PeerID]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	n := p.node
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	cfg := n.policy.Load()
-	for peer, q := range p.queues {
-		if disconnected[peer] || n.modeLocked(peer) == Blocked {
-			p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer))
-			p.stats.LastDrop = ErrPathPolicy.Error()
+	if err := n.state.runningError(); err != nil {
+		return err
+	}
+	if p.closed {
+		return ErrPortClosed
+	}
+	if !n.memberOf(cfg) {
+		return ErrPathPolicy
+	}
+	if !cfg.allowsAddress(n.id, ip.source, nil) {
+		return ErrAddressUnauthorized
+	}
+	peers, group, err := cfg.groupRecipients(n.id, ip.destination)
+	if err != nil {
+		return err
+	}
+	if group && via != (PeerID{}) {
+		return ErrAddressUnauthorized
+	}
+	if !group {
+		peer, err := cfg.unicastNextHop(via, ip.destination)
+		if err != nil {
+			return err
+		}
+		peers = []PeerID{peer}
+	}
+	var packet *outboundPacket
+	full, denied := false, false
+	for _, peer := range peers {
+		if peer == n.id {
 			continue
 		}
-		unauthorized := func(b []byte) bool {
-			ip, err := parseInnerPacket(b)
-			return err != nil || !ip.authorizedBy(cfg, n.id, peer)
+		if n.modeLocked(peer) == Blocked || !n.ready(cfg) && n.preferredSessionLocked(n.peers[peer], false, &ip) == nil {
+			denied = true
+			continue
 		}
-		if q.current != nil && unauthorized(q.current) {
-			q.stopCurrent()
+		q := p.queues[peer]
+		if p.stats.Queued >= maxPortQueue || q == nil && len(p.queues) >= maxPortQueue || q != nil && len(q.packets) >= maxTargetQueue {
+			p.stats.RejectedOutbound++
+			p.stats.LastDrop = ErrQueueFull.Error()
+			full = true
+			continue
 		}
-		before := len(q.packets)
-		q.packets = slices.DeleteFunc(q.packets, unauthorized)
-		dropped := before - len(q.packets)
-		p.stats.Queued -= dropped
-		p.stats.RejectedOutbound += uint64(dropped)
-		if dropped > 0 {
-			p.stats.LastDrop = ErrAddressUnauthorized.Error()
+		if packet == nil {
+			packet = &outboundPacket{innerPacket: ip, data: slices.Clone(b)}
 		}
+		if q == nil {
+			q = &ipQueue{}
+			p.queues[peer] = q
+			n.wg.Go(func() { p.drain(peer, q) })
+		}
+		q.packets = append(q.packets, packet)
+		p.stats.Queued++
+	}
+	switch {
+	case packet != nil:
+		return nil
+	case full:
+		return ErrQueueFull
+	case denied:
+		return ErrPathPolicy
+	case group:
+		return nil
+	default:
+		return ErrPeerUnavailable
 	}
 }
 
@@ -256,7 +244,10 @@ func (n *Node) receiveIP(s *session, b []byte) {
 	n.mu.Lock()
 	port := n.port
 	cfg := n.policy.Load()
-	if err == nil && (len(b) > n.o.MaxIPSize || !n.usableLocked(s) || !ip.authorizedOn(cfg, s.remoteIdentity, s.localIdentity)) {
+	if len(b) > n.o.MaxIPSize {
+		err = ErrPacketTooLarge
+	}
+	if err == nil && (!n.usableLocked(s) || !ip.authorizedOn(cfg, s.remoteIdentity, s.localIdentity)) {
 		err = ErrAddressUnauthorized
 	}
 	n.mu.Unlock()
@@ -289,5 +280,5 @@ func (n *Node) receiveIP(s *session, b []byte) {
 	port.stats.ReceivedPackets++
 	port.stats.ReceivedBytes += uint64(len(b))
 	port.mu.Unlock()
-	port.deliver(b)
+	port.opts.Deliver(s.peer, b)
 }

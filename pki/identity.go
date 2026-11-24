@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"bytes"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -53,10 +54,18 @@ var meshOID = asn1.ObjectIdentifier{1, 2, 840, 113556, 1, 8000, 2554, 0x6823, 0x
 type Scope struct {
 	Network        string
 	RoutedPrefixes []netip.Prefix
+	// Cluster marks the CA defining the logical subnets in its IP name constraints.
+	Cluster bool
+	// AnycastPools delegates ranges to issuers; AnycastIPs grants exact addresses to leaves.
+	AnycastPools []netip.Prefix
+	AnycastIPs   []netip.Addr
 }
 type scopeDER struct {
 	Network  string `asn1:"utf8"`
 	Prefixes []prefixDER
+	Cluster  bool
+	Pools    []prefixDER
+	VIPs     [][]byte
 }
 
 type prefixDER struct {
@@ -74,6 +83,19 @@ func (s Scope) extension() (pkix.Extension, error) {
 			return pkix.Extension{}, fmt.Errorf("invalid routed prefix %s", p)
 		}
 		d.Prefixes = append(d.Prefixes, prefixDER{p.Addr().AsSlice(), p.Bits()})
+	}
+	d.Cluster = s.Cluster
+	for i, p := range s.AnycastPools {
+		if !validUnicastPrefix(p) || slices.ContainsFunc(s.AnycastPools[:i], p.Overlaps) {
+			return pkix.Extension{}, fmt.Errorf("invalid anycast pool %s", p)
+		}
+		d.Pools = append(d.Pools, prefixDER{p.Addr().AsSlice(), p.Bits()})
+	}
+	for i, a := range s.AnycastIPs {
+		if !a.IsGlobalUnicast() || a.Zone() != "" || a.Is4In6() || slices.Contains(s.AnycastIPs[:i], a) {
+			return pkix.Extension{}, fmt.Errorf("invalid anycast address %s", a)
+		}
+		d.VIPs = append(d.VIPs, a.AsSlice())
 	}
 	value, err := asn1.Marshal(d)
 	return pkix.Extension{Id: meshOID, Value: value}, err
@@ -93,18 +115,32 @@ func CertificateScope(c *x509.Certificate) (Scope, bool, error) {
 		if err != nil || len(rest) != 0 || !ValidName(d.Network) {
 			return Scope{}, true, errors.New("invalid mesh extension")
 		}
-		s := Scope{Network: d.Network}
-		for _, v := range d.Prefixes {
-			addr, ok := netip.AddrFromSlice(v.Address)
-			p := netip.PrefixFrom(addr, v.Bits)
-			if !ok || !p.IsValid() || p != p.Masked() || addr.Is4In6() {
-				return Scope{}, true, errors.New("invalid mesh routed prefix")
-			}
-			s.RoutedPrefixes = append(s.RoutedPrefixes, p)
+		s := Scope{Network: d.Network, Cluster: d.Cluster}
+		if c.IsCA && len(d.VIPs) > 0 || !c.IsCA && (d.Cluster || len(d.Pools) > 0) {
+			return Scope{}, true, errors.New("mesh extension has invalid certificate role")
+		}
+		s.RoutedPrefixes = decodePrefixes(d.Prefixes)
+		s.AnycastPools = decodePrefixes(d.Pools)
+		for _, v := range d.VIPs {
+			a, _ := netip.AddrFromSlice(v)
+			s.AnycastIPs = append(s.AnycastIPs, a)
+		}
+		canonical, err := s.extension()
+		if err != nil || !bytes.Equal(e.Value, canonical.Value) {
+			return Scope{}, true, errors.New("invalid mesh extension encoding")
 		}
 		return s, true, nil
 	}
 	return Scope{}, false, nil
+}
+
+func decodePrefixes(encoded []prefixDER) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, p := range encoded {
+		addr, _ := netip.AddrFromSlice(p.Address)
+		prefixes = append(prefixes, netip.PrefixFrom(addr, p.Bits))
+	}
+	return prefixes
 }
 
 type Identity struct {
@@ -136,38 +172,43 @@ func ReadIdentity(c *x509.Certificate) (Identity, error) {
 	return Identity{id, s}, nil
 }
 
-// AllowsIP reports whether this certificate covers an inner address.
-func (i Identity) AllowsIP(addr netip.Addr) bool {
-	if addr == i.ID.IPv4() || addr == i.ID.IPv6() {
-		return true
-	}
-	for _, p := range i.RoutedPrefixes {
-		if p.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-// checkDelegation checks the mesh restrictions on one complete PKIX path.
-func checkDelegation(leaf Scope, ancestors []*x509.Certificate) error {
+// checkDelegation checks every mesh issuer on the path and returns its cluster CA, if present.
+func checkDelegation(leaf Scope, ancestors []*x509.Certificate) (*x509.Certificate, error) {
+	var clusterCA *x509.Certificate
+	issuingCluster := leaf.Cluster
 	for _, c := range ancestors {
 		s, ok, err := CertificateScope(c)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !ok {
 			continue
 		}
+		if s.Cluster {
+			if issuingCluster || clusterCA != nil {
+				return nil, errors.New("nested cluster CA")
+			}
+			clusterCA = c
+		}
 		if s.Network != leaf.Network {
-			return errors.New("issuer network mismatch")
+			return nil, errors.New("issuer network mismatch")
 		}
 		for _, p := range leaf.RoutedPrefixes {
-			if !slices.ContainsFunc(s.RoutedPrefixes, func(within netip.Prefix) bool { return within.Bits() <= p.Bits() && within.Contains(p.Addr()) }) {
-				return fmt.Errorf("issuer does not delegate %s", p)
+			if !covers(s.RoutedPrefixes, p) {
+				return nil, fmt.Errorf("issuer does not delegate route %s", p)
+			}
+		}
+		for _, a := range leaf.AnycastIPs {
+			if !contains(s.AnycastPools, a) {
+				return nil, fmt.Errorf("issuer does not delegate anycast address %s", a)
+			}
+		}
+		for _, p := range leaf.AnycastPools {
+			if !covers(s.AnycastPools, p) {
+				return nil, fmt.Errorf("issuer does not delegate anycast pool %s", p)
 			}
 		}
 		leaf = s
 	}
-	return nil
+	return clusterCA, nil
 }

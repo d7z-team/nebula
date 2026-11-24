@@ -22,7 +22,8 @@ func ValidName(s string) bool {
 	return len(s) > 0 && len(s) <= 128 && strings.Trim(s, "abcdefghijklmnopqrstuvwxyz0123456789-_.") == ""
 }
 
-func ParseCertificates(b []byte) ([]*x509.Certificate, error) {
+// ParseCertificatesPEM reads one or more PEM certificates in the order supplied.
+func ParseCertificatesPEM(b []byte) ([]*x509.Certificate, error) {
 	var out []*x509.Certificate
 	for len(bytes.TrimSpace(b)) > 0 {
 		block, rest := pem.Decode(b)
@@ -42,7 +43,7 @@ func ParseCertificates(b []byte) ([]*x509.Certificate, error) {
 	return out, nil
 }
 
-// ParseChain parses the DER certificates presented by a TLS endpoint.
+// ParseChain parses a leaf-first TLS chain with one DER certificate per element.
 func ParseChain(der [][]byte) ([]*x509.Certificate, error) {
 	if len(der) == 0 {
 		return nil, errors.New("empty certificate chain")
@@ -59,7 +60,7 @@ func ParseChain(der [][]byte) ([]*x509.Certificate, error) {
 }
 
 // VerifyChain builds ordinary PKIX paths and checks the expected identity, usage and mesh delegation on each path.
-func VerifyChain(chain []*x509.Certificate, roots *x509.CertPool, network string, peer PeerID, usage x509.ExtKeyUsage, now time.Time) ([][]*x509.Certificate, error) {
+func VerifyChain(chain []*x509.Certificate, roots *x509.CertPool, cluster Cluster, peer PeerID, usage x509.ExtKeyUsage, now time.Time) ([][]*x509.Certificate, error) {
 	if roots == nil || len(chain) == 0 || chain[0] == nil {
 		return nil, errors.New("chain and explicit roots required")
 	}
@@ -74,7 +75,7 @@ func VerifyChain(chain []*x509.Certificate, roots *x509.CertPool, network string
 	if err != nil {
 		return nil, err
 	}
-	identity, accepted, err := VerifiedPeer(paths, network, usage)
+	identity, accepted, err := VerifiedPeer(paths, cluster, usage)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +87,7 @@ func VerifyChain(chain []*x509.Certificate, roots *x509.CertPool, network string
 
 // VerifiedPeer validates the mesh profile of one PKIX-authenticated peer.
 // paths must be the verified candidate chains from the same X.509 or TLS verification.
-func VerifiedPeer(paths [][]*x509.Certificate, network string, usage x509.ExtKeyUsage) (Identity, [][]*x509.Certificate, error) {
+func VerifiedPeer(paths [][]*x509.Certificate, cluster Cluster, usage x509.ExtKeyUsage) (Identity, [][]*x509.Certificate, error) {
 	if len(paths) == 0 || len(paths[0]) == 0 {
 		return Identity{}, nil, errors.New("no verified chain")
 	}
@@ -95,15 +96,19 @@ func VerifiedPeer(paths [][]*x509.Certificate, network string, usage x509.ExtKey
 	if err != nil {
 		return Identity{}, nil, err
 	}
-	if identity.Network != network {
-		return Identity{}, nil, errors.New("unexpected mesh network")
+	if err := cluster.validateIdentity(identity); err != nil {
+		return Identity{}, nil, err
 	}
 	if !slices.Contains(leaf.ExtKeyUsage, usage) {
 		return Identity{}, nil, errors.New("mesh leaf missing required extended key usage")
 	}
 	var accepted [][]*x509.Certificate
 	for _, path := range paths {
-		if len(path) > 0 && path[0].Equal(leaf) && checkDelegation(identity.Scope, path[1:]) == nil {
+		if len(path) == 0 || !path[0].Equal(leaf) {
+			continue
+		}
+		ca, err := checkDelegation(identity.Scope, path[1:])
+		if err == nil && ca != nil && string(ca.Raw) == cluster.certificate {
 			accepted = append(accepted, path)
 		}
 	}

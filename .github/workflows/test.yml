@@ -26,7 +26,7 @@ jobs:
         working-directory: examples
         shell: bash
         run: |
-          for example in quickstart relay gateway pki; do
+          for example in quickstart relay gateway pki portshare addressing anycast; do
             go run "./$example"
           done
 
@@ -42,6 +42,20 @@ jobs:
       - run: go vet ./...
       - run: go mod tidy && git diff --exit-code -- go.mod go.sum
       - run: go test -race ./...
+      - run: go test -race -count=1 ./e2e -args -portshare
+
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+      - name: Verify IPv4 TTL and IPv6 hop limit with the deployment patch
+        run: |
+          go mod vendor
+          git apply --directory=vendor/gvisor.dev/gvisor patches/gvisor-ipv4-ttl.patch
+          go test -mod=vendor -race -count=1 -run '^TestNodeGVisorForwardingAndDetach$' ./e2e
 
   cross-compile:
     runs-on: ubuntu-latest
@@ -69,6 +83,8 @@ jobs:
           go-version: '1.27'
       - name: Run fixed fault scenarios with the race detector
         run: go test -race -count=1 -timeout=5m -run '^TestChaos' ./e2e -args -extended
+      - name: Run extended scenarios on shared sockets
+        run: go test -race -count=1 -timeout=5m ./e2e -args -extended -portshare
       - name: Replay ten bounded action sequences
         shell: bash
         run: |

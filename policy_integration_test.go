@@ -35,12 +35,12 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
 	in := make(chan []byte, 1)
-	_, err := b.OpenIPPort(func(pkt []byte) { in <- pkt })
+	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { in <- pkt }})
 	require.NoError(t, err)
-	port, err := a.OpenIPPort(func([]byte) {})
+	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	require.NoError(t, port.WriteIP(b.id.IPv4(), testIPv4(a.id.IPv4(), b.id.IPv4(), "pending")))
+	require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), "pending")))
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	denied.Store(true)
 	require.NoError(t, a.Revalidate(t.Context()))
@@ -48,26 +48,26 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	require.Empty(t, in)
 }
 
-func TestClearPendingByEitherAddress(t *testing.T) {
+func TestClearPendingByPeer(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	f.cfg.Members[0].BytesPerSecond = 1
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
 	received := make(chan []byte, 3)
-	_, err := b.OpenIPPort(func(pkt []byte) { received <- pkt })
+	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- pkt }})
 	require.NoError(t, err)
-	port, err := a.OpenIPPort(func([]byte) {})
+	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
 	held := testIPv4(a.id.IPv4(), b.id.IPv4(), "held")
-	require.NoError(t, port.WriteIP(b.id.IPv4(), held))
+	require.NoError(t, port.WriteIP(b.id, held))
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
-	require.NoError(t, port.WriteIP(b.id.IPv4(), held))
-	require.Equal(t, 1, port.ClearPending(b.id.IPv6()))
+	require.NoError(t, port.WriteIP(b.id, held))
+	require.Equal(t, 1, port.ClearPending(b.id))
 
 	fresh := testIPv4(a.id.IPv4(), b.id.IPv4(), "fresh")
-	require.NoError(t, port.WriteIP(b.id.IPv4(), fresh))
+	require.NoError(t, port.WriteIP(b.id, fresh))
 	f.cfg.Members[0].BytesPerSecond = 0
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	select {
@@ -94,12 +94,12 @@ func TestLiveCertificateExpiry(t *testing.T) {
 	o.Certificates.Client = tls.Certificate{Certificate: [][]byte{der}, PrivateKey: o.Certificates.Client.PrivateKey}
 	f.start()
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
-	fresh, key := f.issue(labPeer(f.ips[1]))
-	require.NoError(t, f.nodes[1].ReloadCertificates(t.Context(), LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{fresh.Raw}, PrivateKey: key}}))
+	fresh := f.issue(labPeer(f.ips[1]), pki.Scope{})
+	require.NoError(t, f.nodes[1].ReloadCertificates(t.Context(), LocalCertificates{Client: fresh}))
 	require.Eventually(t, func() bool { return len(f.nodes[0].Paths()) == 0 && len(f.nodes[1].Paths()) == 0 }, 4*time.Second, 20*time.Millisecond)
 	require.True(t, f.nodes[1].ControlStatus().Ready)
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
-	require.Equal(t, fresh.SerialNumber.String(), f.nodes[0].Paths()[0].Serial)
+	require.Equal(t, fresh.Leaf.SerialNumber.String(), f.nodes[0].Paths()[0].Serial)
 }
 
 func TestEventRepairAndPolicyWithdrawal(t *testing.T) {
@@ -166,7 +166,7 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 		if n := node.Load(); n != nil {
 			_ = n.Paths()
 		} // host callbacks may query live state
-		if deny.Load() && c.Object && c.Member == labPeer(a) {
+		if deny.Load() && c.Usage == x509.ExtKeyUsageCodeSigning && c.Member == labPeer(a) {
 			return time.Time{}, errors.New("publisher suspended")
 		}
 		return time.Time{}, nil
@@ -176,7 +176,7 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	node.Store(y)
 	require.NoError(t, y.ConnectPeer(t.Context(), a))
 	require.NoError(t, x.ConnectPeer(t.Context(), b))
-	s := y.selectSession(labPeer(a), false)
+	s := y.preferredSession(labPeer(a), false)
 	require.Equal(t, creds.Server.Certificate[0], s.state.PeerCertificates[0].Raw)
 	sub, err := y.Subscribe("app/test/control")
 	require.NoError(t, err)
@@ -191,7 +191,7 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	}
 	deny.Store(true)
 	require.NoError(t, y.Revalidate(t.Context()))
-	require.Same(t, s, y.selectSession(labPeer(a), false))
+	require.Same(t, s, y.preferredSession(labPeer(a), false))
 	y.mu.Lock()
 	_, cached := y.events[id]
 	y.mu.Unlock()
@@ -211,42 +211,31 @@ func TestConcurrentTopologyAndCredentialUpdates(t *testing.T) {
 	f.start()
 	n, remote := f.nodes[0], f.nodes[1]
 	require.NoError(t, n.ConnectPeer(t.Context(), remote.id.IPv4()))
-	s := n.selectSession(remote.id, false)
+	s := n.preferredSession(remote.id, false)
 	seed := f.cfg
 	seed.Members = slices.Clone(f.cfg.Members)
 	seed.Members = slices.Delete(seed.Members, 2, 3)
-	errs := make(chan error, 3)
-	go func() {
-		for range 8 {
-			if err := n.ApplyTopology(t.Context(), seed); err != nil {
-				errs <- err
-				return
+	updates := []func() error{
+		func() error { return n.ApplyTopology(t.Context(), seed) },
+		func() error { return n.ReloadCertificates(t.Context(), f.opts[0].Certificates) },
+		func() error { return n.Revalidate(t.Context()) },
+	}
+	errs := make(chan error, len(updates))
+	for _, update := range updates {
+		go func() {
+			var err error
+			for range 8 {
+				if err = update(); err != nil {
+					break
+				}
 			}
-		}
-		errs <- nil
-	}()
-	go func() {
-		for range 8 {
-			if err := n.ReloadCertificates(t.Context(), f.opts[0].Certificates); err != nil {
-				errs <- err
-				return
-			}
-		}
-		errs <- nil
-	}()
-	go func() {
-		for range 8 {
-			if err := n.Revalidate(t.Context()); err != nil {
-				errs <- err
-				return
-			}
-		}
-		errs <- nil
-	}()
-	for range 3 {
+			errs <- err
+		}()
+	}
+	for range updates {
 		require.NoError(t, <-errs)
 	}
-	require.Same(t, s, n.selectSession(remote.id, false))
+	require.Same(t, s, n.preferredSession(remote.id, false))
 	require.NoError(t, n.ApplyTopology(t.Context(), f.cfg))
 	require.NoError(t, n.ConnectPeer(t.Context(), f.ips[2]))
 }
@@ -258,12 +247,12 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	local := f.cfg
 	local.Members = slices.Clone(f.cfg.Members)
 	local.Members = slices.Delete(local.Members, 2, 3)
-	require.NoError(t, local.Validate())
+	require.NoError(t, local.Validate(f.cluster))
 	deadline := time.Now().Add(time.Hour)
 	var limit atomic.Pointer[time.Time]
 	limit.Store(&deadline)
 	f.opts[0].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
-		if !c.Local && !c.Object {
+		if !c.Local && c.Usage != x509.ExtKeyUsageCodeSigning {
 			return *limit.Load(), nil
 		}
 		return time.Time{}, nil
@@ -297,7 +286,7 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	m.IPv4 = conflict.IPv4()
 	m.IPv6 = conflict.IPv6()
 	local.Members = append(local.Members, m)
-	err = local.Validate()
+	err = local.Validate(f.cluster)
 	require.Error(t, err)
 	require.EqualError(t, n.ApplyTopology(t.Context(), local), err.Error())
 	require.NoError(t, n.ConnectPeer(t.Context(), b))
@@ -310,7 +299,7 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 		require.Equal(t, shortened, p.AuthorizedUntil)
 	}
 	require.Eventually(t, func() bool {
-		return n.selectSession(labPeer(b), false) == nil && n.selectSession(labPeer(third), false) == nil
+		return n.preferredSession(labPeer(b), false) == nil && n.preferredSession(labPeer(third), false) == nil
 	}, 2*time.Second, 5*time.Millisecond)
 	require.True(t, n.ControlStatus().Ready)
 }
@@ -387,23 +376,27 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv6()))
 	next, err := pki.NewPeerID(b.id.IPv4(), netip.MustParseAddr("fd42::99"))
 	require.NoError(t, err)
-	wrong, key := f.issue(next)
-	require.Error(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{wrong.Raw}, PrivateKey: key}}))
+	wrong := f.issue(next, pki.Scope{})
+	require.Error(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: wrong}))
 	m := f.cfg.Members[1]
 	m.IPv4, m.IPv6 = next.IPv4(), next.IPv6()
 	f.cfg.Members = append(f.cfg.Members, m)
-	require.Error(t, f.cfg.Validate())
+	require.Error(t, f.cfg.Validate(f.cluster))
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
-	port, err := a.OpenIPPort(func([]byte) {})
+	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	require.NoError(t, port.WriteIP(b.id.IPv4(), testIPv4(a.id.IPv4(), b.id.IPv4(), "held for previous owner")))
+	require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), "held for previous owner")))
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	require.Eventually(t, func() bool { return port.Stats().RejectedOutbound == 1 }, time.Second, time.Millisecond)
 	require.Empty(t, a.Paths())
+	owner, ok := a.LookupPeer(b.id.IPv4())
+	require.True(t, ok)
+	require.Equal(t, next, owner)
+	require.ErrorIs(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), next.IPv4(), "stale binding")), ErrPeerUnavailable)
 	require.Error(t, a.ConnectPeer(t.Context(), next.IPv4()))
-	require.Error(t, port.WriteIP(b.id.IPv6(), testIPv6(a.id.IPv6(), b.id.IPv6(), 1280)))
+	require.Error(t, port.WriteIP(b.id, testIPv6(a.id.IPv6(), b.id.IPv6(), 1280)))
 }
 
 func TestGatewaySessionCertificateCeiling(t *testing.T) {
@@ -411,22 +404,21 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	aIP, bIP := f.ips[0], f.ips[1]
 	id := labPeer(bIP)
 	f.cfg.Members[1].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("192.0.0.0/16")}
-	narrow, key := f.issue(id, netip.MustParsePrefix("192.0.2.0/24"))
-	f.opts[1].Certificates.Client = tls.Certificate{Certificate: [][]byte{narrow.Raw}, PrivateKey: key}
+	f.opts[1].Certificates.Client = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), id.IPv6()))
 	received := make(chan []byte, 2)
-	sink, err := b.OpenIPPort(func(pkt []byte) { received <- pkt })
+	sink, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- pkt }})
 	require.NoError(t, err)
-	out, err := a.OpenIPPort(func([]byte) {})
+	out, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	denied := testIPv4(aIP, netip.MustParseAddr("192.0.3.1"), "outside certificate")
 	good := testIPv4(aIP, netip.MustParseAddr("192.0.2.1"), "within certificate")
-	wide, k := f.issue(id, f.cfg.Members[1].RoutedPrefixes...)
-	require.NoError(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{wide.Raw}, PrivateKey: k}}))
-	require.NoError(t, out.WriteIP(id.IPv6(), denied))
-	require.NoError(t, out.WriteIP(bIP, good))
+	wide := f.issue(id, pki.Scope{RoutedPrefixes: f.cfg.Members[1].RoutedPrefixes})
+	require.NoError(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: wide}))
+	require.NoError(t, out.WriteIP(id, denied))
+	require.NoError(t, out.WriteIP(labPeer(bIP), good))
 	select {
 	case pkt := <-received:
 		require.Equal(t, good, pkt)
@@ -435,12 +427,17 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	}
 	require.Equal(t, uint64(1), out.Stats().RejectedOutbound)
 	// Use the authenticated stream directly to independently exercise ingress authorization.
-	require.NoError(t, a.selectSession(id, false).sendIP(denied))
+	stream, err := a.preferredSession(id, false).open(t.Context())
+	require.NoError(t, err)
+	defer stream.Close()
+	_, err = stream.Write([]byte{opIP})
+	require.NoError(t, err)
+	require.NoError(t, writeFrame(stream, denied))
 	require.Eventually(t, func() bool { return sink.Stats().RejectedInbound == 1 }, time.Second, time.Millisecond)
 	require.NoError(t, a.SetPeerPathPolicy(bIP, Blocked))
 	require.NoError(t, a.SetPeerPathPolicy(id.IPv6(), Auto))
 	require.NoError(t, a.ConnectPeer(t.Context(), id.IPv6()))
-	require.NoError(t, out.WriteIP(bIP, denied))
+	require.NoError(t, out.WriteIP(labPeer(bIP), denied))
 	select {
 	case pkt := <-received:
 		require.Equal(t, denied, pkt)

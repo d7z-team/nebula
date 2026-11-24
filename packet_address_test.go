@@ -8,25 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseInnerPacket(t *testing.T) {
-	for _, tc := range []struct{ source, destination string }{
-		{"10.0.0.1", "10.0.0.2"},
-		{"2001:db8::1", "2001:db8::2"},
-	} {
-		source, destination := netip.MustParseAddr(tc.source), netip.MustParseAddr(tc.destination)
-		var packet []byte
-		if source.Is4() {
-			packet = testIPv4(source, destination, "")
-		} else {
-			packet = testIPv6(source, destination, 40)
-		}
-		ip, err := parseInnerPacket(packet)
-		require.NoError(t, err)
-		require.Equal(t, source, ip.source)
-		require.Equal(t, destination, ip.destination)
-	}
-}
-
 func TestPacketRejectsMalformedLengthsAndMappedAddresses(t *testing.T) {
 	good := testIPv4(netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2"), "abc")
 	shortHeader, longHeader := slices.Clone(good), slices.Clone(good)

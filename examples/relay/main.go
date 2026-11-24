@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/examples/internal/demo"
+	"code.d7z.net/d7z-team/nebula/examples/demo"
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
@@ -71,20 +71,20 @@ func run() error {
 
 	// Only A and B attach IP ports. R forwards the encrypted circuit.
 	inboxA, inboxB := make(chan []byte, 1), make(chan []byte, 1)
-	receive := func(inbox chan<- []byte) func([]byte) {
-		return func(packet []byte) {
+	receive := func(inbox chan<- []byte) func(nebula.PeerID, []byte) {
+		return func(_ nebula.PeerID, packet []byte) {
 			select {
 			case inbox <- bytes.Clone(packet):
 			case <-ctx.Done():
 			}
 		}
 	}
-	portA, err := nodes[0].OpenIPPort(receive(inboxA))
+	portA, err := nodes[0].OpenIPPort(nebula.IPPortOptions{Deliver: receive(inboxA)})
 	if err != nil {
 		return err
 	}
 	defer portA.Close()
-	portB, err := nodes[2].OpenIPPort(receive(inboxB))
+	portB, err := nodes[2].OpenIPPort(nebula.IPPortOptions{Deliver: receive(inboxB)})
 	if err != nil {
 		return err
 	}
@@ -96,7 +96,7 @@ func run() error {
 		copy(packet[8:24], src.AsSlice())
 		copy(packet[24:40], dst.AsSlice())
 		copy(packet[40:], body)
-		if err := port.WriteIP(netip.Addr{}, packet); err != nil {
+		if err := port.WriteIP(nebula.PeerID{}, packet); err != nil {
 			return err
 		}
 		select {

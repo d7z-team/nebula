@@ -5,16 +5,16 @@
 | 操作 | API | 调用方提供的材料 |
 | --- | --- | --- |
 | 生成密钥 | `pki.GenerateKey` 或 Go 标准库 | 内置便捷生成器支持 ed25519、p256、3072 位 RSA 和 ml-dsa-44。TLS 可用签名算法由 Go 和对端协商。 |
-| 根与中间 CA | `CreateRoot`、`Issuer.IssueCA` | 根使用自己的签名器。签发中间 CA 时提供 CSR、获批主题、有效期和路径长度，校验 CA 密钥及上级约束。 |
-| 申请与签发叶证书 | `CreateCSR`、`Issuer.IssueLeaf` | 申请者提交自签名 CSR。签发者以独立批准的 SPKI SHA-256、一个 IPv4 和一个 IPv6 SAN、网络、下游路由前缀、用途和有效期构造证书。CA 和叶密钥可以使用不同算法。 |
-| 装载与验证 | `tls.LoadX509KeyPair`、`pki.ParseCertificates`、`pki.ParseKeyPEM`、`pki.VerifyChain` | 明确给出可信根、预期网络与完整地址对、用途与时刻，返回 Go 验证通过的候选路径。 |
+| 根与中间 CA | `CreateRoot`、`Issuer.IssueCA` | 根使用自己的签名器。签发中间 CA 时提供 CSR、获批签发配置和独立批准的 SPKI SHA-256。签发库验证 CSR 签名、公钥指纹及上级约束。 |
+| 申请与签发叶证书 | `CreateCSR`、`Issuer.IssueLeaf` | 申请者提交自签名 CSR。签发者以独立批准的 SPKI SHA-256、一个 IPv4 和一个 IPv6 SAN、网络、下游路由前缀、用途和有效期构造证书。签发端逐一用给定签发链验证所申请的 EKU，可在签发时发现上级 CA 对用途的限制。CA 和叶密钥可以使用不同算法。 |
+| 装载与验证 | `tls.LoadX509KeyPair`、`ParseCertificatesPEM`、`ParseChain`、`VerifyChain` | PEM 文件可包含多张证书；TLS 的 DER 链每个元素恰为一张证书，叶在前。验证时给出可信根、固定的集群 CA 规划、完整地址对、用途和时刻。 |
 | 签发与验证对象 | `pki.SignObject`、`pki.VerifyObjectSignature` | 提供用途、网络名和正文。验证签名后用 `VerifyChain` 建立对签名者的信任，再检查成员绑定和主题授权。节点的事件与介绍接收入口已完成上述检查。 |
 
 ## 进程内签发与验证
 
-在仓库根目录运行 `go run ./examples/pki`。程序从已批准的公钥 DER（SubjectPublicKeyInfo）计算 SHA-256，在 `Enrollment` 中指定网络、双栈地址、用途和有效期，再把 CSR 交给 `Issuer.IssueLeaf`。验证端单独建立根池，并为 `VerifyChain` 指定预期地址对与 `x509.ExtKeyUsageServerAuth`。预期输出为 `verified 10.13.0.1@fd13::1 on demo for serverAuth`。[完整示例](../examples/pki/main.go) · [获批指纹与签发配置](../examples/internal/demo/credentials.go)
+在仓库根目录运行 `go run ./examples/pki`。程序从已批准的公钥 DER（SubjectPublicKeyInfo）计算 SHA-256，在 `Enrollment` 中指定网络、双栈地址、用途和有效期，再把 CSR 交给 `Issuer.IssueLeaf`。验证端单独建立根池，并为 `VerifyChain` 指定预期地址对与 `x509.ExtKeyUsageServerAuth`。预期输出为 `verified 10.13.0.1@fd13::1 on demo for serverAuth`。[完整示例](../examples/pki/main.go) · [获批指纹与签发配置](../examples/demo/credentials.go)
 
-签发中间 CA 时，Go 调用方先将 `sha256.Sum256(csr.RawSubjectPublicKeyInfo)` 与已批准的指纹核对，再调用 `Issuer.IssueCA`。CLI 的 `issue -role ca` 会核对 `-approved-key`。根 CA 要签发一级中间 CA 时设 `MaxPathLen: 1` 或 `-path-len 1`。`0` 表示该 CA 可直接签发叶证书。[签发实现](../pki/issuance.go)
+签发中间 CA 时调用 `issuer.IssueCA(csr, profile, approvedKeyHash)`。第三个参数是经独立渠道批准的公钥 SubjectPublicKeyInfo DER 的 SHA-256，类型为 `[32]byte`。叶证书在 `Enrollment.PublicKeyHash` 传入同类指纹。两种签发均由库核对请求签名和指纹；CLI 从十六进制的 `-approved-key` 读取该参数。根 CA 要签发一级中间 CA 时设 `MaxPathLen: 1` 或 `-path-len 1`。`0` 表示该 CA 可直接签发叶证书。[签发实现](../pki/issuance.go)
 
 ## 签发证书
 
@@ -27,7 +27,7 @@ go build -o "$lab/nebula-pki" ./cmd/nebula-pki
   set -eu
   cd "$lab"
   ./nebula-pki keygen -algorithm p256 -out ca.key
-  ./nebula-pki root -key ca.key -name "Demo CA" -days 30 -out ca.pem
+  ./nebula-pki root -key ca.key -name "Demo CA" -cluster -network demo -permit-ips 10.13.0.0/24,fd13::/64 -days 30 -out ca.pem
   n=0
   for name in alice bob; do
     n=$((n + 1))
@@ -36,12 +36,12 @@ go build -o "$lab/nebula-pki" ./cmd/nebula-pki
     hash=$(./nebula-pki inspect -in "$name.key" -fingerprint)
     ./nebula-pki issue -ca ca.pem -ca-key ca.key -in "$name.csr" \
       -approved-key "$hash" -network demo -ipv4 "10.13.0.$n" -ipv6 "fd13::$n" -name "$name" -days 7 -out "$name.pem"
-    ./nebula-pki verify -in "$name.pem" -network demo -ipv4 "10.13.0.$n" -ipv6 "fd13::$n" -roots ca.pem
+    ./nebula-pki verify -in "$name.pem" -cluster-ca ca.pem -ipv4 "10.13.0.$n" -ipv6 "fd13::$n" -roots ca.pem
   done
 )
 ```
 
-生成的 `alice.pem` 和 `alice.key` 可通过 `tls.LoadX509KeyPair` 装载。本例直接由根签发；使用中间 CA 时，将签发输出按叶证书在先的顺序与中间 CA 拼成一个 PEM 链文件，可信根单独交付。`nebula-pki -h` 列出命令，`nebula-pki issue -h` 列出签发参数。实验结束后可删除临时目录。
+生成的 `alice.pem` 和 `alice.key` 可通过 `tls.LoadX509KeyPair` 装载。本例直接由根签发；使用中间 CA 时，将签发输出按叶证书在先的顺序与中间 CA 拼成一个 PEM 链文件，可信根单独交付。`nebula-pki -h` 列出命令，`nebula-pki issue -h` 列出签发参数。两端可使用这组材料启动独立进程并核对应用回执。[双进程接入](quickstart.md#使用磁盘凭据启动两个进程)
 
 ## 证书配置
 
@@ -50,15 +50,19 @@ go build -o "$lab/nebula-pki" ./cmd/nebula-pki
 ```asn1
 MeshScope ::= SEQUENCE {
     network UTF8String,
-    routedPrefixes SEQUENCE OF SEQUENCE { address OCTET STRING, bits INTEGER }
+    routedPrefixes SEQUENCE OF Prefix,
+    cluster BOOLEAN,
+    anycastPools SEQUENCE OF Prefix,
+    anycastIPs SEQUENCE OF OCTET STRING
 }
+Prefix ::= SEQUENCE { address OCTET STRING, bits INTEGER }
 ```
 
-网络名使用 1 至 128 个小写 ASCII 字母、数字、下划线、点或连字符。前缀地址按网络序编码，主机位置零。普通节点使用空前缀序列。根或中间 CA 可以使用同一扩展限定可下放的网络和网段，缺省继承上级范围。CA 的标准 IP Name Constraints 另行限制叶证书 SAN。`CAProfile.Scope` 与 `PermittedIPs` 对应 CLI 的 `-network`、`-routes` 与 `-permit-ips`。每条候选路径单独验证。
+网络名使用 1 至 128 个小写 ASCII 字母、数字、下划线、点或连字符。前缀地址按网络序编码，主机位置零。字段顺序固定，空列表编码为空序列。集群 CA 使用 `-cluster -network demo -permit-ips CIDR,...` 设置角色及标准 IP Name Constraints，可通过 `-anycast-pools` 和 `-routes` 委派 VIP 池与下游路由。叶证书使用 `-anycast-ips IP,...` 批准具体服务地址，保留两个主地址作为 SAN。签发受委派的中间 CA 时使用 `issue -role ca`，签发属于企业根下的集群 CA 时同时使用 `-cluster`。通过 `inspect` 可查看角色、范围和精确授权。[地址规划与实例配置](addressing.md)
 
 签发节点证书时，`nebula-pki issue` 使用 `-network`、`-ipv4`、`-ipv6` 和经独立批准的 `-approved-key`。默认 `-role node` 同时包含 clientAuth、serverAuth、codeSigning。使用独立凭据时，分别以 `-role client`、`-role server`、`-role object` 签发同一地址对的三张证书，填入 `LocalCertificates.Client`、`Server`、`Object`。PEM 链从叶证书开始，随后依次放入中间 CA。验证单一用途时，给 `nebula-pki verify` 传入相应的 `-role`。[签发与验证示例](#签发证书)
 
-通过 API 读取证书时，`pki.ReadIdentity(cert)` 提取声明，`pki.VerifyChain(chain, roots, network, peer, usage, now)` 验证其信任路径。签发有效期按 DER 的整秒精度检查。PKIX 验证包含到期时刻，节点的会话和缓存授权在到达截止时刻时失效。[证书边界测试](../pki/boundaries_test.go)
+通过 API 读取证书时，`pki.ReadIdentity(cert)` 提取声明，`pki.VerifyChain(chain, roots, cluster, peer, usage, now)` 验证其信任路径。签发有效期按 DER 的整秒精度检查。PKIX 验证包含到期时刻，节点的会话和缓存授权在到达截止时刻时失效。[证书边界测试](../pki/boundaries_test.go)
 
 ## 热加载与宿主授权
 
@@ -88,7 +92,9 @@ opts.CheckChain = func(ctx context.Context, check nebula.ChainCheck) (time.Time,
 }
 ```
 
-取得宿主已核准的撤回决定后，先更新同一份授权数据，再复查节点。`Revalidate` 会重新审核本机凭据、现有会话和缓存事件。`ApplyTopology` 则用于替换整份成员和路由视图。独立调用 `pki.VerifyChain` 验证证书地址对、网络、用途和委派，拓扑成员资格由宿主或节点另行核对。
+取得宿主已核准的撤回决定后，先更新同一份授权数据，再复查节点。`Revalidate` 会重新审核本机凭据、现有会话和缓存事件。`ApplyTopology` 则用于替换整份成员和路由视图。用 `pki.ReadClusterCA` 读取固定 CA 的规划后，独立调用 `pki.VerifyChain` 验证证书地址对、网络、用途和委派，拓扑成员资格由宿主或节点另行核对。
+
+一张仍有效的成员证书可以保有 VIP 授权，而业务已停止接收新连接。计划内排空时，宿主先调整新连接的选择；需要立即停止本机向该成员交付 VIP 流量时，从本机拓扑的该成员上撤回 VIP。会话仍可承载其他获准地址。整张证书失去信任时，使用下方的授权复查流程。[任播授权与排空](addressing.md#任播服务)
 
 ```go
 denied.Store(sha256.Sum256(withdrawn.Raw), struct{}{})
@@ -96,6 +102,8 @@ return node.Revalidate(ctx)
 ```
 
 ## 签名对象
+
+直接消费 CMS 的应用可运行 `go test -v -run '^ExampleVerifyObjectSignature$' ./pki`。先用 `VerifyObjectSignature` 核对正文签名、网络和用途，再用宿主配置的发布者身份、可信根、集群 CA 以及 `codeSigning` 调用 `VerifyChain`，通过该业务的发布者授权后使用正文。通过 `Node.Subscribe` 接收的原生事件已经过节点的证书、成员及主题授权检查。[独立验签示例](../pki/example_test.go)
 
 CMS 使用 DER 编码的封装型 SignedData，包含一个 SignerInfo、叶证书和所提供的中间证书。签名属性包含 content-type 与 message-digest。签名正文将网络、用途、叶证书的 SHA-256 和业务内容绑定在一起；发布者的网络成员 ID 位于业务内容中。实现覆盖 Ed25519、ECDSA、RSA 和 ML-DSA。签名证书与签发 CA 可以采用不同的算法。事件接收方逐次验证原发布者，转发者的连接身份只说明直接来源。[CMS 格式](https://www.rfc-editor.org/rfc/rfc5652) · [签名与解析](../pki/cms.go) · [签发与互操作测试](../pki/pki_test.go)
 

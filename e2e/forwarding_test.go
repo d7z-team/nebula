@@ -44,7 +44,22 @@ func (lan *observedLAN) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Er
 func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 	client, gateway := forwardingPair(t)
 	a, g, h := newStack(t), newStack(t), newStack(t)
-	epA, err := nebulagvisor.NewEndpoint(client, nebulagvisor.Options{})
+	var ingress4, ingress6 atomic.Bool
+	epA, err := nebulagvisor.NewEndpoint(client, nebulagvisor.Options{ObserveReceive: func(from nebula.PeerID, packet []byte) {
+		if from != gateway.ID() {
+			return
+		}
+		switch packet[0] >> 4 {
+		case 4:
+			if header.IPv4(packet).SourceAddress() == addr("172.30.0.20") {
+				ingress4.Store(true)
+			}
+		case 6:
+			if header.IPv6(packet).SourceAddress() == addr("2001:db8:42::20") {
+				ingress6.Store(true)
+			}
+		}
+	}})
 	require.NoError(t, err)
 	epG, err := nebulagvisor.NewEndpoint(gateway, nebulagvisor.Options{})
 	require.NoError(t, err)
@@ -63,8 +78,8 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 	}
 	default4 := route("0.0.0.0/0", "10.13.0.1", vpn)
 	default6 := route("::/0", "fd42::1", vpn)
-	default4.MTU = uint32(client.RecommendedMTU(gateway.ID().IPv4(), false, int(epA.MTU())))
-	default6.MTU = uint32(client.RecommendedMTU(gateway.ID().IPv6(), true, int(epA.MTU())))
+	default4.MTU = uint32(client.RecommendedMTU(gateway.ID(), false, int(epA.MTU())))
+	default6.MTU = uint32(client.RecommendedMTU(gateway.ID(), true, int(epA.MTU())))
 	require.Less(t, default4.MTU, uint32(1280))
 	require.EqualValues(t, 1280, default6.MTU)
 	a.SetRouteTable([]tcpip.Route{route("10.13.0.0/24", "", vpn), route("fd42::/64", "", vpn), default4, default6})
@@ -109,6 +124,7 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 		require.Equal(t, bytes.Repeat([]byte("x"), 1200), buf[:n])
 	}
 
+	require.True(t, ingress4.Load() && ingress6.Load())
 	require.EqualValues(t, ipv4.DefaultTTL-1, observed.ttl4.Load())
 	require.EqualValues(t, ipv6.DefaultTTL-1, observed.ttl6.Load())
 	gatewayStats := epG.Stats()
@@ -133,7 +149,11 @@ func TestNodeNativeEndpointDiagnostics(t *testing.T) {
 	a, gateway := forwardingPair(t)
 	_, err := nebulagvisor.NewEndpoint(a, nebulagvisor.Options{MTU: 1279})
 	require.Error(t, err)
-	ep, err := nebulagvisor.NewEndpoint(a, nebulagvisor.Options{})
+	var lookups atomic.Int32
+	ep, err := nebulagvisor.NewEndpoint(a, nebulagvisor.Options{ResolveNextHop: func(netip.Addr, []byte) (nebula.PeerID, error) {
+		lookups.Add(1)
+		return nebula.PeerID{}, nebula.ErrNextHopRequired
+	}})
 	require.NoError(t, err)
 	t.Cleanup(ep.Close)
 	ep.SetMTU(1)
@@ -151,10 +171,16 @@ func TestNodeNativeEndpointDiagnostics(t *testing.T) {
 	n, e := ep.WritePackets(list)
 	require.Zero(t, n)
 	require.IsType(t, &tcpip.ErrHostUnreachable{}, e)
+	require.EqualValues(t, 1, lookups.Load())
+	pkt.EgressRoute.NextHop = addr("10.13.0.99")
+	n, e = ep.WritePackets(list)
+	require.Zero(t, n)
+	require.IsType(t, &tcpip.ErrHostUnreachable{}, e)
 
 	require.NoError(t, a.SetPeerPathPolicy(gateway.ID().IPv4(), nebula.Blocked))
 	pkt.EgressRoute.NextHop = tcpip.AddrFromSlice(gateway.ID().IPv4().AsSlice())
 	n, e = ep.WritePackets(list)
 	require.Zero(t, n)
 	require.IsType(t, &tcpip.ErrNotPermitted{}, e)
+	require.EqualValues(t, 1, lookups.Load())
 }

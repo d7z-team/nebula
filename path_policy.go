@@ -80,10 +80,15 @@ func (n *Node) SetPeerPathPolicy(address netip.Addr, mode PathMode) error {
 	}
 	n.modes[a] = mode
 	n.mu.Unlock()
+	n.enforcePathPolicy()
+	return nil
+}
+
+func (n *Node) enforcePathPolicy() {
 	n.prunePaths()
+	// Wait for physical writes admitted under the previous policy.
 	n.udpWrites.Lock()
 	n.udpWrites.Unlock()
-	return nil
 }
 
 type deniedEndpoint struct {
@@ -94,6 +99,11 @@ type deniedEndpoint struct {
 func (n *Node) prunePaths() {
 	n.mu.Lock()
 	now := time.Now()
+	for peer, intro := range n.discovered {
+		if !now.Before(intro.authorizedUntil) {
+			n.forgetIntroductionLocked(peer, intro)
+		}
+	}
 	for ep, entry := range n.deniedUDP {
 		mode := n.modeLocked(entry.peer)
 		if !now.Before(entry.expires) || mode.allowsDirect() {

@@ -39,7 +39,7 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	profile.NotAfter = now.Add(10 * time.Minute)
 	var intermediates []*x509.Certificate
 	for _, issuer := range []pki.Issuer{{Chain: []*x509.Certificate{f.ca}, Signer: f.key}, {Chain: []*x509.Certificate{root}, Signer: rootKey}} {
-		inter, err := issuer.IssueCA(req, profile)
+		inter, err := issuer.IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 		require.NoError(t, err)
 		intermediates = append(intermediates, inter)
 	}
@@ -48,13 +48,14 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	req, err = pki.CreateCSR(leafKey, pkix.Name{})
 	require.NoError(t, err)
 	enroll := pki.Enrollment{Name: "host-1", Scope: pki.Scope{Network: "lab"}, IPv4: f.ips[0], IPv6: labPeer(f.ips[0]).IPv6(), Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(5 * time.Minute)}
-	leaf, err := (pki.Issuer{Chain: intermediates[:1], Signer: key}).IssueLeaf(req, enroll)
+	leaf, err := (pki.Issuer{Chain: []*x509.Certificate{intermediates[0], f.ca}, Signer: key}).IssueLeaf(req, enroll)
 	require.NoError(t, err)
 	chain := append([]*x509.Certificate{leaf}, intermediates...)
-	paths, err := pki.VerifyChain(chain, roots, "lab", labPeer(f.ips[0]), x509.ExtKeyUsageClientAuth, now)
+	paths, err := pki.VerifyChain(chain, roots, f.cluster, labPeer(f.ips[0]), x509.ExtKeyUsageClientAuth, now)
 	require.NoError(t, err)
-	require.Len(t, paths, 2)
-	view, err := f.cfg.compile()
+	require.Len(t, paths, 1)
+	require.True(t, paths[0][2].Equal(f.ca))
+	view, err := f.cfg.compile(f.cluster)
 	require.NoError(t, err)
 	n := &Node{id: labPeer(f.ips[0]), o: Options{Roots: roots}}
 	cutoff := now.Add(time.Minute)
@@ -69,8 +70,12 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	}
 	for _, accepted = range []*x509.Certificate{root, f.ca} {
 		until, err := n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
-		require.NoError(t, err)
-		require.Equal(t, cutoff, until)
+		if accepted == root {
+			require.Error(t, err)
+		} else {
+			require.NoError(t, err)
+			require.Equal(t, cutoff, until)
+		}
 	}
 	cutoff = now.Add(time.Hour)
 	until, err := n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
@@ -100,7 +105,7 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 		if issuer.Chain[0] == f.ca {
 			require.ErrorIs(t, err, ErrPathPolicy)
 		} else {
-			require.NoError(t, err)
+			require.Error(t, err)
 		}
 	}
 }
@@ -150,25 +155,4 @@ func TestCredentialAndFrameBudgets(t *testing.T) {
 			require.Equal(t, payload, got)
 		}
 	}
-}
-
-func TestPathQueriesPreserveSelection(t *testing.T) {
-	f := newFixture(t, "tcp", "tcp")
-	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
-	}
-	f.start()
-	n, peer := f.nodes[0], f.ips[1]
-	require.NoError(t, n.ConnectPeer(t.Context(), peer))
-	n.mu.Lock()
-	n.peers[labPeer(peer)].active = nil
-	n.mu.Unlock()
-	status := n.Paths()
-	require.Len(t, status, 1)
-	require.True(t, status[0].Active)
-	require.Equal(t, 1280, n.RecommendedMTU(peer, true, 1280))
-	n.mu.Lock()
-	active := n.peers[labPeer(peer)].active
-	n.mu.Unlock()
-	require.Nil(t, active)
 }

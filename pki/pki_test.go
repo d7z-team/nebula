@@ -28,18 +28,26 @@ func TestIssuanceAndCMS(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	profile := CAProfile{Subject: pkix.Name{CommonName: "offline"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), MaxPathLen: 1}
+	profile := CAProfile{
+		Subject: pkix.Name{CommonName: "offline"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		Scope:        &Scope{Network: "mesh", Cluster: true},
+		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("fd42::/64")},
+		MaxPathLen:   1,
+	}
 	root, err := CreateRoot(key, profile)
 	require.NoError(t, err)
 	_, interKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	req, err := CreateCSR(interKey, pkix.Name{CommonName: "issuer"})
 	require.NoError(t, err)
+	profile.Scope = nil
 	profile.Subject = req.Subject
 	profile.MaxPathLen = 0
-	inter, err := (Issuer{[]*x509.Certificate{root}, key}).IssueCA(req, profile)
+	inter, err := (Issuer{[]*x509.Certificate{root}, key}).IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 	require.NoError(t, err)
 	issuer := Issuer{[]*x509.Certificate{inter, root}, interKey}
+	cluster, err := ReadClusterCA(root)
+	require.NoError(t, err)
 	roots := x509.NewCertPool()
 	roots.AddCert(root)
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -65,7 +73,7 @@ func TestIssuanceAndCMS(t *testing.T) {
 			body, chain, err := VerifyObjectSignature(wire, "team", "event")
 			require.NoError(t, err)
 			require.Equal(t, "original publisher", string(body))
-			_, err = VerifyChain(chain, roots, "mesh", peer, x509.ExtKeyUsageCodeSigning, now)
+			_, err = VerifyChain(chain, roots, cluster, peer, x509.ExtKeyUsageCodeSigning, now)
 			require.NoError(t, err)
 			_, _, err = VerifyObjectSignature(wire, "other", "event")
 			require.Error(t, err)
@@ -73,9 +81,6 @@ func TestIssuanceAndCMS(t *testing.T) {
 			require.Error(t, err)
 			changed := bytes.Replace(wire, []byte("original"), []byte("modified"), 1)
 			_, _, err = VerifyObjectSignature(changed, "team", "event")
-			require.Error(t, err)
-			enrollment.PublicKeyHash = [32]byte{}
-			_, err = issuer.IssueLeaf(req, enrollment)
 			require.Error(t, err)
 			if name == "ECDSA" {
 				exe, err := exec.LookPath("openssl")

@@ -10,7 +10,8 @@ import (
 	"net/netip"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/examples/internal/demo"
+	"code.d7z.net/d7z-team/nebula"
+	"code.d7z.net/d7z-team/nebula/examples/demo"
 	"code.d7z.net/d7z-team/nebula/nebulagvisor"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -61,11 +62,18 @@ func run() error {
 	defer host.Destroy()
 	const vpn, lan tcpip.NICID = 1, 2
 	for i, s := range []*stack.Stack{clientStack, router} {
-		ep, err := nebulagvisor.NewEndpoint(nodes[i], nebulagvisor.Options{})
+		var opts nebulagvisor.Options
+		if i == 0 {
+			opts.ObserveReceive = func(from nebula.PeerID, packet []byte) {
+				fmt.Printf("IPv%d packet received via mesh member %s\n", packet[0]>>4, from)
+			}
+		}
+		ep, err := nebulagvisor.NewEndpoint(nodes[i], opts)
 		if err != nil {
 			return err
 		}
-		if err := addNIC(s, vpn, ep, nodes[i].ID().IPv4(), nodes[i].ID().IPv6()); err != nil {
+		id, cluster := nodes[i].ID(), nodes[i].Cluster()
+		if err := addNIC(s, vpn, ep, netip.PrefixFrom(id.IPv4(), cluster.Subnet(id.IPv4()).Bits()), netip.PrefixFrom(id.IPv6(), cluster.Subnet(id.IPv6()).Bits())); err != nil {
 			return err
 		}
 		defer s.RemoveNIC(vpn)
@@ -73,11 +81,11 @@ func run() error {
 	gw4, gw6 := netip.MustParseAddr("172.30.0.1"), netip.MustParseAddr("2001:db8:42::1")
 	host4, host6 := netip.MustParseAddr("172.30.0.20"), netip.MustParseAddr("2001:db8:42::20")
 	routerLAN, hostLAN := pipe.New("", "", 1500)
-	if err := addNIC(router, lan, routerLAN, gw4, gw6); err != nil {
+	if err := addNIC(router, lan, routerLAN, netip.PrefixFrom(gw4, lan4.Bits()), netip.PrefixFrom(gw6, lan6.Bits())); err != nil {
 		return err
 	}
 	defer router.RemoveNIC(lan)
-	if err := addNIC(host, lan, hostLAN, host4, host6); err != nil {
+	if err := addNIC(host, lan, hostLAN, netip.PrefixFrom(host4, lan4.Bits()), netip.PrefixFrom(host6, lan6.Bits())); err != nil {
 		return err
 	}
 	defer host.RemoveNIC(lan)
@@ -89,7 +97,7 @@ func run() error {
 		}
 	}
 
-	overlay4, overlay6 := netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd13::/64")
+	overlay4, overlay6 := nodes[0].Cluster().Subnet(client.IPv4), nodes[0].Cluster().Subnet(client.IPv6)
 	var onLink netip.Addr
 	clientStack.SetRouteTable([]tcpip.Route{
 		route(overlay4, onLink, vpn), route(overlay6, onLink, vpn),
@@ -113,17 +121,17 @@ func run() error {
 	return nil
 }
 
-func addNIC(s *stack.Stack, id tcpip.NICID, ep stack.LinkEndpoint, ips ...netip.Addr) error {
+func addNIC(s *stack.Stack, id tcpip.NICID, ep stack.LinkEndpoint, ips ...netip.Prefix) error {
 	if e := s.CreateNIC(id, ep); e != nil {
 		ep.Close()
 		return fmt.Errorf("create NIC %d: %s", id, e)
 	}
 	for _, ip := range ips {
 		family := ipv4.ProtocolNumber
-		if ip.Is6() {
+		if ip.Addr().Is6() {
 			family = ipv6.ProtocolNumber
 		}
-		address := tcpip.ProtocolAddress{Protocol: family, AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix()}
+		address := tcpip.ProtocolAddress{Protocol: family, AddressWithPrefix: tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(ip.Addr().AsSlice()), PrefixLen: ip.Bits()}}
 		if e := s.AddProtocolAddress(id, address, stack.AddressProperties{}); e != nil {
 			s.RemoveNIC(id)
 			return fmt.Errorf("assign %s to NIC %d: %s", ip, id, e)

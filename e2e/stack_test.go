@@ -28,24 +28,31 @@ func newStack(t *testing.T) *stack.Stack {
 	return s
 }
 
-func addr(ip string) tcpip.Address { return tcpip.AddrFromSlice(netip.MustParseAddr(ip).AsSlice()) }
+func gvisorAddr(ip netip.Addr) tcpip.Address { return tcpip.AddrFromSlice(ip.AsSlice()) }
+
+func addr(ip string) tcpip.Address { return gvisorAddr(netip.MustParseAddr(ip)) }
 
 func addNIC(t *testing.T, s *stack.Stack, id tcpip.NICID, ep stack.LinkEndpoint, addresses ...string) {
 	t.Helper()
 	require.Nil(t, s.CreateNIC(id, ep))
 	for _, ip := range addresses {
-		a := addr(ip)
+		p, err := netip.ParsePrefix(ip)
+		if err != nil {
+			a := netip.MustParseAddr(ip)
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		a := gvisorAddr(p.Addr())
 		proto := ipv4.ProtocolNumber
 		if a.BitLen() == 128 {
 			proto = ipv6.ProtocolNumber
 		}
-		require.Nil(t, s.AddProtocolAddress(id, tcpip.ProtocolAddress{Protocol: proto, AddressWithPrefix: a.WithPrefix()}, stack.AddressProperties{}))
+		require.Nil(t, s.AddProtocolAddress(id, tcpip.ProtocolAddress{Protocol: proto, AddressWithPrefix: tcpip.AddressWithPrefix{Address: a, PrefixLen: p.Bits()}}, stack.AddressProperties{}))
 	}
 }
 
 func route(prefix, via string, nic tcpip.NICID) tcpip.Route {
 	p := netip.MustParsePrefix(prefix)
-	a := tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(p.Addr().AsSlice()), PrefixLen: p.Bits()}
+	a := tcpip.AddressWithPrefix{Address: gvisorAddr(p.Addr()), PrefixLen: p.Bits()}
 	r := tcpip.Route{Destination: a.Subnet(), NIC: nic}
 	if via != "" {
 		r.Gateway = addr(via)
