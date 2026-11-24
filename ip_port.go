@@ -26,9 +26,11 @@ type PortStats struct {
 }
 
 // TransmitResult describes a dequeued packet's local submission attempt.
-// A nil Err means the local transport accepted the packet. Transport is "udp",
-// "tcp", or "relay" when a path was selected, including a remote size-limit
-// rejection. It is empty if no path was selected.
+// A nil Err means the local transport accepted the packet. Transport identifies
+// the submission path ("udp", "tcp", or "relay"), including when its receive
+// limit is too small. An attempt that ends while dialing or waiting for
+// bandwidth can report an empty Transport. Use errors.Is on Err to distinguish
+// an unavailable peer, a path policy denial, or an unauthorized packet address.
 type TransmitResult struct {
 	Peer                PeerID
 	Source, Destination netip.Addr
@@ -60,9 +62,14 @@ type outboundPacket struct {
 }
 
 type ipQueue struct {
-	packets     []*outboundPacket
-	current     *outboundPacket
-	stopCurrent context.CancelFunc
+	packets []*outboundPacket
+	current ipSubmission
+}
+
+type ipSubmission struct {
+	*outboundPacket
+	stop context.CancelCauseFunc
+	path *session // Selected under Node.mu, including while waiting for bandwidth.
 }
 
 // IPPort delivers complete IPv4 and IPv6 packets for one attachment.
@@ -95,7 +102,7 @@ func (p *IPPort) Close() {
 	p.mu.Lock()
 	p.closed = true
 	for peer := range p.queues {
-		p.discardQueueLocked(peer)
+		p.discardQueueLocked(peer, nil)
 	}
 	p.mu.Unlock()
 	n := p.node
@@ -111,16 +118,16 @@ func (p *IPPort) Close() {
 func (p *IPPort) ClearPending(peer PeerID) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.discardQueueLocked(peer)
+	return p.discardQueueLocked(peer, nil)
 }
 
-func (p *IPPort) discardQueueLocked(peer PeerID) int {
+func (p *IPPort) discardQueueLocked(peer PeerID, cause error) int {
 	q := p.queues[peer]
 	if q == nil {
 		return 0
 	}
-	if q.stopCurrent != nil {
-		q.stopCurrent()
+	if q.current.stop != nil {
+		q.current.stop(cause)
 	}
 	delete(p.queues, peer)
 	count := len(q.packets)

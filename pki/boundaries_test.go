@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math"
@@ -153,29 +152,6 @@ func TestIssuanceBoundaries(t *testing.T) {
 			_, err := VerifyChain(tc.chain, tc.roots, cluster, peer, tc.usage, now)
 			require.Error(t, err)
 		})
-	}
-
-	cert := tls.Certificate{Certificate: [][]byte{leaf.Raw, inter.Raw}, PrivateKey: leafKey}
-	body := make([]byte, MaxDocument-2048)
-	wire, err := SignObject("mesh", "publication", body, cert)
-	require.NoError(t, err)
-	maxBody := len(body) + MaxDocument - len(wire)
-	for _, delta := range []int{-1, 0, 1} {
-		data := make([]byte, maxBody+delta)
-		wire, err := SignObject("mesh", "publication", data, cert)
-		if delta > 0 {
-			require.Error(t, err)
-			continue
-		}
-		require.NoError(t, err)
-		require.Len(t, wire, MaxDocument+delta)
-		got, _, err := VerifyObjectSignature(wire, "mesh", "publication")
-		require.NoError(t, err)
-		require.Equal(t, data, got)
-		if delta == 0 {
-			_, _, err = VerifyObjectSignature(append(wire, 0), "mesh", "publication")
-			require.Error(t, err)
-		}
 	}
 }
 

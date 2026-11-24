@@ -148,6 +148,9 @@ func (n *Node) ReloadCertificates(ctx context.Context, in LocalCertificates) err
 		if err != nil {
 			return err
 		}
+		if err := n.validateIntroduction(p, c.Object); err != nil {
+			return err
+		}
 		n.mu.Lock()
 		if n.state == closed || n.ctx.Err() != nil {
 			n.mu.Unlock()
@@ -242,11 +245,15 @@ type (
 )
 
 func (n *Node) signStatement(kind string, value any, signer tls.Certificate) (statement, error) {
-	b, err := json.Marshal(publishedStatement[any]{n.id, value})
+	b, err := n.statementBody(value)
 	if err != nil {
 		return nil, err
 	}
 	return pki.SignObject(n.Cluster().Network(), kind, b, signer)
+}
+
+func (n *Node) statementBody(value any) ([]byte, error) {
+	return json.Marshal(publishedStatement[any]{n.id, value})
 }
 
 func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (pki.Identity, []byte, time.Time, error) {

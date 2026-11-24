@@ -9,8 +9,6 @@ import (
 	"net/netip"
 	"sync"
 	"time"
-
-	quic "github.com/quic-go/quic-go"
 )
 
 // A peer dial wakes waiters on registration and on completion. Node.mu guards both fields.
@@ -25,7 +23,7 @@ type endpointAttempt struct {
 	session *session
 }
 
-type directDial struct {
+type endpointDialKey struct {
 	peer     PeerID
 	endpoint Endpoint
 }
@@ -99,6 +97,10 @@ func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}
 			}
 		case a == nil && slots != nil && reserved == nil && n.attempts[peer] == nil:
 			acquire = slots
+			if n.pathRegistered == nil {
+				n.pathRegistered = make(chan struct{})
+			}
+			changed = n.pathRegistered
 		default:
 			if a == nil {
 				a = n.startDialLocked(peer, reserved)
@@ -107,7 +109,7 @@ func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}
 			changed = a.changed
 		}
 		n.mu.Unlock()
-		if changed == nil && acquire == nil {
+		if changed == nil {
 			if reserved != nil {
 				<-reserved
 			}
@@ -157,15 +159,22 @@ func (n *Node) establishPath(peer PeerID) error {
 	n.mu.Lock()
 	mode := n.modeLocked(peer)
 	n.mu.Unlock()
-	if mode == Blocked {
-		return ErrPathPolicy
-	}
 	var directErr, relayErr error
 	if mode.allowsDirect() {
 		_, directErr = n.dialDirect(n.ctx, peer)
-		if directErr == nil || n.preferredSession(peer, false) != nil {
+		if directErr == nil {
 			return nil
 		}
+		n.mu.Lock()
+		mode = n.modeLocked(peer)
+		connected := n.preferredSessionLocked(n.peers[peer], false, nil) != nil
+		n.mu.Unlock()
+		if connected {
+			return nil
+		}
+	}
+	if mode == Blocked {
+		return ErrPathPolicy
 	}
 	if mode.allowsRelay() {
 		relayErr = n.dialRelay(n.ctx, peer, maxCircuitAttempts)
@@ -283,7 +292,8 @@ func (n *Node) dialCandidates(ctx context.Context, peer PeerID, udp, tcp []Endpo
 }
 
 func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*session, error) {
-	key := directDial{peer, e}
+	key := endpointDialKey{peer, e}
+	byEndpoint := peer == (PeerID{})
 	for {
 		n.mu.Lock()
 		if err := ctx.Err(); err != nil {
@@ -294,8 +304,7 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 			n.mu.Unlock()
 			return nil, err
 		}
-		byEndpoint := peer == (PeerID{})
-		if byEndpoint && (!e.Valid() || n.policy.Load().isOverlayAddress(e.Address.Addr())) {
+		if byEndpoint && !n.policy.Load().physicalEndpoint(e) {
 			n.mu.Unlock()
 			return nil, errors.New("invalid physical endpoint")
 		}
@@ -314,10 +323,10 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 			if !byEndpoint {
 				// A peer dial races transports and cancels the losing candidate.
 				n.mu.Unlock()
-				n.finishEndpointDial(ctx, key, a)
+				n.runEndpointDial(ctx, key, a)
 				return a.session, a.err
 			}
-			n.wg.Go(func() { n.finishEndpointDial(n.ctx, key, a) })
+			n.wg.Go(func() { n.runEndpointDial(n.ctx, key, a) })
 		}
 		n.mu.Unlock()
 		select {
@@ -337,34 +346,12 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 	}
 }
 
-func (n *Node) finishEndpointDial(ctx context.Context, key directDial, a *endpointAttempt) {
+func (n *Node) runEndpointDial(ctx context.Context, key endpointDialKey, a *endpointAttempt) {
 	e, peer := key.endpoint, key.peer
-	dctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
-	defer cancel()
-	if e.Network == "udp" {
-		if transport := n.transports[e.Address.Addr().Is6()]; transport == nil {
-			a.err = fmt.Errorf("%w: no UDP socket for address family of %s", ErrPeerUnavailable, e.Address.Addr())
-		} else {
-			var q *quic.Conn
-			q, a.err = transport.Dial(dctx, net.UDPAddrFromAddrPort(e.Address), n.tlsConfig(peer, false), transport.config)
-			if a.err == nil {
-				a.session, a.err = n.attachQUIC(dctx, q, peer, true)
-			}
-		}
-	} else {
-		var c net.Conn
-		network := "tcp4"
-		if e.Address.Addr().Is6() {
-			network = "tcp6"
-		}
-		c, a.err = n.o.DialTCP(dctx, network, e.Address.String())
-		if a.err == nil {
-			a.session, a.err = n.attachTLS(dctx, c, peer, nil, true, nil)
-		}
-	}
+	a.session, a.err = n.dialTransport(ctx, peer, e)
 	if a.err != nil {
-		if ctx.Err() != nil {
-			a.err = ctx.Err()
+		if err := ctx.Err(); err != nil {
+			a.err = err
 		} else {
 			n.dialFailures.Add(1)
 		}
@@ -376,4 +363,29 @@ func (n *Node) finishEndpointDial(ctx context.Context, key directDial, a *endpoi
 	delete(n.directDials, key)
 	close(a.done)
 	n.mu.Unlock()
+}
+
+func (n *Node) dialTransport(ctx context.Context, peer PeerID, e Endpoint) (*session, error) {
+	ctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
+	defer cancel()
+	if e.Network == "udp" {
+		transport := n.transports[e.Address.Addr().Is6()]
+		if transport == nil {
+			return nil, fmt.Errorf("%w: no UDP socket for address family of %s", ErrPeerUnavailable, e.Address.Addr())
+		}
+		q, err := transport.Dial(ctx, net.UDPAddrFromAddrPort(e.Address), n.tlsConfig(peer, false), transport.config)
+		if err != nil {
+			return nil, err
+		}
+		return n.attachQUIC(ctx, q, peer, true)
+	}
+	network := "tcp4"
+	if e.Address.Addr().Is6() {
+		network = "tcp6"
+	}
+	c, err := n.o.DialTCP(ctx, network, e.Address.String())
+	if err != nil {
+		return nil, err
+	}
+	return n.attachTLS(ctx, c, peer, nil, true, nil)
 }

@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -82,6 +83,33 @@ func TestIssuanceAndCMS(t *testing.T) {
 			changed := bytes.Replace(wire, []byte("original"), []byte("modified"), 1)
 			_, _, err = VerifyObjectSignature(changed, "team", "publication")
 			require.Error(t, err)
+			t.Run("document limit", func(t *testing.T) {
+				data := make([]byte, MaxDocument)
+				chainOnly := tls.Certificate{Certificate: crt.Certificate}
+				limit := sort.Search(len(data), func(i int) bool {
+					err := CheckObjectSize("team", "publication", data[:i+1], chainOnly)
+					if err != nil {
+						require.ErrorIs(t, err, ErrDocumentTooLarge)
+					}
+					return err != nil
+				})
+				require.Positive(t, limit)
+				require.Less(t, limit, len(data))
+				wire, err := SignObject("team", "publication", data[:limit], crt)
+				require.NoError(t, err)
+				got, _, err := VerifyObjectSignature(wire, "team", "publication")
+				require.NoError(t, err)
+				require.Equal(t, data[:limit], got)
+				_, _, err = VerifyObjectSignature(append(wire, 0), "team", "publication")
+				require.Error(t, err)
+				// ECDSA integers have variable DER length. Other signatures fill
+				// the preflight budget exactly.
+				if name != "ECDSA" {
+					require.Len(t, wire, MaxDocument)
+					_, err = SignObject("team", "publication", data[:limit+1], crt)
+					require.ErrorIs(t, err, ErrDocumentTooLarge)
+				}
+			})
 			if name == "ECDSA" {
 				exe, err := exec.LookPath("openssl")
 				if err != nil {

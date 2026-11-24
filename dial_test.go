@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -53,6 +54,93 @@ func TestConnectPeerAfterSuccessfulPathIsWithdrawn(t *testing.T) {
 		}
 		require.EqualValues(t, 1, dials.Load())
 	})
+}
+
+func TestGroupSendUsesInboundPathWhileWaitingForDialSlot(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp")
+	f.cfg.EnableBroadcast = true
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+	for range cap(a.sharedAddressDialSlots) {
+		a.sharedAddressDialSlots <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	received := make(chan []byte, 1)
+	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- pkt }})
+	require.NoError(t, err)
+	out, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
+	require.NoError(t, err)
+	pkt := testIPv4(a.id.IPv4(), limitedBroadcast, "inbound path")
+	require.NoError(t, out.WriteIP(PeerID{}, pkt))
+	require.Eventually(t, func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.pathRegistered != nil
+	}, time.Second, time.Millisecond)
+	require.NoError(t, b.ConnectPeerID(ctx, a.id))
+	select {
+	case got := <-received:
+		require.Equal(t, pkt, got)
+	case <-ctx.Done():
+		t.Fatal("queued broadcast missed the inbound connection")
+	}
+	require.Len(t, a.sharedAddressDialSlots, cap(a.sharedAddressDialSlots))
+}
+
+func TestPeerPolicyChangeDuringDirectDial(t *testing.T) {
+	for name, mode := range map[string]PathMode{"allow relay": Auto, "block peer": Blocked} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, "tcp", "tcp", "tcp")
+			f.link(0, 1)
+			f.link(1, 2)
+			f.cfg.Members[1].Transit = true
+			for i := range f.opts {
+				f.opts[i].Interval = time.Hour
+			}
+			f.opts[0].DialTimeout = 4 * time.Second
+			target := f.cfg.Members[2].Endpoints[0].Address.String()
+			entered, release := make(chan struct{}), make(chan struct{})
+			f.opts[0].DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+				if address != target {
+					return (&net.Dialer{}).DialContext(ctx, network, address)
+				}
+				close(entered)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-release:
+					return nil, errors.New("direct route unavailable")
+				}
+			}
+			f.start()
+			a, r, b := f.nodes[0], f.nodes[1], f.nodes[2]
+			ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+			defer cancel()
+			require.NoError(t, a.ConnectPeerID(ctx, r.id))
+			require.NoError(t, r.ConnectPeerID(ctx, b.id))
+			require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), DirectOnly))
+			result := make(chan error, 1)
+			go func() { result <- a.ConnectPeerID(ctx, b.id) }()
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), mode))
+			close(release)
+			err := <-result
+			path, ok := a.PreferredPath(b.id)
+			if mode == Blocked {
+				require.ErrorIs(t, err, ErrPathPolicy)
+				require.False(t, ok)
+			} else {
+				require.NoError(t, err)
+				require.True(t, ok)
+				require.Equal(t, []PeerID{a.id, r.id, b.id}, path.Circuit)
+			}
+		})
+	}
 }
 
 func TestConnectEndpointTrustAndRestrictions(t *testing.T) {
@@ -194,11 +282,9 @@ func TestConnectEndpointOutboundTCP(t *testing.T) {
 	f.start()
 	client := f.nodes[0]
 	ep := f.cfg.Members[1].Endpoints[0]
-	for _, invalid := range []Endpoint{{}, {"tcp", netip.AddrPortFrom(f.ips[1], 443)}} {
-		_, err := client.ConnectEndpoint(t.Context(), invalid)
-		require.ErrorContains(t, err, "invalid physical endpoint")
-	}
-	_, err := client.ConnectEndpoint(t.Context(), Endpoint{"udp", netip.MustParseAddrPort("[::1]:443")})
+	_, err := client.ConnectEndpoint(t.Context(), Endpoint{})
+	require.ErrorContains(t, err, "invalid physical endpoint")
+	_, err = client.ConnectEndpoint(t.Context(), Endpoint{"udp", netip.MustParseAddrPort("[::1]:443")})
 	require.ErrorIs(t, err, ErrPeerUnavailable)
 	require.Contains(t, client.ControlStatus().LastError, "[::1]:443")
 	id, err := client.ConnectEndpoint(t.Context(), ep)
@@ -223,6 +309,45 @@ func TestConnectEndpointRequiresServerAuthorization(t *testing.T) {
 			require.NoError(t, a.ConnectPeerID(t.Context(), bID))
 			_, err := a.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
 			require.ErrorIs(t, err, denied)
+		})
+	}
+}
+
+func TestConfiguredPhysicalEndpoints(t *testing.T) {
+	f := newFixture(t, "", "")
+	f.start()
+	for _, tc := range []struct {
+		address  string
+		physical bool
+	}{
+		{"10.13.0.2:443", false},
+		{"[fd42::c8]:443", false},
+		{"[fd42::2%eth0]:443", false},
+		{"192.168.1.2:443", true},
+		{"[fe80::2%eth0]:443", true},
+	} {
+		t.Run(tc.address, func(t *testing.T) {
+			ep := Endpoint{"tcp", netip.MustParseAddrPort(tc.address)}
+			opts := f.opts[0]
+			opts.Topology = f.cfg
+			opts.AdvertiseEndpoints = []Endpoint{ep}
+			n, advertiseErr := New(t.Context(), opts)
+			if n != nil {
+				t.Cleanup(func() { n.Close() })
+			}
+			cfg := f.cfg
+			cfg.Members = slices.Clone(cfg.Members)
+			cfg.Members[1].Endpoints = []Endpoint{ep}
+			topologyErr := f.nodes[0].ApplyTopology(t.Context(), cfg)
+			if tc.physical {
+				require.NoError(t, advertiseErr)
+				require.NoError(t, topologyErr)
+				return
+			}
+			require.ErrorContains(t, advertiseErr, tc.address)
+			require.ErrorContains(t, topologyErr, tc.address)
+			_, err := f.nodes[0].ConnectEndpoint(t.Context(), ep)
+			require.ErrorContains(t, err, "invalid physical endpoint")
 		})
 	}
 }

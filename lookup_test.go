@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"net/netip"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,6 +67,26 @@ func TestConnectEndpointAndIPDiscovery(t *testing.T) {
 				t.Fatal("missing primary packet")
 			}
 		})
+	}
+}
+
+func TestRendezvousEndpointOrder(t *testing.T) {
+	f := newFixture(t, "udp", "both", "udp")
+	static := f.cfg.Members[1].Endpoints
+	f.cfg.Members[1].Endpoints = []Endpoint{static[1], static[0], static[1]}
+	additional := f.cfg.Members[2].Endpoints[0]
+	f.opts[1].AdvertiseEndpoints = []Endpoint{additional, static[0]}
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+	_, ok := a.learnIntroduction(t.Context(), b.localIntroduction(b.policy.Load()).record, nil)
+	require.True(t, ok)
+	a.mu.Lock()
+	eps := a.endpointsLocked(b.id)
+	a.mu.Unlock()
+	require.Equal(t, []Endpoint{static[1], static[0], additional}, eps)
+	a.punch(b.id)
+	for _, ep := range []Endpoint{static[0], additional} {
+		require.Equal(t, 1, f.sockets[0].count(ep.Address))
 	}
 }
 
@@ -146,6 +168,25 @@ func TestHiddenIntroduction(t *testing.T) {
 		}
 		require.Equal(t, want, matches[0].Prefix)
 	}
+}
+
+func TestAdvertRetainsUsableNATMapping(t *testing.T) {
+	f := newFixture(t, "udp", "udp")
+	f.startDiscovery(1, -1)
+	observer, target := f.nodes[0], f.nodes[1]
+	s := observer.preferredSession(target.ID(), true)
+	require.NotNil(t, s)
+	mapping := Endpoint{"udp", netip.MustParseAddrPort("[2001:db8::1]:45001")}
+	for _, port := range []uint16{mapping.Address.Port(), 0} {
+		report, err := json.Marshal(advert{Observed: netip.AddrPortFrom(mapping.Address.Addr(), port)})
+		require.NoError(t, err)
+		_, err = s.request(t.Context(), opHello, report, maxControlFrame)
+		require.NoError(t, err)
+	}
+	matches, err := target.ResolveIP(t.Context(), target.ID().IPv6())
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	require.Contains(t, matches[0].Endpoints, mapping)
 }
 
 func TestDownstreamDiscoveryAcrossBranches(t *testing.T) {
@@ -273,5 +314,79 @@ func TestConcurrentResolveCancellation(t *testing.T) {
 			require.NoError(t, <-second)
 			require.Len(t, a.Paths(), 1)
 		})
+	}
+}
+
+func TestGatewayIntroductionBudget(t *testing.T) {
+	f := newFixture(t, "tcp")
+	member := &f.cfg.Members[0]
+	grant := netip.MustParsePrefix("172.16.0.0/16")
+	id := labPeer(member.IPv4)
+	wide := f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{grant}})
+	routes := make([]netip.Prefix, 4096)
+	for i := range routes {
+		routes[i] = netip.PrefixFrom(netip.AddrFrom4([4]byte{172, 16, byte(i >> 4), byte(i << 4)}), 32)
+	}
+	member.RoutedPrefixes = routes
+	opts := f.opts[0]
+	opts.Certificates.Client = wide
+	opts.Topology = f.cfg
+	_, err := New(t.Context(), opts)
+	require.ErrorIs(t, err, pki.ErrDocumentTooLarge)
+
+	// The same topology fits while the object signer authorizes a single route.
+	narrow := f.issue(id, pki.Scope{RoutedPrefixes: routes[:1]})
+	f.opts[0].Certificates.Client = narrow
+	f.start()
+	n := f.nodes[0]
+	require.ErrorIs(t, n.ReloadCertificates(t.Context(), LocalCertificates{Client: wide}), pki.ErrDocumentTooLarge)
+	first, err := n.ResolveIP(t.Context(), routes[0].Addr())
+	require.NoError(t, err)
+	require.Equal(t, routes[0], first[0].Prefix)
+	require.Equal(t, narrow.Leaf.SerialNumber.String(), n.ControlStatus().Serial)
+
+	member.RoutedPrefixes = routes[:1]
+	require.NoError(t, n.ApplyTopology(t.Context(), f.cfg))
+	require.NoError(t, n.ReloadCertificates(t.Context(), LocalCertificates{Client: wide}))
+	member.RoutedPrefixes = routes
+	require.ErrorIs(t, n.ApplyTopology(t.Context(), f.cfg), pki.ErrDocumentTooLarge)
+	require.Equal(t, routes[:1], n.localIntroduction(n.policy.Load()).RoutedPrefixes)
+
+	// Fill the record up to the last host route that fits, leaving room for
+	// several observations. The exact count depends on the actual certificate.
+	base := n.localIntroduction(n.policy.Load()).introduction
+	base.Expires = time.Unix(base.Expires.Unix(), 999999999).UTC()
+	end := sort.Search(len(routes), func(i int) bool {
+		base.RoutedPrefixes = routes[:i+1]
+		return errors.Is(n.checkIntroductionSize(n.policy.Load(), wide, base), pki.ErrDocumentTooLarge)
+	})
+	require.Greater(t, end, 10)
+	member.RoutedPrefixes = routes[:end-4]
+	require.NoError(t, n.ApplyTopology(t.Context(), f.cfg))
+	n.mu.Lock()
+	for i := range 15 {
+		n.observations[observer{peer: labPeer(netip.AddrFrom4([4]byte{10, 13, 0, byte(i + 2)}))}] = observation{
+			endpoint: netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(12000+i)),
+			expires:  time.Now().Add(time.Minute),
+		}
+	}
+	n.mu.Unlock()
+	local := n.localIntroduction(n.policy.Load())
+	var intro introduction
+	_, body, _, err := n.verifyStatement(t.Context(), "introduction", local.record, n.policy.Load())
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(body, &intro))
+	require.Greater(t, len(intro.Endpoints), len(member.Endpoints))
+	require.Less(t, len(intro.Endpoints), len(local.candidates))
+	require.Equal(t, member.Endpoints[0], intro.Endpoints[0])
+	require.Equal(t, local.candidates[:len(intro.Endpoints)], intro.Endpoints)
+	require.Equal(t, member.RoutedPrefixes, intro.RoutedPrefixes)
+	intro.Endpoints = local.candidates[:len(intro.Endpoints)+1]
+	_, err = n.signStatement("introduction", intro, wide)
+	require.ErrorIs(t, err, pki.ErrDocumentTooLarge)
+	for _, dst := range []netip.Addr{id.IPv6(), member.RoutedPrefixes[len(member.RoutedPrefixes)-1].Addr()} {
+		matches, err := n.ResolveIP(t.Context(), dst)
+		require.NoError(t, err)
+		require.Equal(t, id, matches[0].Peer)
 	}
 }

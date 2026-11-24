@@ -44,8 +44,9 @@ const maxLookupAnswers = 64
 
 // ResolveIP looks up a primary address or a downstream unicast destination over
 // existing neighbors. It returns current signed matches, most specific first.
-// Cached and network results may be partial, including when a neighbor cannot
-// finish its search. Discovery does not dial peers or authorize downstream traffic.
+// Any cache hit returns immediately, even if another gateway advertises a more
+// specific prefix. Network results can also be partial. Discovery does not dial
+// peers or authorize downstream traffic.
 func (n *Node) ResolveIP(ctx context.Context, ip netip.Addr) ([]IPMatch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

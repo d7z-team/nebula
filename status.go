@@ -106,7 +106,7 @@ type ControlStatus struct {
 	Started, Closed    bool
 	// LastError records the most recent failed peer connection attempt.
 	LastError string
-	// ListenerErrors records terminal TCP accept errors by address family.
+	// ListenerErrors records terminal listener errors keyed by udp4, udp6, tcp4 or tcp6.
 	ListenerErrors map[string]string
 	// Ready means local membership and credentials are valid, including before Start.
 	Ready    bool

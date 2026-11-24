@@ -34,17 +34,20 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
-	in := make(chan []byte, 1)
+	in := make(chan []byte, 3)
 	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { in <- pkt }})
 	require.NoError(t, err)
 	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), "pending")))
-	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
+	for _, body := range []string{"shaping", "queued", "queued again"} {
+		require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), body)))
+	}
+	require.Eventually(t, func() bool { return port.Stats().Queued == 2 && a.limiter.Tokens() < 0 }, time.Second, time.Millisecond)
 	denied.Store(true)
 	require.NoError(t, a.Revalidate(t.Context()))
-	require.Eventually(t, func() bool { return port.Stats().RejectedOutbound == 1 }, time.Second, time.Millisecond)
+	require.Zero(t, port.Stats().Queued)
+	require.Eventually(t, func() bool { return port.Stats().RejectedOutbound == 3 }, time.Second, time.Millisecond)
 	require.Empty(t, in)
 }
 

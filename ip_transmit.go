@@ -3,11 +3,16 @@ package nebula
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
 	"github.com/quic-go/quic-go"
 )
+
+// The next queued packet may establish a fresh path. An actual dial failure
+// still discards the backlog for that peer.
+var errNoOutboundPath = fmt.Errorf("%w: no usable outbound path", ErrPeerUnavailable)
 
 func (p *IPPort) drain(peer PeerID, q *ipQueue) {
 	n := p.node
@@ -23,25 +28,30 @@ func (p *IPPort) drain(peer PeerID, q *ipQueue) {
 			return
 		}
 		b := q.packets[0]
-		packetCtx, stop := context.WithCancel(n.ctx)
-		q.current, q.stopCurrent = b, stop
+		packetCtx, stop := context.WithCancelCause(n.ctx)
+		q.current = ipSubmission{outboundPacket: b, stop: stop}
 		q.packets[0] = nil
 		q.packets = q.packets[1:]
 		p.stats.Queued--
 		p.mu.Unlock()
-		session, err := n.transmitIP(packetCtx, peer, b)
+		session, err := n.transmitIP(packetCtx, peer, &q.current)
 		p.mu.Lock()
-		interrupted := packetCtx.Err() != nil
-		stop()
-		q.current, q.stopCurrent = nil, nil
+		cause := context.Cause(packetCtx)
+		stop(nil)
+		q.current = ipSubmission{}
 		if err == nil {
 			p.stats.SentPackets++
 			p.stats.SentBytes += uint64(len(b.data))
 		} else {
+			if cause != nil {
+				err = cause
+			}
 			p.stats.RejectedOutbound++
 			p.stats.LastDrop = err.Error()
-			if !errors.Is(err, ErrAddressUnauthorized) && !errors.Is(err, ErrPacketTooLarge) && !interrupted && p.queues[peer] == q {
-				p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer))
+			keepQueued := errors.Is(err, errNoOutboundPath) || errors.Is(err, ErrAddressUnauthorized) || errors.Is(err, ErrPacketTooLarge) ||
+				session != nil && errors.Is(err, ErrPathPolicy)
+			if !keepQueued && cause == nil && p.queues[peer] == q {
+				p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer, err))
 			}
 		}
 		p.mu.Unlock()
@@ -59,12 +69,9 @@ func (p *IPPort) drain(peer PeerID, q *ipQueue) {
 
 // transmitIP keeps the selected end-to-end peer through dialing and shaping.
 // It returns the session used for submission, including on a transport error.
-func (n *Node) transmitIP(ctx context.Context, peer PeerID, packet *outboundPacket) (*session, error) {
+func (n *Node) transmitIP(ctx context.Context, peer PeerID, packet *ipSubmission) (*session, error) {
 	s, err := n.outboundSession(peer, packet, false)
-	if err != nil {
-		return s, err
-	}
-	if s == nil {
+	if err == errNoOutboundPath {
 		cfg := n.policy.Load()
 		_, group, _ := cfg.groupRecipients(n.id, packet.destination)
 		var slots chan struct{}
@@ -75,12 +82,9 @@ func (n *Node) transmitIP(ctx context.Context, peer PeerID, packet *outboundPack
 			return nil, err
 		}
 		s, err = n.outboundSession(peer, packet, false)
-		if err != nil {
-			return s, err
-		}
-		if s == nil {
-			return nil, ErrAddressUnauthorized
-		}
+	}
+	if err != nil {
+		return s, err
 	}
 	if err := n.shape(ctx, len(packet.data)); err != nil {
 		return nil, err
@@ -89,15 +93,18 @@ func (n *Node) transmitIP(ctx context.Context, peer PeerID, packet *outboundPack
 	if err != nil {
 		return s, err
 	}
-	if s == nil {
-		return nil, ErrAddressUnauthorized
+	err = s.sendIP(ctx, packet.outboundPacket)
+	if err != nil {
+		// A concurrent withdrawal can also surface as a stream or socket error.
+		if reason := s.checkIPSubmission(ctx, packet.outboundPacket); reason != nil {
+			return s, reason
+		}
 	}
-	return s, s.sendIP(ctx, packet)
+	return s, err
 }
 
-// outboundSession returns nil, nil when an authorized packet needs a connection.
 // Only the final selection before submission records the general-purpose path.
-func (n *Node) outboundSession(peer PeerID, packet *outboundPacket, submitting bool) (*session, error) {
+func (n *Node) outboundSession(peer PeerID, packet *ipSubmission, submitting bool) (*session, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.modeLocked(peer) == Blocked {
@@ -109,7 +116,7 @@ func (n *Node) outboundSession(peer PeerID, packet *outboundPacket, submitting b
 		if !packet.authorizedBy(cfg, n.id, peer) {
 			return nil, ErrAddressUnauthorized
 		}
-		return nil, nil
+		return nil, errNoOutboundPath
 	}
 	s := preferred
 	if !packet.authorizedOn(cfg, s.localIdentity, s.remoteIdentity) {
@@ -124,24 +131,35 @@ func (n *Node) outboundSession(peer PeerID, packet *outboundPacket, submitting b
 	if submitting && s == preferred {
 		paths.active = s
 	}
+	packet.path = s
 	return s, nil
 }
 
-func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
-	authorize := func() error {
-		if err := ctx.Err(); err != nil {
-			return err
+func (s *session) checkIPSubmission(ctx context.Context, packet *outboundPacket) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	n := s.n
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !n.usableLocked(s) {
+		if len(s.path) == 0 && !n.modeLocked(s.peer).allowsDirect() || len(s.path) > 0 && !n.circuitAllowedLocked(s.path) {
+			return ErrPathPolicy
 		}
-		n := s.n
-		n.mu.Lock()
-		defer n.mu.Unlock()
-		if !n.usableLocked(s) || !packet.authorizedOn(n.policy.Load(), s.localIdentity, s.remoteIdentity) {
+		if !packet.authorizedBy(n.policy.Load(), n.id, s.peer) {
 			return ErrAddressUnauthorized
 		}
-		return nil
+		return errNoOutboundPath
 	}
+	if !packet.authorizedOn(n.policy.Load(), s.localIdentity, s.remoteIdentity) {
+		return ErrAddressUnauthorized
+	}
+	return nil
+}
+
+func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 	if s.q != nil {
-		if err := authorize(); err != nil {
+		if err := s.checkIPSubmission(ctx, packet); err != nil {
 			return err
 		}
 		err := s.q.SendDatagram(packet.data)
@@ -171,7 +189,7 @@ func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 		}
 		s.data = c
 	}
-	if err := authorize(); err != nil {
+	if err := s.checkIPSubmission(ctx, packet); err != nil {
 		return err
 	}
 	s.data.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout))
@@ -183,7 +201,7 @@ func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 	return nil
 }
 
-func (p *IPPort) revalidateQueues(disconnected map[PeerID]bool) {
+func (p *IPPort) revalidateQueues(expiredPeers map[PeerID]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := p.node
@@ -191,16 +209,21 @@ func (p *IPPort) revalidateQueues(disconnected map[PeerID]bool) {
 	defer n.mu.Unlock()
 	cfg := n.policy.Load()
 	for peer, q := range p.queues {
-		if disconnected[peer] || n.modeLocked(peer) == Blocked {
-			p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer))
+		if n.modeLocked(peer) == Blocked || expiredPeers[peer] && n.peers[peer] == nil {
+			p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer, ErrPathPolicy))
 			p.stats.LastDrop = ErrPathPolicy.Error()
 			continue
 		}
 		unauthorized := func(packet *outboundPacket) bool {
 			return !packet.authorizedBy(cfg, n.id, peer)
 		}
-		if q.current != nil && unauthorized(q.current) {
-			q.stopCurrent()
+		if current := &q.current; current.stop != nil {
+			switch {
+			case unauthorized(current.outboundPacket):
+				current.stop(ErrAddressUnauthorized)
+			case current.path != nil && !n.sessionAllowedLocked(current.path):
+				current.stop(ErrPathPolicy)
+			}
 		}
 		before := len(q.packets)
 		q.packets = slices.DeleteFunc(q.packets, unauthorized)

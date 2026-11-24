@@ -2,15 +2,25 @@
 
 Nebula connects Go applications over an encrypted Layer 3 mesh. Each node has a certified IPv4 and IPv6 address and exposes a raw IP port. You can handle packets directly or attach the port as a NIC to your own gVisor stack.
 
+## Getting started
+
+With Go 1.27.3 or later, run the two-node example from the repository root.
+
+```sh
+go run ./examples/quickstart
+```
+
+Bob sends Alice a signed publication and an IPv6 packet over a loopback QUIC connection. The example generates its own credentials. [Walkthrough](docs/quickstart.md)
+
 ## Use from a Go module
 
-Use Go 1.27.3 or later. To use a published revision, run this in your application's module:
+Add the module to your application.
 
 ```sh
 go get code.d7z.net/d7z-team/nebula
 ```
 
-To try the source in a local checkout, point your module at that directory:
+To develop against a local checkout, point your module at that directory.
 
 ```sh
 go mod edit -replace=code.d7z.net/d7z-team/nebula=/absolute/path/to/nebula
@@ -19,15 +29,9 @@ go get code.d7z.net/d7z-team/nebula@v0.0.0
 
 Pass your trust roots, pinned cluster CA, member credentials and local topology to `nebula.New`. The initial topology can contain just your own member. For QUIC, supply a UDP socket for the physical address family you plan to use. An outbound TCP client can use the default dialer. [Integration guide](docs/integration.md)
 
-Register an IP receiver or topic subscription before `Start` if you need the first delivery. Once the node is running, call `ConnectEndpoint(ctx, ep)` with an existing member’s physical address. It returns the authenticated member’s `PeerID`. You can then query other addresses through that neighbor. [Discovery example](examples/discovery/main.go)
+Register an IP receiver or topic subscription before `Start` if you need the first delivery. Once the node is running, call `ConnectEndpoint(ctx, ep)` with an existing member’s physical address to learn its authenticated `PeerID`. Configure reciprocal `Member.Links` for neighbors that should stay connected while idle. [Discovery example](examples/discovery/main.go)
 
-## Getting started
-
-Run the two-node example from the repository root.
-
-```sh
-go run ./examples/quickstart
-```
+## Examples
 
 The self-contained examples generate short-lived credentials in memory. Their network traffic uses ephemeral loopback ports and runs as an ordinary user. The public `examples/demo` package supplies fixtures for local experiments and tests.
 
@@ -48,7 +52,7 @@ For deployment with existing certificates, run `go run ./examples/peer` with the
 
 - **Authenticated transports.** QUIC over UDP and TLS over TCP use mutual TLS 1.3 with X25519MLKEM768 key exchange. A node can listen on the same port number for both transports. Peers exchange their IP receive limits before carrying traffic. QUIC sends IP packets as datagrams and falls back to a reliable stream for larger packets within the negotiated limit.
 - **Shared website ports.** The optional `portshare` package routes connections offering `meshwire.ALPN` as their sole protocol to the node and hands other traffic to your existing TCP or UDP service. Your HTTP servers retain control of certificates and virtual hosts. Custom UDP adapters can implement `meshwire.SharedSocket` to configure the node's QUIC transport. [Port sharing guide](docs/portshare.md)
-- **Discovery and routing.** Use `ResolveIP(ctx, ip)` to find a member or downstream gateway through authenticated neighbors. Pass the selected `IPMatch.Peer` to `ConnectPeerID` to connect to that exact address pair. Use `PreferredPath(peer)` to inspect its current transport and relay hops.
+- **Discovery and routing.** `ResolveIP(ctx, ip)` returns signed matches from the local cache or queries authenticated neighbors on a miss. Use `ConnectPeerID(ctx, match.Peer)` to connect to a selected member or gateway, and `PreferredPath(match.Peer)` to inspect its transport and relay hops. [Integration guide](docs/integration.md#按地址发现成员和下游网关)
 - **Private endpoints and relays.** Set `Options.HideEndpoints` to omit physical addresses from signed introductions. A member can dial its neighbors and relay encrypted traffic over those connections. Configure `Restricted` and reciprocal `Links` to limit its direct connections and probes. Grant `Transit` to let it relay for others. [Relay setup](docs/integration.md#让节点通过已连接的邻居提供中继)
 - **Cluster addressing.** A pinned CA defines dual-stack member subnets and service address pools. Enable broadcast and multicast in the topology or authorize multiple instances for one VIP. The application chooses the instance for each flow. The mesh selects an authorized path to that member and can report each local packet submission. [Addressing guide](docs/addressing.md)
 - **Gateway authorization.** A gateway can advertise downstream prefixes covered by its certificate and local topology. To route through it, approve the gateway and prefixes in your own topology and configure forwarding in your network stack. [Gateway example](examples/gateway/main.go)

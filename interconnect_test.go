@@ -67,6 +67,26 @@ func TestSessionReceiveLimit(t *testing.T) {
 	}
 }
 
+func TestRelaySearchSkipsUnreachableTargets(t *testing.T) {
+	f := newFixture(t, "", "", "", "")
+	f.link(0, 1)
+	f.link(2, 3)
+	f.cfg.Members[1].Transit = true
+	f.cfg.Members[2].Transit = true
+	f.start()
+	a := f.nodes[0]
+	// Neither a member outside the view nor a disconnected component can
+	// yield a relay route. Both identities remain eligible for direct discovery.
+	unknown := labPeer(netip.MustParseAddr("10.13.0.20"))
+	for _, peer := range []PeerID{unknown, f.nodes[3].ID()} {
+		require.ErrorIs(t, a.ConnectPeerID(t.Context(), peer), ErrPeerUnavailable)
+		a.mu.Lock()
+		_, retained := a.routeCursors[peer]
+		a.mu.Unlock()
+		require.False(t, retained)
+	}
+}
+
 func TestRelaySearchContinuesAcrossDials(t *testing.T) {
 	f := newFixture(t, slices.Repeat([]string{"tcp"}, 12)...)
 	last := len(f.opts) - 1
@@ -91,6 +111,30 @@ func TestRelaySearchContinuesAcrossDials(t *testing.T) {
 	require.NoError(t, a.ConnectPeer(ctx, b.id.IPv4()))
 	want := []PeerID{a.id, r.id, f.nodes[last-1].id, b.id}
 	require.True(t, slices.ContainsFunc(a.Paths(), func(s PathStatus) bool { return s.Peer == b.id && slices.Equal(s.Circuit, want) }))
+}
+
+func TestRelaySearchAfterLastCandidate(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp")
+	f.link(0, 1)
+	f.link(1, 2)
+	f.cfg.Members[1].Transit = true
+	for i := range f.opts {
+		f.opts[i].Interval = time.Hour
+	}
+	// The only transit node initially declines the canary's one candidate.
+	view := f.cfg
+	view.Members = slices.Clone(view.Members)
+	view.Members[1].Transit = false
+	f.opts[1].Topology = view
+	f.start()
+	a, relay, b := f.nodes[0], f.nodes[1], f.nodes[2]
+	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	require.Error(t, a.dialRelay(t.Context(), b.id, 1))
+	require.NoError(t, relay.ApplyTopology(t.Context(), f.cfg))
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
+	path, ok := a.PreferredPath(b.id)
+	require.True(t, ok)
+	require.Equal(t, []PeerID{a.id, relay.id, b.id}, path.Circuit)
 }
 
 func TestIntroductionLookupAndAuthorization(t *testing.T) {
@@ -325,4 +369,102 @@ func TestCloseDuringReceiveLimitExchange(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("closing node waited for the receive limit deadline")
 	}
+}
+
+func TestColdCircuitAcrossSlowHops(t *testing.T) {
+	f := newFixture(t, "udp", "both", "tcp", "tcp")
+	for i := 0; i < 3; i++ {
+		f.link(i, i+1)
+	}
+	f.cfg.Members[1].Transit = true
+	f.cfg.Members[2].Transit = true
+	for i, opts := range f.opts {
+		opts.Topology = f.cfg
+		opts.Interval = time.Hour
+		opts.DialTimeout = 600 * time.Millisecond
+		if i == 1 || i == 2 {
+			opts.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+				select {
+				case <-time.After(375 * time.Millisecond):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, address)
+			}
+		}
+		n, err := New(t.Context(), opts)
+		require.NoError(t, err)
+		// Keep the two downstream legs cold until the foreground circuit reaches them.
+		for range cap(n.neighborDialSlots) {
+			n.neighborDialSlots <- struct{}{}
+		}
+		t.Cleanup(func() { n.Close() })
+		require.NoError(t, n.Start())
+		f.nodes = append(f.nodes, n)
+	}
+	a, b := f.nodes[0], f.nodes[3]
+	_, err := a.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+	require.NoError(t, err)
+	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
+	path, ok := a.PreferredPath(b.id)
+	require.True(t, ok)
+	require.Equal(t, []PeerID{a.id, f.nodes[1].id, f.nodes[2].id, b.id}, path.Circuit)
+	received := make(chan []byte, 1)
+	_, err = b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, data []byte) { received <- data }})
+	require.NoError(t, err)
+	out, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
+	require.NoError(t, err)
+	packet := testIPv4(a.id.IPv4(), b.id.IPv4(), "first circuit")
+	require.NoError(t, out.WriteIP(b.id, packet))
+	select {
+	case data := <-received:
+		require.Equal(t, packet, data)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first circuit did not deliver the packet")
+	}
+}
+
+func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp")
+	f.cfg.Members[0].BytesPerSecond = 1
+	f.opts[0].Interval = 40 * time.Millisecond
+	f.start()
+	a, b, c := f.nodes[0], f.nodes[1], f.nodes[2]
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
+	require.True(t, a.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	for i := range cap(a.backgroundSlots) + 2 {
+		_, err := a.Publish(t.Context(), "app/test", []byte{byte(i)})
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool { return len(a.backgroundSlots) == cap(a.backgroundSlots) }, time.Second, time.Millisecond)
+	f.link(0, 2)
+	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
+	require.Eventually(t, func() bool {
+		path, ok := a.PreferredPath(c.id)
+		return ok && path.Transport == "tcp"
+	}, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestUDPListenerFailure(t *testing.T) {
+	for _, kind := range []string{"dedicated", "shared"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newFixture(t, "udp")
+			socket := f.opts[0].UDP4
+			if kind == "shared" {
+				shared := portshare.NewUDP(socket)
+				t.Cleanup(func() { shared.Close() })
+				f.opts[0].UDP4 = shared.Mesh()
+			}
+			f.start()
+			n := f.nodes[0]
+			require.NoError(t, socket.Close())
+			require.Eventually(t, func() bool { return n.ControlStatus().ListenerErrors["udp4"] != "" }, time.Second, time.Millisecond)
+			require.True(t, n.ControlStatus().Ready)
+		})
+	}
+	f := newFixture(t, "udp")
+	f.start()
+	require.NoError(t, f.nodes[0].Close())
+	require.Empty(t, f.nodes[0].ControlStatus().ListenerErrors)
 }

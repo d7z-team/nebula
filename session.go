@@ -323,6 +323,10 @@ func (n *Node) register(s *session) (*session, error) {
 		replaced = standby
 	}
 	paths.sessions = append(paths.sessions, s)
+	if n.pathRegistered != nil {
+		close(n.pathRegistered)
+		n.pathRegistered = nil
+	}
 	if a := n.attempts[s.peer]; a != nil {
 		close(a.changed)
 		a.changed = make(chan struct{})

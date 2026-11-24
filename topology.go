@@ -30,8 +30,8 @@ type Member struct {
 	IPv6 netip.Addr `json:"ipv6"`
 	// Links declares reciprocal neighbors to maintain and use as circuit hops.
 	Links []PeerID `json:"links,omitempty"`
-	// Endpoints lists host-configured physical addresses. A member that dials
-	// its neighbors can serve as a circuit hop with an empty list.
+	// Endpoints lists physical addresses outside the member subnets and anycast
+	// pools. A member that dials its neighbors can serve as a hop with an empty list.
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 	// RoutedPrefixes enables downstream prefixes within the session certificate's authority.
 	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
@@ -80,8 +80,9 @@ type topologyView struct {
 	endpointOwners       map[Endpoint][]PeerID
 }
 
-func (c *topologyView) isOverlayAddress(ip netip.Addr) bool {
-	return c.cluster.Subnet(ip).IsValid() || c.cluster.InAnycastPool(ip)
+func (c *topologyView) physicalEndpoint(ep Endpoint) bool {
+	ip := ep.Address.Addr().WithZone("")
+	return ep.Valid() && !c.cluster.Subnet(ip).IsValid() && !c.cluster.InAnycastPool(ip)
 }
 
 type multicastGroup struct {
@@ -150,7 +151,8 @@ func (s *topologyView) groupRecipients(from PeerID, dst netip.Addr) ([]PeerID, b
 
 func comparePeer(a, b PeerID) int { return bytes.Compare(a[:], b[:]) }
 
-// Validate checks the topology using the same rules as New and ApplyTopology.
+// Validate checks the topology against the certified address plan. New and
+// ApplyTopology also check the local introduction against its signing credential.
 func (c Topology) Validate(cluster pki.Cluster) error {
 	_, err := c.compile(cluster)
 	return err
@@ -222,8 +224,8 @@ func (s *topologyView) indexMember(m Member) error {
 		s.subnets[subnet] = append(s.subnets[subnet], id)
 	}
 	for _, ep := range m.Endpoints {
-		if !ep.Valid() {
-			return fmt.Errorf("invalid endpoint %v", ep)
+		if !s.physicalEndpoint(ep) {
+			return fmt.Errorf("invalid physical endpoint %v for member %s", ep, id)
 		}
 		s.endpointOwners[ep] = append(s.endpointOwners[ep], id)
 		if ep.Network == "tcp" {

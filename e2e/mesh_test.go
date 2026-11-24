@@ -331,11 +331,13 @@ func TestDualUnderlayFamilyFailover(t *testing.T) {
 			roundTrip(t, c4, s4)
 			roundTrip(t, c6, s6)
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.segment == "wan4"} })
+			// These are on-demand peers. Send on the original flow so it can
+			// trigger a new dial even if the IPv4 session closed before a probe.
+			receipt(t, c4, s4, 1)
 			require.Eventually(t, func() bool {
 				path, ok := a.node.PreferredPath(b.node.ID())
 				return ok && path.Transport == kind && path.Endpoint.Addr().Is6()
 			}, 12*time.Second, 20*time.Millisecond)
-			roundTrip(t, c4, s4)
 			roundTrip(t, c6, s6)
 		})
 	}

@@ -3,6 +3,7 @@ package nebula
 import (
 	"context"
 	"maps"
+	"slices"
 	"time"
 )
 
@@ -42,6 +43,14 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		// A valid view may withdraw the local member. A zero deadline marks
 		// current credentials unusable while the new topology takes effect.
 		end, _ := n.credentialDeadline(ctx, p, c)
+		if after, local := p.members[n.id]; next != nil && local {
+			before, existed := old.members[n.id]
+			if !existed || !slices.Equal(before.RoutedPrefixes, after.RoutedPrefixes) || !slices.Equal(before.Endpoints, after.Endpoints) {
+				if err := n.validateIntroduction(next, c.Object); err != nil {
+					return err
+				}
+			}
+		}
 		deadlines := make([]time.Time, len(ss))
 		for i, s := range ss {
 			d, err := s.authorizationDeadline(ctx, p)

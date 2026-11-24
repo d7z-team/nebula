@@ -127,10 +127,12 @@ func (n *Node) prunePaths() {
 		}
 	}
 	var dead []*session
-	disconnected := make(map[PeerID]bool)
+	expiredPeers := make(map[PeerID]bool)
 	for peer, paths := range n.peers {
+		var authorized bool
 		for i := len(paths.sessions) - 1; i >= 0; i-- {
 			s := paths.sessions[i]
+			authorized = authorized || now.Before(s.until)
 			if n.sessionAllowedLocked(s) {
 				continue
 			}
@@ -140,8 +142,10 @@ func (n *Node) prunePaths() {
 			n.removeSessionLocked(s)
 			dead = append(dead, s)
 		}
-		if len(paths.sessions) == 0 {
-			disconnected[peer] = true
+		// Losing every credential withdraws the backlog. Losing an allowed
+		// transport leaves queued packets free to dial the same identity.
+		if !authorized && len(paths.sessions) == 0 {
+			expiredPeers[peer] = true
 		}
 	}
 	port := n.port
@@ -153,7 +157,7 @@ func (n *Node) prunePaths() {
 	}
 	n.mu.Unlock()
 	if port != nil {
-		port.revalidateQueues(disconnected)
+		port.revalidateQueues(expiredPeers)
 	}
 	for _, s := range dead {
 		s.close()

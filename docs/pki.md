@@ -8,7 +8,7 @@
 | 根与中间 CA | `CreateRoot`、`Issuer.IssueCA` | 根使用自己的签名器。签发中间 CA 时提供 CSR、获批签发配置和独立批准的 SPKI SHA-256。签发库验证 CSR 签名、公钥指纹及上级约束。 |
 | 申请与签发叶证书 | `CreateCSR`、`Issuer.IssueLeaf` | 申请者提交自签名 CSR。签发者以独立批准的 SPKI SHA-256、一个 IPv4 和一个 IPv6 SAN、网络、下游路由前缀、用途和有效期构造证书。签发端逐一用给定签发链验证所申请的 EKU，可在签发时发现上级 CA 对用途的限制。CA 和叶密钥可以使用不同算法。 |
 | 装载与验证 | `tls.LoadX509KeyPair`、`ParseCertificatesPEM`、`ParseChain`、`VerifyChain` | PEM 文件可包含多张证书；TLS 的 DER 链每个元素恰为一张证书，叶在前。验证时给出可信根、固定的集群 CA 规划、完整地址对、用途和时刻。 |
-| 签发与验证对象 | `pki.SignObject`、`pki.VerifyObjectSignature` | 提供用途、网络名和正文。验证签名后用 `VerifyChain` 建立对签名者的信任，再检查成员绑定和主题授权。节点的主题消息与介绍接收入口已完成上述检查。 |
+| 签名对象 | `CheckObjectSize`、`SignObject`、`VerifyObjectSignature` | 预检和签名使用相同的网络名、用途、正文和证书链。独立验签后还需验证证书链与业务授权。[签名对象](#签名对象) |
 
 ## 进程内签发与验证
 
@@ -107,4 +107,6 @@ return node.Revalidate(ctx)
 
 CMS 使用 DER 编码的封装型 SignedData，包含一个 SignerInfo、叶证书和所提供的中间证书。签名属性包含 content-type 与 message-digest。签名正文将网络、用途、叶证书的 SHA-256 和业务内容绑定在一起；发布者的网络成员 ID 位于业务内容中。实现覆盖 Ed25519、ECDSA、RSA 和 ML-DSA。签名证书与签发 CA 可以采用不同的算法。主题消息接收方逐次验证原发布者，转发者的连接身份只说明直接来源。[CMS 格式](https://www.rfc-editor.org/rfc/rfc5652) · [签名与解析](../pki/cms.go) · [签发与互操作测试](../pki/pki_test.go)
 
-节点在创建或热加载凭据时，要求对象签名证书链中所有 DER 证书的字节数加上叶证书的 `RawIssuer` 长度合计不超过 24 KiB。CMS 也用签发者和序列号标识签名者，因此签发者名称需要单独计入。完整 CMS DER 的上限为 44 KiB。端点介绍随 JSON 通告传送，通告还须容纳观察地址等字段并满足 64 KiB 控制帧预算。使用较长的中间 CA 链或较大的密钥时，应按实际 DER 长度核算。若节点需要独立的发布证书，可通过 `LocalCertificates.Object` 配置。[凭据装载](../identity.go) · [CMS 尺寸限制](../pki/cms.go)
+独立签名前，用 `pki.CheckObjectSize(network, kind, body, cert)` 检查完整 CMS DER 是否能放进 44 KiB。传入证书链即可，预检按该公钥的最大签名长度计算。用 `errors.Is(err, pki.ErrDocumentTooLarge)` 识别超限。[尺寸预检与签名](../pki/cms.go)
+
+节点通过 `LocalCertificates.Object` 选择对象签名凭据。证书链中所有 DER 的长度加上叶证书的 `RawIssuer` 长度，合计上限为 24 KiB。创建节点、变更本机介绍的路由或端点、热加载凭据时，节点还会检查必需的介绍内容能否签发。超限更新返回错误，已有配置继续生效。签名介绍经 Base64 编码后随邻居通告装入 64 KiB 控制帧。[凭据装载](../identity.go) · [签名介绍](../introduction.go)

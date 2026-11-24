@@ -141,8 +141,8 @@ func (n *Node) maintain() {
 				peer := targets[next]
 				if n.modeLocked(peer) != Blocked && n.attempts[peer] == nil && n.preferredSessionLocked(n.peers[peer], false, nil) == nil {
 					select {
-					case n.backgroundSlots <- struct{}{}:
-						n.startDialLocked(peer, n.backgroundSlots)
+					case n.neighborDialSlots <- struct{}{}:
+						n.startDialLocked(peer, n.neighborDialSlots)
 					default:
 						break schedule
 					}

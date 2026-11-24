@@ -25,7 +25,12 @@ func ExampleVerifyObjectSignature() {
 	if err != nil {
 		panic(err)
 	}
-	wire, err := pki.SignObject(cluster.Network(), "report", []byte("ready"), opts[0].Certificates.Client)
+	report, cert := []byte("ready"), opts[0].Certificates.Client
+	// Check the envelope against the wire budget before asking the signer to sign.
+	if err := pki.CheckObjectSize(cluster.Network(), "report", report, cert); err != nil {
+		panic(err)
+	}
+	wire, err := pki.SignObject(cluster.Network(), "report", report, cert)
 	if err != nil {
 		panic(err)
 	}

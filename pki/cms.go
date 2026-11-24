@@ -22,6 +22,9 @@ import (
 // MaxDocument is the largest DER object accepted by the mesh CMS profile.
 const MaxDocument = 44 << 10
 
+// ErrDocumentTooLarge means the content or its CMS envelope exceeds MaxDocument.
+var ErrDocumentTooLarge = errors.New("oversized CMS document")
+
 var (
 	oidData          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
 	oidSigned        = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
@@ -92,7 +95,7 @@ func wrapCMS(s signedData) ([]byte, error) {
 	}
 	wire, err := asn1.Marshal(contentInfo{oidSigned, explicit(b)})
 	if len(wire) > MaxDocument {
-		return nil, errors.New("oversized CMS document")
+		return nil, ErrDocumentTooLarge
 	}
 	return wire, err
 }
@@ -163,14 +166,28 @@ type signedContent struct {
 
 // SignObject creates an encapsulated CMS signature bound to its publisher, network and purpose.
 func SignObject(network, kind string, body []byte, cert tls.Certificate) ([]byte, error) {
-	if !ValidName(network) || !ValidName(kind) || len(body) > MaxDocument || len(cert.Certificate) == 0 {
+	return encodeObject(network, kind, body, cert, true)
+}
+
+// CheckObjectSize checks that the complete CMS envelope fits MaxDocument, even
+// with the largest signature for the key. It does not invoke the private signer.
+func CheckObjectSize(network, kind string, body []byte, cert tls.Certificate) error {
+	_, err := encodeObject(network, kind, body, cert, false)
+	return err
+}
+
+func encodeObject(network, kind string, body []byte, cert tls.Certificate, sign bool) ([]byte, error) {
+	if len(body) > MaxDocument {
+		return nil, ErrDocumentTooLarge
+	}
+	if !ValidName(network) || !ValidName(kind) || len(cert.Certificate) == 0 {
 		return nil, errors.New("invalid object or signing credential")
 	}
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
 		return nil, err
 	}
-	if !MatchesKey(cert.PrivateKey, leaf) {
+	if sign && !MatchesKey(cert.PrivateKey, leaf) {
 		return nil, errors.New("signing key mismatch")
 	}
 	a, err := objectAlgorithm(leaf.PublicKey)
@@ -183,7 +200,23 @@ func SignObject(network, kind string, body []byte, cert tls.Certificate) ([]byte
 		return nil, err
 	}
 	attrs, tag := a.attributes(payload)
-	sig, err := crypto.SignMessage(cert.PrivateKey.(crypto.Signer), rand.Reader, attrs, a.prehash)
+	var sig []byte
+	if sign {
+		sig, err = crypto.SignMessage(cert.PrivateKey.(crypto.Signer), rand.Reader, attrs, a.prehash)
+	} else {
+		switch key := leaf.PublicKey.(type) {
+		case ed25519.PublicKey:
+			sig = make([]byte, ed25519.SignatureSize)
+		case *ecdsa.PublicKey:
+			// Both signature integers are positive and smaller than the curve order.
+			order := key.Params().N
+			sig, err = asn1.Marshal(struct{ R, S *big.Int }{order, order})
+		case *rsa.PublicKey:
+			sig = make([]byte, key.Size())
+		case *mldsa.PublicKey:
+			sig = make([]byte, key.Parameters().SignatureSize())
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

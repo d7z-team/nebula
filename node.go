@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"slices"
@@ -51,7 +52,8 @@ type Options struct {
 	TCP4, TCP6 net.Listener
 	// DialTCP opens outbound TCP connections. The default is net.Dialer.DialContext.
 	DialTCP func(context.Context, string, string) (net.Conn, error)
-	// AdvertiseEndpoints adds reachable physical addresses to signed introductions.
+	// AdvertiseEndpoints adds reachable physical addresses outside the certified
+	// member subnets and anycast pools to signed introductions.
 	AdvertiseEndpoints []Endpoint
 	// HideEndpoints omits all physical endpoints from this node's signed introductions,
 	// including AdvertiseEndpoints, local topology entries, listeners and NAT mappings.
@@ -95,14 +97,16 @@ type Node struct {
 	discovered             map[PeerID]learnedIntroduction
 	discoveredOwners       map[netip.Addr]PeerID
 	attempts               map[PeerID]*peerAttempt
-	directDials            map[directDial]*endpointAttempt
+	directDials            map[endpointDialKey]*endpointAttempt
 	observations           map[observer]observation
 	introduced             map[Endpoint]map[PeerID]time.Time
 	deniedUDP              map[netip.AddrPort]deniedEndpoint
 	resolutions            map[netip.Addr]*ipResolution
 	queries                map[string]time.Time
 	backgroundSlots        chan struct{}
+	neighborDialSlots      chan struct{}
 	sharedAddressDialSlots chan struct{}
+	pathRegistered         chan struct{} // lazy notification for callers waiting for a cold-dial slot
 	port                   *IPPort
 	handshakeSlots         chan struct{}
 	sizeQuery              []byte
@@ -189,8 +193,8 @@ func New(parent context.Context, o Options) (*Node, error) {
 		o.DialTCP = (&net.Dialer{}).DialContext
 	}
 	for _, ep := range o.AdvertiseEndpoints {
-		if !ep.Valid() {
-			return nil, errors.New("invalid advertised endpoint")
+		if !view.physicalEndpoint(ep) {
+			return nil, fmt.Errorf("invalid advertised physical endpoint %v", ep)
 		}
 	}
 	o.AdvertiseEndpoints = slices.Clone(o.AdvertiseEndpoints)
@@ -204,7 +208,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 		peers:                  make(map[PeerID]*peerPaths),
 		modes:                  make(map[PeerID]PathMode),
 		attempts:               make(map[PeerID]*peerAttempt),
-		directDials:            make(map[directDial]*endpointAttempt),
+		directDials:            make(map[endpointDialKey]*endpointAttempt),
 		deniedUDP:              make(map[netip.AddrPort]deniedEndpoint),
 		routeCursors:           make(map[PeerID]*routeCursor),
 		probeSlots:             make(chan struct{}, 4),
@@ -218,11 +222,16 @@ func New(parent context.Context, o Options) (*Node, error) {
 		publications:           make(map[string]cachedPublication),
 		subscriptions:          make(map[*Subscription]struct{}),
 		handshakeSlots:         make(chan struct{}, 128),
-		backgroundSlots:        make(chan struct{}, 12),
+		backgroundSlots:        make(chan struct{}, 8),
+		neighborDialSlots:      make(chan struct{}, 4),
 		sharedAddressDialSlots: make(chan struct{}, 8),
 	}
 	c.until, err = n.credentialDeadline(ctx, view, c)
 	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if err := n.validateIntroduction(view, c.Object); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -281,26 +290,27 @@ func (n *Node) Start() error {
 		n.sizeQuery = make([]byte, MaxIPPacketSize+1)
 	}
 	n.transports = make(map[bool]*udpTransport, 2)
-	var listeners []*quic.Listener
-	for ipv6, udp := range map[bool]net.PacketConn{false: n.o.UDP4, true: n.o.UDP6} {
+	listeners := make(map[string]*quic.Listener, 2)
+	for family, udp := range map[string]net.PacketConn{"udp4": n.o.UDP4, "udp6": n.o.UDP6} {
 		if udp == nil {
 			continue
 		}
 		transport := n.newUDPTransport(udp)
-		n.transports[ipv6] = transport
+		n.transports[family == "udp6"] = transport
 		listener, err := transport.Listen(n.tlsConfig(PeerID{}, true), transport.config)
 		if err != nil {
 			n.mu.Unlock()
 			n.Close()
 			return err
 		}
-		listeners = append(listeners, listener)
+		listeners[family] = listener
 	}
-	for _, listener := range listeners {
+	for family, listener := range listeners {
 		n.wg.Go(func() {
 			for {
 				q, err := listener.Accept(n.ctx)
 				if err != nil {
+					n.recordListenerError(family, err)
 					return
 				}
 				if !n.tryTask(n.handshakeSlots, func() { n.attachQUIC(n.ctx, q, PeerID{}, false) }) {
@@ -317,14 +327,7 @@ func (n *Node) Start() error {
 			for {
 				c, err := meshwire.AcceptTCP(listener, n.ctx.Done())
 				if err != nil {
-					n.mu.Lock()
-					if n.state == running && n.ctx.Err() == nil {
-						if n.listenerErrors == nil {
-							n.listenerErrors = make(map[string]string)
-						}
-						n.listenerErrors[family] = err.Error()
-					}
-					n.mu.Unlock()
+					n.recordListenerError(family, err)
 					return
 				}
 				ep := addrPort(c.RemoteAddr())
@@ -342,6 +345,17 @@ func (n *Node) Start() error {
 	n.mu.Unlock()
 	go func() { <-n.ctx.Done(); n.Close() }()
 	return nil
+}
+
+func (n *Node) recordListenerError(family string, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state == running && n.ctx.Err() == nil {
+		if n.listenerErrors == nil {
+			n.listenerErrors = make(map[string]string)
+		}
+		n.listenerErrors[family] = err.Error()
+	}
 }
 
 // Close shuts down the node and waits for its background tasks to finish.

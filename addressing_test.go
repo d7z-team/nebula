@@ -269,12 +269,61 @@ func TestAnycastSubmissionAndWithdrawal(t *testing.T) {
 	write(a.id, "queued")
 	f.cfg.Members[1].AnycastIPs = nil
 	require.NoError(t, client.ApplyTopology(t.Context(), f.cfg))
-	require.Error(t, result(a.id).Err)
+	require.ErrorIs(t, result(a.id).Err, ErrAddressUnauthorized)
 	require.EqualValues(t, 3, out.Stats().RejectedOutbound)
 	require.EqualValues(t, 1, out.Stats().SentPackets)
 	require.Zero(t, out.Stats().Queued)
 	require.Equal(t, []PeerID{b.id}, client.AnycastMembers(vip))
 	require.Empty(t, received)
+}
+
+// Return once the first packet is waiting for bandwidth and the rest are queued.
+func queueShapedPackets(t *testing.T, a, b *Node, bodies ...string) (*IPPort, <-chan TransmitResult, <-chan string) {
+	t.Helper()
+	received := make(chan string, len(bodies))
+	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- string(pkt[20:]) }})
+	require.NoError(t, err)
+	results := make(chan TransmitResult, len(bodies))
+	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}, ObserveTransmit: func(r TransmitResult) { results <- r }})
+	require.NoError(t, err)
+	require.True(t, a.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	for _, body := range bodies {
+		require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), body)))
+	}
+	require.Eventually(t, func() bool {
+		return a.limiter.Tokens() < 0 && port.Stats().Queued == len(bodies)-1
+	}, time.Second, time.Millisecond)
+	return port, results, received
+}
+
+func TestChaosPathLossWhileShaping(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp")
+	f.cfg.Members[0].BytesPerSecond = 1
+	for i := range f.opts {
+		f.opts[i].Interval = time.Hour
+	}
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
+	port, results, received := queueShapedPackets(t, a, b, "in flight", "queued")
+	require.Eventually(t, func() bool { return b.preferredSession(a.id, true) != nil }, time.Second, time.Millisecond)
+	b.preferredSession(a.id, true).close()
+	require.Eventually(t, func() bool { _, ok := a.PreferredPath(b.id); return !ok }, time.Second, time.Millisecond)
+	f.cfg.Members[0].BytesPerSecond = 0
+	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
+
+	require.Eventually(t, func() bool { return len(results) == 2 }, 3*time.Second, time.Millisecond)
+	require.ErrorIs(t, (<-results).Err, ErrPeerUnavailable)
+	recovered := <-results
+	require.NoError(t, recovered.Err)
+	require.Equal(t, "tcp", recovered.Transport)
+	select {
+	case got := <-received:
+		require.Equal(t, "queued", got)
+	case <-time.After(time.Second):
+		t.Fatal("missing packet on the replacement connection")
+	}
+	require.EqualValues(t, 1, port.Stats().RejectedOutbound)
 }
 
 func TestReplyViaIngressGateway(t *testing.T) {
@@ -352,4 +401,45 @@ func BenchmarkPacketAuthorization(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestChaosRelayOnlyWhileShaping(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp")
+	f.link(0, 1)
+	f.link(1, 2)
+	f.cfg.Members[1].Transit = true
+	f.cfg.Members[0].BytesPerSecond = 1
+	for i := range f.opts {
+		f.opts[i].Interval = time.Hour
+	}
+	f.start()
+	a, r, b := f.nodes[0], f.nodes[1], f.nodes[2]
+	require.NoError(t, r.ConnectPeerID(t.Context(), b.id))
+	require.NoError(t, a.ConnectPeerID(t.Context(), r.id))
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
+	direct, ok := a.PreferredPath(b.id)
+	require.True(t, ok)
+	require.Equal(t, "tcp", direct.Transport)
+	out, results, received := queueShapedPackets(t, a, b, "in flight", "second", "third")
+	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	select {
+	case r := <-results:
+		require.ErrorIs(t, r.Err, ErrPathPolicy)
+	case <-time.After(time.Second):
+		t.Fatal("old path still waiting for bandwidth")
+	}
+	require.Eventually(t, func() bool {
+		path, ok := a.PreferredPath(b.id)
+		return ok && path.Transport == "relay" && a.limiter.Tokens() < 0
+	}, 2*time.Second, time.Millisecond)
+	f.cfg.Members[0].BytesPerSecond = 0
+	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
+	require.Eventually(t, func() bool { return len(received) == 2 && len(results) == 2 }, 3*time.Second, time.Millisecond)
+	for _, want := range []string{"second", "third"} {
+		require.Equal(t, want, <-received)
+		r := <-results
+		require.NoError(t, r.Err)
+		require.Equal(t, "relay", r.Transport)
+	}
+	require.EqualValues(t, 1, out.Stats().RejectedOutbound)
 }

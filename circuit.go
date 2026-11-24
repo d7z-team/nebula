@@ -165,12 +165,10 @@ func (n *Node) dialRelay(ctx context.Context, target PeerID, attempts int) error
 		n.mu.Unlock()
 		return ErrPathPolicy
 	}
-	cursor := n.routeCursors[target]
-	if cursor == nil {
-		cursor = &routeCursor{}
-		n.routeCursors[target] = cursor
-	}
 	n.mu.Unlock()
+	if len(p.members[n.id].Links) == 0 || len(p.members[target].Links) == 0 {
+		return ErrPeerUnavailable
+	}
 
 	// Reverse distances prune branches that cannot reach the destination
 	// within the remaining depth. Never route back through the origin.
@@ -189,6 +187,21 @@ func (n *Node) dialRelay(ctx context.Context, target PeerID, attempts int) error
 			}
 		}
 	}
+	// A relay route must start with a transit neighbor that can reach target.
+	if !slices.ContainsFunc(p.members[n.id].Links, func(id PeerID) bool { return distance[id] > 0 }) {
+		return ErrPeerUnavailable
+	}
+	n.mu.Lock()
+	if n.policy.Load() != p {
+		n.mu.Unlock()
+		return ErrPathPolicy
+	}
+	cursor, resumed := n.routeCursors[target]
+	if !resumed {
+		cursor = &routeCursor{}
+		n.routeCursors[target] = cursor
+	}
+	n.mu.Unlock()
 	work := maxSearchEdges
 	var last error
 	for attempts > 0 && work > 0 {
@@ -200,8 +213,15 @@ func (n *Node) dialRelay(ctx context.Context, target PeerID, attempts int) error
 			return ErrPathPolicy
 		}
 		if path == nil {
+			// A previous call may have spent its last attempt on the last
+			// candidate. Start a fresh pass within this call's remaining budget.
+			if resumed && work > 0 {
+				resumed = false
+				continue
+			}
 			break
 		}
+		resumed = false
 		n.mu.Lock()
 		paths := n.peers[target]
 		established := paths != nil && slices.ContainsFunc(paths.sessions, func(s *session) bool {
@@ -333,7 +353,10 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 		n.attachCircuit(n.ctx, c, l, false)
 		return true
 	}
-	ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout*time.Duration(len(req.Path)-pos))
+	// The upstream ready reply waits for all remaining cold legs.
+	ctx, cancel := context.WithTimeout(l.ctx, n.o.DialTimeout*time.Duration(len(req.Path)-pos))
+	deadline, _ := ctx.Deadline()
+	c.SetDeadline(deadline)
 	next, err := n.openLeg(ctx, req.Path[pos+1], l)
 	cancel()
 	if err != nil {

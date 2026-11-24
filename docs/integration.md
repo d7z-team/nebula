@@ -58,9 +58,11 @@ func serve(serviceCtx context.Context, opts nebula.Options, ep nebula.Endpoint) 
 | 对端的一个虚拟主地址 | 如果 `LookupPeer(primary)` 能在本机找到归属，用 `ConnectPeer(ctx, primary)` 连接其所有者。预配置时，在对端的 `Member.Endpoints` 填入可达物理端点。 |
 | 对端完整的双栈身份 | 用 `ConnectPeerID(ctx, id)` 等待与该身份的获准路径。要持续维护该邻居，在拓扑中为两端配置双向 `Links`。 |
 
-同一物理端点的并发 `ConnectEndpoint` 共享拨号。成功返回表示本机已注册直连。其他成员经邻居查询刚加入的节点时，要等转发查询的邻居也注册好这条路径。在此期间，`ResolveIP` 可能返回 `ErrPeerUnavailable`，调用方可在自己的截止时间内重试。取消拨号 context 只结束本次等待，已启动的拨号受节点生命周期和 `DialTimeout` 约束。[按地址发现的示例](../examples/discovery/main.go)
+`Member.Endpoints`、`Options.AdvertiseEndpoints` 和 `ConnectEndpoint` 使用可达的物理 IP 和非零端口。公网或私网地址均可，地址须在集群成员网段和 VIP 池之外。监听器可以绑定通配地址，需要通告该服务时填写对端实际可达的端点。
 
-按成员调用 `ConnectPeer` 或 `ConnectPeerID` 时，两个主地址共享同一轮拨号。如果该轮成功建立的路径在调用返回前已被撤回，节点会按当前策略再尝试一次。对端仍为 `Blocked` 时，调用返回 `ErrPathPolicy`。
+并发的 `ConnectEndpoint` 按物理端点共享拨号，`ConnectPeer` 和 `ConnectPeerID` 按完整成员身份共享拨号。任一调用方取消 context 只结束自己的等待。`ConnectEndpoint` 成功表示本机已注册直连。邻居也完成注册后，其他成员才能通过这条邻接查询新节点。期间遇到 `ErrPeerUnavailable` 可在调用方的截止时间内重试。[按地址发现的示例](../examples/discovery/main.go)
+
+需要空闲时也自动重连的邻居，在两端的成员视图中配置双向 `Links`。按需连接失去最后一条路径后，可以再次调用连接 API，也可以向已知成员写包来触发建链。
 
 ### 按地址发现成员和下游网关
 
@@ -76,7 +78,7 @@ for _, m := range matches {
 }
 ```
 
-`ResolveIP` 在已认证的邻居之间查询。输入普通集群主地址会精确匹配证书中的任一 IP SAN；输入下游地址会返回本次取得的网关及其最具体的匹配前缀。先按前缀长度、再按成员身份排序。结果可来自尚在有效期内的缓存，表示签名归属信息，业务可达性需通过实际连接确认。调用可取消，冷查询有跳数和时间预算。缓存命中或邻居提前结束查询时，返回的网关可以只是候选的一部分。未找到时可在邻接变化后重试。[可运行示例](../examples/discovery/main.go)
+`ResolveIP` 先查本机有效的签名介绍，命中即返回。未命中时才通过认证邻居查询，受跳数、时间和调用方 context 限制。主地址精确匹配证书中的 IPv4 或 IPv6。下游地址按各网关的最长匹配前缀返回，结果按前缀长度降序、再按成员身份排序。比如本机已有覆盖目的地址的 `172.16.0.0/16`，即使远端另有 `172.16.2.0/24`，本次也可能只得到前者。[可运行示例](../examples/discovery/main.go)
 
 选中结果后调用 `ConnectPeerID(ctx, m.Peer)`，握手绑定完整地址对。向该网关转发下游 IP 包之前，宿主须核准网关及其前缀，并用 `ApplyTopology` 安装相应授权。再调用 `port.WriteIP(m.Peer, packet)`，收发双方根据各自拓扑和实际会话证书校验数据。[网关实例](../examples/gateway/main.go) · [组地址与任播交付](addressing.md)
 
@@ -139,7 +141,7 @@ return err
 | --- | --- | --- |
 | 本机是否接纳写入 | `WriteIP` 的返回值 | 单播成功表示已复制入队。组投递可能只有部分接收者入队，合法空组也可返回 nil。本机收包上限同样约束写入大小。 |
 | 包在发送队列中发生了什么 | `Stats()`、`ClearPending(peerID)` | `Queued` 只计等待包；清空操作返回移除的等待包数，并尝试取消在途包。等待期间因撤权或拥塞的丢弃可查拒绝计数。 |
-| 已出队的这次提交是否成功 | `ObserveTransmit(result)` | 拨号失败时 `Transport` 为空。选好路径后发现包超过对端上限时，结果带有所选传输，且 `errors.Is(result.Err, nebula.ErrPacketTooLarge)` 为真。回调可能并发，应及时返回。 |
+| 已出队的这次提交是否成功 | `ObserveTransmit(result)` | 拨号失败或等待带宽时被取消，`Transport` 可以为空。包超过所选路径的对端收包上限时，结果带有所选传输和 `ErrPacketTooLarge`。回调可能并发，应及时返回。 |
 | 远端业务是否处理了请求 | 对端应用回执 | 用请求 ID 和预期成员关联回执。传输接受一个包后，远端仍可能丢弃它。 |
 
 异步上限示例可用 `go test -v -run '^ExampleIPPort_WriteIP$' .` 运行。[可执行示例](../example_test.go) · [双进程应用回执](quickstart.md#使用磁盘凭据启动两个进程)
@@ -169,10 +171,13 @@ opts.InboundPolicy = func(peer nebula.PeerID, src, dst netip.Addr) bool {
 
 发布方的 `Member.Topics` 可授予 `app/demo` 及其子树；订阅方按完整主题 `app/demo/hello` 调用 `Subscribe`。先注册订阅并从 `sub.Publications()` 读取 `nebula.DeliveredPublication`，再触发业务。`Publish` 返回的 ID 表示本机已接纳，可以用它关联接收端回执。邻居在有效期内补发缺失主题消息；本机新建的订阅从之后接纳的主题消息开始交付。缓冲上限为 32 条，`sub.Missed()` 记录本订阅因缓冲满而丢弃的数量。`sub.Close()` 或关闭节点都会关闭交付 channel。[主题消息收发示例](../examples/quickstart/main.go)
 
-- TCP 监听遇到暂时性错误会退避重试。永久错误可从 `ControlStatus().ListenerErrors["tcp4"]` 或 `["tcp6"]` 读取，用于定位退出的入口。
-- 检查服务启动和本机资格用 `ControlStatus().Started` 与 `Ready`。本机证书和成员视图有效时，启动前 `Ready` 也可以为真。
-- 检查对端连通性先用 `ConnectPeer`，再用 `Paths()` 看每条已建立路径的 `Active`、`Transport`、`Circuit` 和 `AuthorizedUntil`。同一成员可能有多行。`TLSGroup` 为握手使用的密钥交换组。
-- 对照一般流量的首选路径与单个包实际选择的路径，使用 `PreferredPath(peerID)` 和端口或 gVisor 的 `ObserveTransmit`。[发送诊断](#ip-收发与网关)
+| 排查的问题 | 查看位置 |
+| --- | --- |
+| 节点是否已经启动、具备本机成员资格 | `ControlStatus().Started` 表示已启动收发。`Ready` 表示本机凭据和成员视图有效，启动前也可以为真。 |
+| 哪个入口停止接收连接 | `ControlStatus().ListenerErrors` 按 `udp4`、`udp6`、`tcp4`、`tcp6` 记录异常退出的入口。TCP 遇到暂时性错误会退避重试。共享 UDP 的物理套接字读取失败时，mesh 分支可能只报告连接已关闭。 |
+| 拨号为何失败 | 先看本次连接返回的错误。`ControlStatus().LastError` 保留最近的建链错误，`DialFailures` 累计失败的端点拨号。 |
+| 到成员有哪些可用路径 | `Paths()` 列出每条已建路径的传输、证书、授权截止时间和探测数据。`PreferredPath(peerID)` 返回一般流量当前会选的路径。 |
+| 某个包是否发出 | `IPPort.Stats()` 提供排队和丢包计数，`ObserveTransmit` 给出已出队包的本地提交结果。远端处理情况由应用回执确认。[发送诊断](#ip-收发与网关) |
 
 ## gVisor 的 IPv4 网关构建
 
