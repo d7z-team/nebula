@@ -67,6 +67,7 @@ func (n *Node) ConnectEndpoint(ctx context.Context, ep Endpoint) (PeerID, error)
 func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}) error {
 	var a *peerAttempt
 	var reserved chan struct{}
+	var retried bool
 	for {
 		var acquire chan struct{}
 		var changed <-chan struct{}
@@ -84,6 +85,14 @@ func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}
 		case n.preferredSessionLocked(n.peers[peer], false, nil) != nil:
 			// A registered path in either direction satisfies the caller.
 		case a != nil && a.changed == nil:
+			// The attempt can finish successfully after its registered path was
+			// withdrawn. Allow one fresh attempt under the current policy.
+			if a.err == nil && !retried {
+				retried = true
+				a = nil
+				n.mu.Unlock()
+				continue
+			}
 			err = a.err
 			if err == nil {
 				err = ErrPeerUnavailable

@@ -13,6 +13,8 @@ go test -race -count=1 -timeout=5m ./e2e -args -extended -portshare
 
 常规 CI 在 Linux、macOS 和 Windows 运行自带凭据的示例，双进程示例由 `TestPeerProcesses` 验证。Linux 另用 `-portshare` 重跑 gVisor 场景，让实验节点的 UDP 和 TCP 入口使用端口分流器。[示例入口](../README.md#getting-started) · [共享 443 端口](portshare.md)
 
+quic-go 的 `failed to sufficiently increase receive buffer size` 日志列出套接字实际可用的缓冲区和期望值。Linux 上可用 `sysctl net.core.rmem_max net.core.wmem_max` 查看内核收发上限。QUIC 会使用实际可用的缓冲区继续运行。排查测试失败时，以具体的 `--- FAIL` 用例和断言为准。[quic-go 缓冲区说明](https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes)
+
 可按故障类型单独重放。前两条命令分别验证物理端点断网后的重新接入，以及两种 NAT 映射或过滤条件下的选路。
 
 ```sh

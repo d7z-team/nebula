@@ -8,10 +8,52 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestConnectPeerAfterSuccessfulPathIsWithdrawn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, "", "")
+		f.cfg.Members[1].Endpoints = []Endpoint{{Network: "tcp", Address: netip.MustParseAddrPort("127.0.0.1:4242")}}
+		refused := errors.New("replacement dial refused")
+		release := make(chan struct{})
+		var dials atomic.Int32
+		f.opts[0].DialTCP = func(context.Context, string, string) (net.Conn, error) {
+			dials.Add(1)
+			<-release
+			return nil, refused
+		}
+		f.start()
+		a, peer := f.nodes[0], f.nodes[1].ID()
+
+		// The registered path has been withdrawn, but its dial has yet to
+		// report completion. Both address families join that same attempt.
+		old := &peerAttempt{changed: make(chan struct{})}
+		a.mu.Lock()
+		a.attempts[peer] = old
+		a.mu.Unlock()
+		done := make(chan error, 2)
+		for _, addr := range []netip.Addr{peer.IPv4(), peer.IPv6()} {
+			go func() { done <- a.ConnectPeer(t.Context(), addr) }()
+		}
+		synctest.Wait()
+		a.mu.Lock()
+		delete(a.attempts, peer)
+		close(old.changed)
+		old.changed = nil
+		a.mu.Unlock()
+
+		synctest.Wait()
+		close(release)
+		for range 2 {
+			require.ErrorIs(t, <-done, refused)
+		}
+		require.EqualValues(t, 1, dials.Load())
+	})
+}
 
 func TestConnectEndpointTrustAndRestrictions(t *testing.T) {
 	for _, policy := range []string{"trust", "restricted"} {

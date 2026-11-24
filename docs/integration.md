@@ -60,6 +60,8 @@ func serve(serviceCtx context.Context, opts nebula.Options, ep nebula.Endpoint) 
 
 同一物理端点的并发 `ConnectEndpoint` 共享拨号。成功返回表示本机已注册直连。其他成员经邻居查询刚加入的节点时，要等转发查询的邻居也注册好这条路径。在此期间，`ResolveIP` 可能返回 `ErrPeerUnavailable`，调用方可在自己的截止时间内重试。取消拨号 context 只结束本次等待，已启动的拨号受节点生命周期和 `DialTimeout` 约束。[按地址发现的示例](../examples/discovery/main.go)
 
+按成员调用 `ConnectPeer` 或 `ConnectPeerID` 时，两个主地址共享同一轮拨号。如果该轮成功建立的路径在调用返回前已被撤回，节点会按当前策略再尝试一次。对端仍为 `Blocked` 时，调用返回 `ErrPathPolicy`。
+
 ### 按地址发现成员和下游网关
 
 `LookupPeer(primary)` 只查本机的静态成员、有效签名介绍和已认证会话。如果只知道一个陌生的成员主地址或下游单播地址，使用 `ResolveIP` 查询签名介绍。
