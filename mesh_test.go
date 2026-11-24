@@ -39,7 +39,7 @@ type fixture struct {
 }
 
 type meteredSocket struct {
-	net.PacketConn
+	*net.UDPConn
 	mu    sync.Mutex
 	sent  map[netip.AddrPort]int
 	drop  atomic.Bool
@@ -54,7 +54,7 @@ func (s *meteredSocket) WriteTo(b []byte, to net.Addr) (int, error) {
 	if s.drop.Load() || s.limit > 0 && len(b) > s.limit {
 		return len(b), nil
 	}
-	return s.PacketConn.WriteTo(b, to)
+	return s.UDPConn.WriteTo(b, to)
 }
 
 func (s *meteredSocket) count(a netip.AddrPort) int {
@@ -102,9 +102,9 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 		const loopback = "127.0.0.1:0"
 		var sock *meteredSocket
 		if kind == "udp" || kind == "both" {
-			var pc net.PacketConn
+			var pc *net.UDPConn
 			for attempt := 1; ; attempt++ {
-				pc, e = net.ListenPacket("udp4", loopback)
+				pc, e = net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(loopback)))
 				require.NoError(t, e)
 				if kind == "udp" {
 					break
@@ -119,7 +119,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 					t.Fatal(e)
 				}
 			}
-			sock = &meteredSocket{PacketConn: pc, sent: map[netip.AddrPort]int{}, limit: 1200}
+			sock = &meteredSocket{UDPConn: pc, sent: map[netip.AddrPort]int{}, limit: 1200}
 			o.UDP4 = sock
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "udp", Address: addrPort(pc.LocalAddr())})
 			t.Cleanup(func() { pc.Close() })
@@ -169,8 +169,8 @@ func (f *fixture) start() {
 	}
 }
 
-// Each node starts with its own member only. A nonnegative entry makes
-// that node dial the specified neighbor's physical endpoint.
+// Each node starts with its own member only. For each requested adjacency,
+// wait until both ends can use it to forward a discovery query.
 func (f *fixture) startDiscovery(neighbors ...int) {
 	f.t.Helper()
 	for i := range f.opts {
@@ -179,9 +179,15 @@ func (f *fixture) startDiscovery(neighbors ...int) {
 	f.start()
 	for i, neighbor := range neighbors {
 		if neighbor >= 0 {
-			id, err := f.nodes[i].ConnectEndpoint(f.t.Context(), f.cfg.Members[neighbor].Endpoints[0])
+			local, remote := f.nodes[i], f.nodes[neighbor]
+			ep := f.cfg.Members[neighbor].Endpoints[0]
+			id, err := local.ConnectEndpoint(f.t.Context(), ep)
 			require.NoError(f.t, err)
-			require.Equal(f.t, f.nodes[neighbor].ID(), id)
+			require.Equal(f.t, remote.ID(), id)
+			require.Eventually(f.t, func() bool {
+				path, ok := remote.PreferredPath(local.ID())
+				return ok && path.Transport == ep.Network
+			}, 3*time.Second, time.Millisecond, "%s did not register the %s path from %s", id, ep.Network, local.ID())
 		}
 	}
 }

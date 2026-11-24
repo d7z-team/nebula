@@ -58,7 +58,7 @@ func serve(serviceCtx context.Context, opts nebula.Options, ep nebula.Endpoint) 
 | 对端的一个虚拟主地址 | 如果 `LookupPeer(primary)` 能在本机找到归属，用 `ConnectPeer(ctx, primary)` 连接其所有者。预配置时，在对端的 `Member.Endpoints` 填入可达物理端点。 |
 | 对端完整的双栈身份 | 用 `ConnectPeerID(ctx, id)` 等待与该身份的获准路径。要持续维护该邻居，在拓扑中为两端配置双向 `Links`。 |
 
-同一物理端点的并发 `ConnectEndpoint` 共享拨号。取消调用方的 context 会结束该调用的等待，已启动的拨号受节点生命周期和 `DialTimeout` 约束。错误包含传输、地址和底层原因，宿主决定何时重试或换用其他端点。
+同一物理端点的并发 `ConnectEndpoint` 共享拨号。成功返回表示本机已注册直连。其他成员经邻居查询刚加入的节点时，要等转发查询的邻居也注册好这条路径。在此期间，`ResolveIP` 可能返回 `ErrPeerUnavailable`，调用方可在自己的截止时间内重试。取消拨号 context 只结束本次等待，已启动的拨号受节点生命周期和 `DialTimeout` 约束。[按地址发现的示例](../examples/discovery/main.go)
 
 ### 按地址发现成员和下游网关
 

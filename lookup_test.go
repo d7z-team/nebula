@@ -23,10 +23,7 @@ func TestConnectEndpointAndIPDiscovery(t *testing.T) {
 			f.cfg.Members[3].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("172.30.0.0/16")}
 			f.opts[3].Certificates.Client = f.issue(gateway, pki.Scope{RoutedPrefixes: []netip.Prefix{route}})
 			f.startDiscovery(1, -1, 1, 2)
-			a, r, b, n := f.nodes[0], f.nodes[1], f.nodes[2], f.nodes[3]
-			require.Eventually(t, func() bool {
-				return a.preferredSession(r.id, true) != nil && b.preferredSession(r.id, true) != nil && n.preferredSession(b.id, true) != nil
-			}, 3*time.Second, 10*time.Millisecond)
+			a, n := f.nodes[0], f.nodes[3]
 			_, ok := a.LookupPeer(gateway.IPv4())
 			require.False(t, ok)
 			dst := netip.MustParseAddr("172.30.0.42")
@@ -162,7 +159,6 @@ func TestDownstreamDiscoveryAcrossBranches(t *testing.T) {
 	}
 	f.startDiscovery(1, -1, 1, 1, 1, 1, 1, 1)
 	a, hub := f.nodes[0], f.nodes[1]
-	require.Eventually(t, func() bool { return len(hub.Paths()) == 7 }, 3*time.Second, 5*time.Millisecond)
 	got, err := a.ResolveIP(t.Context(), dst)
 	require.NoError(t, err)
 	require.Len(t, got, 6)
@@ -242,8 +238,7 @@ func TestConcurrentResolveCancellation(t *testing.T) {
 				f.opts[i].Interval = time.Hour
 			}
 			f.startDiscovery(1, -1, 1)
-			a, hub, g := f.nodes[0], f.nodes[1], f.nodes[2]
-			require.Eventually(t, func() bool { return len(hub.Paths()) == 2 }, 2*time.Second, 5*time.Millisecond)
+			a, g := f.nodes[0], f.nodes[2]
 			armed.Store(true)
 			addr := g.id.IPv4()
 			var ctx context.Context

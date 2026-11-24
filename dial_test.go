@@ -178,10 +178,6 @@ func TestConnectEndpointRequiresServerAuthorization(t *testing.T) {
 			}
 			f.startDiscovery(-1, 0)
 			a := f.nodes[0]
-			require.Eventually(t, func() bool {
-				_, ok := a.PreferredPath(bID)
-				return ok
-			}, time.Second, time.Millisecond)
 			require.NoError(t, a.ConnectPeerID(t.Context(), bID))
 			_, err := a.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
 			require.ErrorIs(t, err, denied)
