@@ -38,7 +38,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	options[1].HideEndpoints = true
+	options[1].Transport.HideEndpoints = true
 	nodes, err := demo.Listen(context.Background(), "udp", options)
 	if err != nil {
 		return err
@@ -46,10 +46,10 @@ func run() error {
 	for _, node := range nodes {
 		defer node.Close()
 	}
-	if err := nodes[0].SetPeerPathPolicy(b.IPv4, nebula.RelayOnly); err != nil {
+	if err := nodes[0].SetPeerPathPolicy(circuit[2], nebula.RelayOnly); err != nil {
 		return err
 	}
-	if err := nodes[2].SetPeerPathPolicy(a.IPv4, nebula.RelayOnly); err != nil {
+	if err := nodes[2].SetPeerPathPolicy(circuit[0], nebula.RelayOnly); err != nil {
 		return err
 	}
 	for _, node := range nodes {

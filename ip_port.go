@@ -30,7 +30,7 @@ type PortStats struct {
 // the submission path ("udp", "tcp", or "relay"), including when its receive
 // limit is too small. An attempt that ends while dialing or waiting for
 // bandwidth can report an empty Transport. Use errors.Is on Err to distinguish
-// an unavailable peer, a path policy denial, or an unauthorized packet address.
+// an unavailable peer, an instance conflict, a path denial, or an unauthorized address.
 type TransmitResult struct {
 	Peer                PeerID
 	Source, Destination netip.Addr
@@ -62,8 +62,21 @@ type outboundPacket struct {
 }
 
 type ipQueue struct {
-	packets []*outboundPacket
-	current ipSubmission
+	instance InstanceID // Protected by Node.mu; bound once the destination run is known.
+	packets  []*outboundPacket
+	current  ipSubmission
+}
+
+// bindInstance pins the queue to the first known run. An unknown destination
+// leaves the existing binding in place while the peer is disconnected.
+func (q *ipQueue) bindInstance(instance InstanceID) bool {
+	if instance == (InstanceID{}) {
+		return true
+	}
+	if q.instance == (InstanceID{}) {
+		q.instance = instance
+	}
+	return q.instance == instance
 }
 
 type ipSubmission struct {
@@ -136,6 +149,30 @@ func (p *IPPort) discardQueueLocked(peer PeerID, cause error) int {
 	return count
 }
 
+// syncInstanceQueue binds a cold queue on first admission and drops work for
+// a displaced or suspended run without affecting other peers.
+func (p *IPPort) syncInstanceQueue(peer PeerID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.queues[peer] == nil {
+		return
+	}
+	p.node.mu.Lock()
+	defer p.node.mu.Unlock()
+	p.reconcileQueueLocked(peer)
+}
+
+// reconcileQueueLocked discards stale work and returns the current admission
+// for new packets. The caller holds the port and node locks, in that order.
+func (p *IPPort) reconcileQueueLocked(peer PeerID) (instance InstanceID, suspended bool) {
+	instance, suspended = p.node.deliveryInstanceLocked(peer)
+	if q := p.queues[peer]; q != nil && (suspended || !q.bindInstance(instance)) {
+		p.stats.RejectedOutbound += uint64(p.discardQueueLocked(peer, ErrInstanceConflict))
+		p.stats.LastDrop = ErrInstanceConflict.Error()
+	}
+	return instance, suspended
+}
+
 // Stats returns a snapshot of this attachment's queues and traffic.
 func (p *IPPort) Stats() PortStats {
 	p.mu.Lock()
@@ -190,7 +227,7 @@ func (p *IPPort) enqueue(via PeerID, ip innerPacket, b []byte) error {
 	if !cfg.allowsAddress(n.id, ip.source, nil) {
 		return ErrAddressUnauthorized
 	}
-	peers, group, err := cfg.groupRecipients(n.id, ip.destination)
+	peers, group, err := cfg.groupRecipients(ip.destination)
 	if err != nil {
 		return err
 	}
@@ -205,13 +242,18 @@ func (p *IPPort) enqueue(via PeerID, ip innerPacket, b []byte) error {
 		peers = []PeerID{peer}
 	}
 	var packet *outboundPacket
-	full, denied := false, false
+	full, denied, conflict := false, false, false
 	for _, peer := range peers {
 		if peer == n.id {
 			continue
 		}
 		if n.modeLocked(peer) == Blocked || !n.ready(cfg) && n.preferredSessionLocked(n.peers[peer], false, &ip) == nil {
 			denied = true
+			continue
+		}
+		instance, suspended := p.reconcileQueueLocked(peer)
+		if suspended {
+			conflict = true
 			continue
 		}
 		q := p.queues[peer]
@@ -225,7 +267,7 @@ func (p *IPPort) enqueue(via PeerID, ip innerPacket, b []byte) error {
 			packet = &outboundPacket{innerPacket: ip, data: slices.Clone(b)}
 		}
 		if q == nil {
-			q = &ipQueue{}
+			q = &ipQueue{instance: instance}
 			p.queues[peer] = q
 			n.wg.Go(func() { p.drain(peer, q) })
 		}
@@ -235,6 +277,8 @@ func (p *IPPort) enqueue(via PeerID, ip innerPacket, b []byte) error {
 	switch {
 	case packet != nil:
 		return nil
+	case conflict:
+		return ErrInstanceConflict
 	case full:
 		return ErrQueueFull
 	case denied:
@@ -273,19 +317,25 @@ func (n *Node) receiveIP(s *session, b []byte) {
 			n.mu.Unlock()
 		}
 	}
-	port.mu.Lock()
-	if port.closed {
-		port.mu.Unlock()
-		return
+	if port.recordInbound(len(b), err) {
+		port.opts.Deliver(s.peer, b)
+	}
+}
+
+// recordInbound accounts for a complete packet or a rejected frame header.
+// It reports whether the packet should be delivered to this attachment.
+func (p *IPPort) recordInbound(size int, err error) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
 	}
 	if err != nil {
-		port.stats.RejectedInbound++
-		port.stats.LastDrop = err.Error()
-		port.mu.Unlock()
-		return
+		p.stats.RejectedInbound++
+		p.stats.LastDrop = err.Error()
+		return false
 	}
-	port.stats.ReceivedPackets++
-	port.stats.ReceivedBytes += uint64(len(b))
-	port.mu.Unlock()
-	port.opts.Deliver(s.peer, b)
+	p.stats.ReceivedPackets++
+	p.stats.ReceivedBytes += uint64(size)
+	return true
 }

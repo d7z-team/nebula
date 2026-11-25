@@ -65,39 +65,38 @@ func (n *Node) modeLocked(a PeerID) PathMode {
 	return mode
 }
 
-// SetPeerPathPolicy applies a local policy to either overlay address and prunes
-// disallowed paths. It may be called before Start.
-func (n *Node) SetPeerPathPolicy(address netip.Addr, mode PathMode) error {
-	n.mu.Lock()
-	a := n.ownerLocked(address)
-	if a == (PeerID{}) {
-		// A blocked peer can outlive its signed introduction.
-		for id := range n.modes {
-			if address == id.IPv4() || address == id.IPv6() {
-				if a != (PeerID{}) {
-					n.mu.Unlock()
-					return ErrPathPolicy
-				}
-				a = id
-			}
-		}
-	}
-	if a == (PeerID{}) || a == n.id || mode > Blocked {
-		n.mu.Unlock()
+// SetPeerPathPolicy applies a local policy to an exact address pair and prunes
+// disallowed paths. A valid remote identity may be configured before discovery
+// or Start. Auto clears its override.
+func (n *Node) SetPeerPathPolicy(peer PeerID, mode PathMode) error {
+	if peer == n.id || mode > Blocked || n.Cluster().ValidateMember(peer) != nil {
 		return ErrPathPolicy
 	}
+	n.mu.Lock()
 	if n.state == closed {
 		n.mu.Unlock()
 		return ErrNodeClosed
 	}
 	if mode == Auto {
-		delete(n.modes, a)
+		delete(n.modes, peer)
 	} else {
-		n.modes[a] = mode
+		n.modes[peer] = mode
 	}
 	n.mu.Unlock()
 	n.enforcePathPolicy()
 	return nil
+}
+
+// PeerPathPolicy returns the local override (Auto by default) and the mode
+// allowed by the current topology. It does not check connectivity or credentials.
+// The effective mode is Blocked for an invalid or local identity or a closed node.
+func (n *Node) PeerPathPolicy(peer PeerID) (configured, effective PathMode) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if peer == n.id || n.state == closed || n.Cluster().ValidateMember(peer) != nil {
+		return n.modes[peer], Blocked
+	}
+	return n.modes[peer], n.modeLocked(peer)
 }
 
 func (n *Node) enforcePathPolicy() {

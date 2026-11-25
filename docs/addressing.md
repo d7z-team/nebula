@@ -8,24 +8,25 @@ go run ./examples/addressing
 
 ## 签发和分配
 
-1. 使用 `Scope{Network: "demo", Cluster: true}` 声明集群 CA，在 `CAProfile.PermittedIPs` 设置同族互不重叠的成员子网，IPv4 和 IPv6 各至少一个。例如 `10.13.0.0/24`、`fd13::/64`。这些 CIDR 写入标准 X.509 IP Name Constraints。集群 CA 可以是信任根，也可以由企业根签发。
-2. 在 CA 的 `Scope.RoutedPrefixes` 设置可下放的业务路由，在 `Scope.AnycastPools` 预留服务地址，例如 `10.13.0.192/27`。服务地址池可以位于成员子网内部，也可以独立部署。下级 CA 省略 mesh 扩展时继承上级授权，提供扩展时按其中的范围收窄。签发者的 `Issuer.Chain` 按顺序提供签发 CA、集群 CA 和已有的上级链。
-3. 每个成员获得一个独占 IPv4 和一个独占 IPv6。两者是叶证书的 IP SAN，共同构成 `PeerID`。需要承载服务时，将每个获批 VIP 写入叶证书的 `Scope.AnycastIPs`。下游路由和 VIP 分别签发。客户端、服务端使用不同凭据时，两种方向的会话均需各自具备相应授权。
-4. 为节点提供 `Options.Roots` 和 `Options.ClusterCA`。用 `pki.ReadClusterCA(cert)` 读取规划并调用 `topology.Validate(cluster)` 预检，运行中通过 `node.Cluster()` 读取同一规划。PKIX 验证、集群 CA 固定、mesh 委派和宿主授权作用于同一条证书路径。[签发命令与编码](pki.md)
+1. 在集群 CA 的 `CAProfile.PermittedIPs` 设置一个 IPv4 和一个 IPv6 成员网段，例如 `10.13.0.0/24` 和 `fd13::/64`。这些 CIDR 写入标准 X.509 IP Name Constraints，共同定义一条逻辑链路。站点 CA 在上级委派的双栈范围内签发地址。
+2. 在 `Scope.RoutedPrefixes` 设置可下放的业务路由，在 `Scope.AnycastPools` 预留服务池。服务池可在成员网段内，也可独立分配。站点 CA 省略 mesh 扩展时继承上述授权上限。
+3. 每个节点的两个独占主地址共同构成 `PeerID`。叶证书用 `Scope.AnycastIPs` 授权精确 VIP，用 `Scope.RoutedPrefixes` 授权下游前缀。客户端、服务端使用不同凭据时，各方向要分别授权。
+4. 将信任根和固定的集群 CA 填入 `Options.Auth.Roots` 和 `Options.Auth.ClusterCA`。启动前可用 `pki.ReadClusterCA(cert)` 和 `topology.Validate(cluster)` 预检地址规划，运行中用 `node.Cluster()` 读取同一规划。[CA 签发参数与证书字段](pki.md#证书配置)
 
-`cluster.Subnets()` 和 `cluster.AnycastPools()` 返回副本。分配器可用 `cluster.MemberAddresses(prefix)` 按需遍历候选主地址，用 `cluster.ValidateMember(id)` 检查一对指定地址。宿主在自己的持久化分配表中分别为 IPv4 和 IPv6 建唯一约束，在同一事务中预留这对地址，再签发证书。IPv4 普通子网保留网络地址和定向广播地址，/31 和 /32 可使用所有地址。IPv6 普通子网保留全零接口标识，/127 和 /128 可使用所有地址。成员分配会跳过 VIP 池和排除范围。下级 CA 进一步收窄的 SAN 范围只影响签发权限，逻辑链路边界始终取集群 CA 的子网。[分配 API](../pki/cluster.go) · [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021) · [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164)
+`v4, v6 := cluster.MemberPrefixes()` 返回集群前缀，`cluster.AnycastPools()` 返回服务池副本。分配器可用 `cluster.MemberAddresses(within)` 枚举集群内任意规范子范围，按集群前缀判断网络边界，用 `cluster.ValidateMember(id)` 检查一对指定地址。宿主在自己的持久化分配表中分别为 IPv4 和 IPv6 建唯一约束，在同一事务中预留这对地址，再签发证书。IPv4 普通子网保留网络地址和定向广播地址，/31 和 /32 可使用所有地址。IPv6 普通子网保留全零接口标识，/127 和 /128 可使用所有地址。成员分配会跳过 VIP 池和排除范围。下级 CA 进一步收窄的 SAN 范围只影响签发权限，逻辑链路边界始终取集群 CA 的子网。[分配 API](../pki/cluster.go) · [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021) · [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164)
+
+多个成员可以共同承载同一 VIP 或下游前缀。核对运行中观察到的主地址、VIP 或网关声明时，在相关节点调用 `InspectIP(ip)`。[排查与恢复](integration.md#排查重复地址与实例)
 
 ## 广播与组播
 
-`Topology.EnableBroadcast` 控制广播收发，`EnableMulticast` 控制组播收发，两者默认关闭。用 `node.ApplyTopology(ctx, topology)` 更新本机视图。在接收成员的 `MulticastGroups` 中列出要订阅的组地址。发送方按自己拓扑的 `Members` 展开接收名单，接收方按自己的视图校验交付资格。下表的“同子网”指双方在相应地址族的主地址属于同一个 CA 子网。[拓扑字段](../topology.go)
+`Topology.EnableBroadcast` 控制广播收发，`EnableMulticast` 控制组播收发，两者默认关闭。用 `node.ApplyTopology(ctx, topology)` 更新本机视图。在接收成员的 `MulticastGroups` 中列出要订阅的组地址。发送方按自己拓扑的 `Members` 展开接收名单，接收方按自己的视图校验交付资格。不同站点 CA 签发的成员共享一条逻辑链路。[拓扑字段](../topology.go)
 
 | 目的地址 | 远端接收者 |
 | --- | --- |
-| `255.255.255.255` 或本子网 IPv4 定向广播 | 同一 IPv4 子网的成员 |
-| `224.0.0.1`、`ff02::1` | 同族同子网的全部成员 |
-| 其余 `224.0.0.0/24`、IPv6 链路作用域组 | 同族同子网且订阅该组的成员 |
+| `255.255.255.255` 或本子网 IPv4 定向广播 | 本机拓扑中的其他成员 |
+| `224.0.0.1`、`ff02::1` | 本机拓扑中的其他成员 |
 | IPv6 接口作用域组，如 `ff01::1` | 由宿主栈在本机处理 |
-| 其余可用组播地址 | 当前拓扑中订阅该地址的成员 |
+| 其余可用组播地址（含链路作用域） | 当前拓扑中订阅该地址的成员 |
 
 每个合格远端各有一份排队记录，共用原始报文，各自等待带宽。中继沿认证电路转发，宿主栈处理本地回环。接收端核对源地址、会话、组流量开关和接收资格，再调用宿主的 `InboundPolicy`。
 
@@ -43,6 +44,10 @@ go run ./examples/addressing
 VIP 或下游地址使用零 ID 时，端口在入队前调用一次可选的 `ResolveNextHop(dst, packet)`。回调收到只读包，可以查询节点或应用的流绑定表。回调结束后，端口用最新拓扑重新检查所选成员；回调返回的错误直接交给写入方。显式下一跳、已归属的主地址和组流量均跳过回调。调用方未配置解析器或解析器返回零 ID 时，写入返回 `ErrNextHopRequired`。目的为本机尚未知的普通主地址时，先显式调用 `ResolveIP(ctx, dst)`，选中结果后可调用 `ConnectPeerID(ctx, match.Peer)`，向该身份写包。
 
 查询下游地址得到多个候选时，应用可按流选定网关。宿主核准网关及其下游前缀后，用 `ApplyTopology` 安装本机视图。实际收发时还会校验会话证书中的地址授权。[地址查询与缓存](integration.md#按地址发现成员和下游网关) · [IP 端口](../ip_port.go)
+
+网关的 `RoutedPrefixes` 同时批准发往该范围的目的地址以及网关代表的源地址，支持下游主动发起的连接。已有默认出口时，调用 `RefreshIP(ctx, dst)` 可查询新加入的站点网关。给两个网关分别批准 `0.0.0.0/0` 与站点 `/24` 后，宿主可优先经站点网关发包；入站时两者都可以代表该站点。宿主可用 `InboundPolicy` 收窄入站来源。双栈默认出口另外需要批准 `::/0`。成员网段中的未分配地址和已保留的服务池始终按各自规则交付。[双出口示例](../examples/gateway/main.go)
+
+实例冲突导致交付暂停时，原始端口的 `WriteIP` 返回 `ErrInstanceConflict`，gVisor 网卡写入返回 `tcpip.ErrNotPermitted`。
 
 通过 `ObserveTransmit` 读取已出队包的结果，用 `errors.Is` 区分路径不可达（`ErrPeerUnavailable`）、路径策略拒绝（`ErrPathPolicy`）和地址未获授权（`ErrAddressUnauthorized`）。
 

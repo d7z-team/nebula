@@ -92,7 +92,7 @@ func (s *topologyView) allowsAddress(peer PeerID, addr netip.Addr, cert *pki.Sco
 }
 
 func (s *topologyView) allowsDestination(from, to PeerID, dst netip.Addr, cert *pki.Scope) bool {
-	if peers, group, err := s.groupRecipients(from, dst); group {
+	if peers, group, err := s.groupRecipients(dst); group {
 		_, subscribed := slices.BinarySearchFunc(peers, to, comparePeer)
 		return err == nil && from != to && subscribed
 	}

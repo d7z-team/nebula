@@ -122,7 +122,7 @@ func TestChaosFailoverAndRenewal(t *testing.T) {
 	old := l.connect(a, b, "udp")
 	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, c, d, 0)
-	fresh := l.credentials(l.top.Members[b.index], "ed25519")
+	fresh := issueCredentials(t, l.issuer, l.top.Members[b.index], "ed25519")
 	require.NoError(t, b.node.ReloadCertificates(t.Context(), fresh))
 	require.Equal(t, old.Serial, waitPath(t, a, b, "udp").Serial)
 	// Isolate one direction after renewal. A TCP standby must authenticate
@@ -168,7 +168,7 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	receipt(t, c, d, 1)
 	before := flow{"wan", netip.MustParseAddrPort("192.0.2.1:45002"), netip.MustParseAddrPort("192.0.2.20:4242"), 17}
 	require.Positive(t, l.net.packets(before))
-	require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.Blocked))
+	require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Blocked))
 	require.ErrorIs(t, a.node.ConnectPeer(t.Context(), b.ip), nebula.ErrPathPolicy)
 	require.Empty(t, a.node.Paths())
 	dest := tcpip.FullAddress{Addr: gvisorAddr(b.ip), Port: 7011}
@@ -181,12 +181,12 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	// UDP may report the policy rejection at write time or drop the packet.
 	_, _ = tx.Write([]byte("withdrawn"))
 	var msg [64]byte
-	require.NoError(t, rx.SetReadDeadline(time.Now().Add(2*a.options.Interval)))
+	require.NoError(t, rx.SetReadDeadline(time.Now().Add(2*a.options.MaintenanceInterval)))
 	_, err = rx.Read(msg[:])
 	var timeout net.Error
 	require.ErrorAs(t, err, &timeout)
 	require.True(t, timeout.Timeout())
-	require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.Auto))
+	require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Auto))
 	l.connect(a, b, "udp")
 	_, err = tx.Write([]byte("restored"))
 	require.NoError(t, err)
@@ -206,7 +206,7 @@ func TestChaosMobileHandover(t *testing.T) {
 	fixed := l.host("wan", "192.0.2.20", "", "udp", true)
 	for _, h := range l.hosts {
 		// Exercise the node's production probe and dial timing.
-		h.options.Interval, h.options.DialTimeout = 0, 0
+		h.options.MaintenanceInterval, h.options.DialTimeout = 0, 0
 	}
 	l.start()
 	l.connect(mobile, fixed, "udp")
@@ -265,14 +265,14 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 	l.link(fixed, observer)
 	l.link(mobile, observer)
 	// The mobile peer answers rendezvous but leaves direct dialing to the fixed peer.
-	mobile.options.Interval = time.Minute
+	mobile.options.MaintenanceInterval = time.Minute
 	fixed.options.DialTimeout = 2 * time.Second
 	l.start()
 	l.top.Members[mobile.index].Endpoints = []nebula.Endpoint{{Network: "udp", Address: old}}
 	require.NoError(t, fixed.node.ApplyTopology(t.Context(), l.top))
 	l.connect(mobile, observer, "udp")
 	l.connect(fixed, observer, "udp")
-	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.ip, nebula.RelayOnly))
+	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.node.ID(), nebula.RelayOnly))
 	l.connect(fixed, mobile, "relay")
 	c, d := tcpPair(t, l.business(fixed), l.business(mobile), mobile.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, c, d, 0)
@@ -291,7 +291,7 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 		}
 		return disturbance{}
 	})
-	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.ip, nebula.Auto))
+	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.node.ID(), nebula.Auto))
 	var started time.Time
 	select {
 	case started = <-first:
@@ -311,8 +311,8 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 		return p.Peer == mobile.node.ID() && p.Endpoint == next
 	}))
 	require.Positive(t, l.net.punches(flow{"wan", from, next, 17}))
-	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.ip, nebula.DirectOnly))
-	require.NoError(t, mobile.node.SetPeerPathPolicy(fixed.ip, nebula.DirectOnly))
+	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.node.ID(), nebula.DirectOnly))
+	require.NoError(t, mobile.node.SetPeerPathPolicy(fixed.node.ID(), nebula.DirectOnly))
 	receipt(t, c, d, 1)
 }
 
@@ -401,9 +401,9 @@ func TestChaosHiddenTransit(t *testing.T) {
 	for _, restricted := range []*host{a, h, b} {
 		l.top.Members[restricted.index].Restricted = true
 	}
-	h.options.HideEndpoints = true
+	h.options.Transport.HideEndpoints = true
 	mapped := netip.AddrPortFrom(nat.public.Addr(), nat.bindings[0].port)
-	h.options.AdvertiseEndpoints = []nebula.Endpoint{{Network: "udp", Address: mapped}}
+	h.options.Transport.AdvertiseEndpoints = []nebula.Endpoint{{Network: "udp", Address: mapped}}
 	l.start()
 	l.connect(a, left, "udp")
 	l.connect(b, right, "udp")
@@ -496,7 +496,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	r := l.host("wan", "192.0.2.2", "", "tcp", true)
 	c := l.host("wan", "192.0.2.3", "", "tcp", true)
 	var denied atomic.Bool
-	r.options.CheckChain = func(_ context.Context, check nebula.ChainCheck) (time.Time, error) {
+	r.options.Auth.CheckChain = func(_ context.Context, check nebula.ChainCheck) (time.Time, error) {
 		if denied.Load() && check.Usage == x509.ExtKeyUsageCodeSigning && check.Member == labPeer(a.ip) {
 			return time.Time{}, errors.New("publisher withdrawn")
 		}
@@ -507,7 +507,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	publicationReceipt(t, a, r, "withdrawn publication")
 	denied.Store(true)
 	require.NoError(t, r.node.Revalidate(t.Context()))
-	require.Equal(t, a.options.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, r, a, "tcp").Serial)
+	require.Equal(t, a.options.Auth.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, r, a, "tcp").Serial)
 	id, err := r.node.Publish(t.Context(), "app/test", []byte("cached while partitioned"))
 	require.NoError(t, err)
 	sub, err := c.node.Subscribe("app/test")
@@ -528,7 +528,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 		default:
 			return false
 		}
-	}, 4*c.options.Interval, 20*time.Millisecond)
+	}, 4*c.options.MaintenanceInterval, 20*time.Millisecond)
 }
 
 func TestChaosCloseWithBacklog(t *testing.T) {
@@ -635,13 +635,13 @@ func TestSeededChaos(t *testing.T) {
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.protocol == 17} })
 			waitPath(t, a, b, "tcp")
 		case 2:
-			fresh := l.credentials(l.top.Members[b.index], "ed25519")
+			fresh := issueCredentials(t, l.issuer, l.top.Members[b.index], "ed25519")
 			require.NoError(t, b.node.ReloadCertificates(t.Context(), fresh))
 			require.Equal(t, fresh.Client.Leaf.SerialNumber.String(), b.node.ControlStatus().Serial)
 		case 3:
-			require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.Blocked))
+			require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Blocked))
 			require.ErrorIs(t, a.node.ConnectPeer(t.Context(), b.ip), nebula.ErrPathPolicy)
-			require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.Auto))
+			require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Auto))
 			l.connect(a, b, "udp")
 		}
 		receipt(t, c, d, step)

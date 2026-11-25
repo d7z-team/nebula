@@ -66,10 +66,10 @@ func newLab(t *testing.T) *lab {
 		Scope: &pki.Scope{
 			Network: "lab", Cluster: true,
 			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
-			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27"), netip.MustParsePrefix("fd42::c0/123")},
+			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27"), netip.MustParsePrefix("fd42::c0/123"), netip.MustParsePrefix("192.0.2.200/32")},
 		},
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd42::/64")},
-		Subject:      pkix.Name{CommonName: "test root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		MaxPathLen:   1, Subject: pkix.Name{CommonName: "test root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
 	})
 	require.NoError(t, err)
 	l := &lab{
@@ -82,20 +82,24 @@ func newLab(t *testing.T) *lab {
 	return l
 }
 
-func (l *lab) credentials(m nebula.Member, algorithm string) nebula.LocalCertificates {
-	l.t.Helper()
+func issueCredentials(t *testing.T, issuer pki.Issuer, m nebula.Member, algorithm string) nebula.LocalCertificates {
+	t.Helper()
 	key, err := pki.GenerateKey(algorithm)
-	require.NoError(l.t, err)
+	require.NoError(t, err)
 	req, err := pki.CreateCSR(key, pkix.Name{})
-	require.NoError(l.t, err)
-	leaf, err := l.issuer.IssueLeaf(req, pki.Enrollment{
+	require.NoError(t, err)
+	leaf, err := issuer.IssueLeaf(req, pki.Enrollment{
 		Scope: pki.Scope{Network: "lab", RoutedPrefixes: m.RoutedPrefixes, AnycastIPs: m.AnycastIPs}, IPv4: m.IPv4, IPv6: m.IPv6,
 		Usages:        []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageCodeSigning},
 		PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo),
 		NotBefore:     time.Now().Add(-time.Minute), NotAfter: time.Now().Add(30 * time.Minute),
 	})
-	require.NoError(l.t, err)
-	return nebula.LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: key, Leaf: leaf}}
+	require.NoError(t, err)
+	chain := [][]byte{leaf.Raw}
+	for _, ca := range issuer.Chain[:len(issuer.Chain)-1] {
+		chain = append(chain, ca.Raw)
+	}
+	return nebula.LocalCertificates{Client: tls.Certificate{Certificate: chain, PrivateKey: key, Leaf: leaf}}
 }
 
 // Each host owns its underlay stack. All TCP dials, including failed dials,
@@ -104,8 +108,12 @@ func (l *lab) host(segment, physical, via, transport string, publish bool) *host
 	l.t.Helper()
 	number := len(l.hosts) + 1
 	ip := netip.MustParseAddr(fmt.Sprintf("10.13.0.%d", number))
-	member := nebula.Member{IPv4: ip, IPv6: labPeer(ip).IPv6(), Topics: []string{"app/test"}}
-	h := &host{index: len(l.hosts), ip: ip, options: nebula.Options{Roots: l.roots, ClusterCA: l.issuer.Chain[0], Interval: 140 * time.Millisecond, DialTimeout: 650 * time.Millisecond}}
+	member := nebula.Member{IPv4: ip, IPv6: labPeer(ip).IPv6(), PublishTopics: []string{"app/test"}}
+	h := &host{index: len(l.hosts), ip: ip, options: nebula.Options{
+		Auth:                nebula.AuthOptions{Roots: l.roots, ClusterCA: l.issuer.Chain[0]},
+		MaintenanceInterval: 140 * time.Millisecond,
+		DialTimeout:         650 * time.Millisecond,
+	}}
 	l.top.Members = append(l.top.Members, member)
 	l.addUnderlay(h, segment, physical, via, transport, publish)
 	l.hosts = append(l.hosts, h)
@@ -136,9 +144,9 @@ func (l *lab) addUnderlay(h *host, segment, physical, via, transport string, pub
 			l.t.Cleanup(func() { pc.Close() })
 		}
 		if a.Is4() {
-			h.options.UDP4 = input
+			h.options.Transport.UDP4 = input
 		} else {
-			h.options.UDP6 = input
+			h.options.Transport.UDP6 = input
 		}
 		if publish {
 			m.Endpoints = append(m.Endpoints, nebula.Endpoint{Network: "udp", Address: netip.AddrPortFrom(a, meshPort)})
@@ -156,16 +164,16 @@ func (l *lab) addUnderlay(h *host, segment, physical, via, transport string, pub
 			l.t.Cleanup(func() { listener.Close() })
 		}
 		if a.Is4() {
-			h.options.TCP4 = input
+			h.options.Transport.TCP4 = input
 		} else {
-			h.options.TCP6 = input
+			h.options.Transport.TCP6 = input
 		}
 		if publish {
 			m.Endpoints = append(m.Endpoints, nebula.Endpoint{Network: "tcp", Address: netip.AddrPortFrom(a, meshPort)})
 		}
 	}
-	previousDial := h.options.DialTCP
-	h.options.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+	previousDial := h.options.Transport.DialTCP
+	h.options.Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
 		ap, err := netip.ParseAddrPort(address)
 		if err != nil {
 			return nil, err
@@ -189,8 +197,8 @@ func (l *lab) link(a, b *host) {
 func (l *lab) start() {
 	l.t.Helper()
 	for _, h := range l.hosts {
-		if h.options.Certificates.Client.PrivateKey == nil {
-			h.options.Certificates = l.credentials(l.top.Members[h.index], "ed25519")
+		if h.options.Auth.Certificates.Client.PrivateKey == nil {
+			h.options.Auth.Certificates = issueCredentials(l.t, l.issuer, l.top.Members[h.index], "ed25519")
 		}
 		o := h.options
 		o.Topology = l.top
@@ -262,7 +270,7 @@ func forwardingPair(t *testing.T) (client, gateway *nebula.Node) {
 	l := newLab(t)
 	g := l.host("wan", "192.0.2.1", "", "both", true)
 	c := l.host("wan", "192.0.2.2", "", "both", true)
-	routes := []netip.Prefix{netip.MustParsePrefix("172.30.0.0/24"), netip.MustParsePrefix("2001:db8:42::/64")}
+	routes := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
 	l.top.Members[g.index].RoutedPrefixes = routes
 	l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.protocol == 17 && d.size > 1200} })
 	l.start()
@@ -298,15 +306,15 @@ func TestMixedTLSCredentials(t *testing.T) {
 			l := newLab(t)
 			a := l.host("wan", "192.0.2.1", "", tc.transport, true)
 			b := l.host("wan", "192.0.2.2", "", tc.transport, true)
-			a.options.Certificates = l.credentials(l.top.Members[a.index], tc.client)
-			b.options.Certificates = l.credentials(l.top.Members[b.index], tc.server)
+			a.options.Auth.Certificates = issueCredentials(t, l.issuer, l.top.Members[a.index], tc.client)
+			b.options.Auth.Certificates = issueCredentials(t, l.issuer, l.top.Members[b.index], tc.server)
 			l.start()
 			p := l.connect(a, b, tc.transport)
 			require.EqualValues(t, tls.VersionTLS13, p.TLSVersion)
 			require.Equal(t, meshwire.ALPN, p.ALPN)
 			require.Equal(t, tls.X25519MLKEM768, p.TLSGroup)
-			require.Equal(t, b.options.Certificates.Client.Leaf.SerialNumber.String(), p.Serial)
-			require.Equal(t, a.options.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).Serial)
+			require.Equal(t, b.options.Auth.Certificates.Client.Leaf.SerialNumber.String(), p.Serial)
+			require.Equal(t, a.options.Auth.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).Serial)
 			publicationReceipt(t, a, b, "client publication")
 			publicationReceipt(t, b, a, "server publication")
 		})

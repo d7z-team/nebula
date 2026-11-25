@@ -383,7 +383,7 @@ func (n *Node) dialTransport(ctx context.Context, peer PeerID, e Endpoint) (*ses
 	if e.Address.Addr().Is6() {
 		network = "tcp6"
 	}
-	c, err := n.o.DialTCP(ctx, network, e.Address.String())
+	c, err := n.o.Transport.DialTCP(ctx, network, e.Address.String())
 	if err != nil {
 		return nil, err
 	}

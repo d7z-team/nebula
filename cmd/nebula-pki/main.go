@@ -122,9 +122,9 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		fs.IntVar(&days, "days", 30, "validity in days")
 		fs.IntVar(&profile.MaxPathLen, "path-len", 0, "allowed intermediate CA depth")
 		fs.BoolVar(&scope.Cluster, "cluster", false, "define the cluster address plan on this CA")
-		fs.Func("routes", "approved routed prefixes, comma separated", listFlag(&scope.RoutedPrefixes, netip.ParsePrefix))
+		fs.Func("routes", "routed traffic a leaf may carry or a CA may delegate (including /0)", listFlag(&scope.RoutedPrefixes, netip.ParsePrefix))
 		fs.Func("anycast-pools", "delegated service prefixes for a CA", listFlag(&scope.AnycastPools, netip.ParsePrefix))
-		fs.Func("permit-ips", "permitted IP SAN ranges for a CA", listFlag(&profile.PermittedIPs, netip.ParsePrefix))
+		fs.Func("permit-ips", "cluster: one IPv4 and one IPv6 member prefix; subordinate issuer: delegated ranges for both families", listFlag(&profile.PermittedIPs, netip.ParsePrefix))
 	}
 	if op == "issue" || op == "verify" {
 		fs.TextVar(&v4, "ipv4", netip.Addr{}, "overlay IPv4 address")
@@ -348,7 +348,16 @@ func inspect(b []byte, fingerprint bool) ([]byte, error) {
 			if present {
 				detail += fmt.Sprintf(" network=%s cluster=%t routes=%v anycastPools=%v", scope.Network, scope.Cluster, scope.RoutedPrefixes, scope.AnycastPools)
 			}
-			detail += fmt.Sprintf(" permittedIPs=%v", c.PermittedIPRanges)
+			if scope.Cluster {
+				plan, err := pki.ReadClusterCA(c)
+				if err != nil {
+					return nil, err
+				}
+				v4, v6 := plan.MemberPrefixes()
+				detail += fmt.Sprintf(" memberIPv4=%s memberIPv6=%s", v4, v6)
+			} else {
+				detail += fmt.Sprintf(" permittedIPs=%v", c.PermittedIPRanges)
+			}
 		} else {
 			identity, err := pki.ReadIdentity(c)
 			if err != nil {

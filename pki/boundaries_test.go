@@ -30,29 +30,29 @@ func TestIssuanceBoundaries(t *testing.T) {
 	issuer := Issuer{Chain: []*x509.Certificate{root}, Signer: key}
 	interKey, err := GenerateKey("ed25519")
 	require.NoError(t, err)
-	req, err := CreateCSR(interKey, pkix.Name{CommonName: "issuer"})
+	siteCSR, err := CreateCSR(interKey, pkix.Name{CommonName: "issuer"})
 	require.NoError(t, err)
-	interProfile := CAProfile{Subject: req.Subject, NotBefore: now.Add(-20 * time.Minute), NotAfter: now.Add(20 * time.Minute), MaxPathLen: 0}
+	interProfile := CAProfile{PermittedIPs: profile.PermittedIPs, Subject: siteCSR.Subject, NotBefore: now.Add(-20 * time.Minute), NotAfter: now.Add(20 * time.Minute), MaxPathLen: 0}
 	approvedSPKI, err := x509.MarshalPKIXPublicKey(interKey.Public())
 	require.NoError(t, err)
 	approvedHash := sha256.Sum256(approvedSPKI)
-	_, err = issuer.IssueCA(req, interProfile, sha256.Sum256(root.RawSubjectPublicKeyInfo))
+	_, err = issuer.IssueCA(siteCSR, interProfile, sha256.Sum256(root.RawSubjectPublicKeyInfo))
 	require.ErrorContains(t, err, "fingerprint")
-	inter, err := issuer.IssueCA(req, interProfile, approvedHash)
+	inter, err := issuer.IssueCA(siteCSR, interProfile, approvedHash)
 	require.NoError(t, err)
 	interIssuer := Issuer{Chain: []*x509.Certificate{inter, root}, Signer: interKey}
-	_, err = interIssuer.IssueCA(req, interProfile, approvedHash)
+	_, err = interIssuer.IssueCA(siteCSR, interProfile, approvedHash)
 	require.Error(t, err)
 	tooDeep := interProfile
 	tooDeep.MaxPathLen = math.MaxInt
-	_, err = issuer.IssueCA(req, tooDeep, approvedHash)
+	_, err = issuer.IssueCA(siteCSR, tooDeep, approvedHash)
 	require.Error(t, err)
 
 	leafKey, err := GenerateKey("ed25519")
 	require.NoError(t, err)
 	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{DNSNames: []string{"requested.test"}, Subject: pkix.Name{CommonName: "unapproved"}}, leafKey)
 	require.NoError(t, err)
-	req, err = x509.ParseCertificateRequest(der)
+	req, err := x509.ParseCertificateRequest(der)
 	require.NoError(t, err)
 	enroll := Enrollment{Name: "publisher", IPv4: netip.MustParseAddr("10.0.0.1"), IPv6: netip.MustParseAddr("fd42::1"), Scope: Scope{Network: "mesh"}, Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Minute)}
 	peer, err := NewPeerID(enroll.IPv4, enroll.IPv6)
@@ -124,6 +124,30 @@ func TestIssuanceBoundaries(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AddCert(root)
 	chain := []*x509.Certificate{leaf, inter}
+	// The leaf fits the parent and is signed by the intermediate's key in
+	// every case. Check the delegation itself on externally issued paths.
+	for name, ranges := range map[string][]netip.Prefix{
+		"no-issuer-ranges": nil, "single-family": {profile.PermittedIPs[0]},
+		"excess-delegation": {profile.PermittedIPs[1], profile.PermittedIPs[0], netip.MustParsePrefix("192.0.2.0/24")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			site := interProfile
+			site.PermittedIPs = ranges
+			_, err := issuer.IssueCA(siteCSR, site, approvedHash)
+			require.Error(t, err)
+			tmpl, err := caTemplate(site)
+			require.NoError(t, err)
+			der, err := x509.CreateCertificate(rand.Reader, tmpl, root, interKey.Public(), key)
+			require.NoError(t, err)
+			external, err := x509.ParseCertificate(der)
+			require.NoError(t, err)
+			externalIssuer := Issuer{Chain: []*x509.Certificate{external, root}, Signer: interKey}
+			_, err = externalIssuer.IssueLeaf(req, enroll)
+			require.Error(t, err)
+			_, err = VerifyChain([]*x509.Certificate{leaf, external}, roots, cluster, peer, x509.ExtKeyUsageCodeSigning, now)
+			require.Error(t, err)
+		})
+	}
 	for _, tc := range []struct {
 		name string
 		at   time.Time
@@ -164,7 +188,7 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	}
 	profile := CAProfile{
 		Subject: pkix.Name{CommonName: "root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
-		MaxPathLen:   1,
+		MaxPathLen:   2,
 		Scope:        &scope,
 		PermittedIPs: []netip.Prefix{prefix("10.0.0.0/8"), prefix("fd42::/64")},
 	}
@@ -173,6 +197,15 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	root, err := CreateRoot(rootKey, profile)
 	require.NoError(t, err)
 	issuer := Issuer{Chain: []*x509.Certificate{root}, Signer: rootKey}
+	regionKey, err := GenerateKey("ed25519")
+	require.NoError(t, err)
+	regionCSR, err := CreateCSR(regionKey, pkix.Name{CommonName: "region"})
+	require.NoError(t, err)
+	profile.Subject, profile.MaxPathLen, profile.Scope = regionCSR.Subject, 1, nil
+	profile.PermittedIPs = []netip.Prefix{prefix("10.1.3.0/24"), prefix("10.1.2.0/24"), prefix("fd42::/96")}
+	region, err := issuer.IssueCA(regionCSR, profile, sha256.Sum256(regionCSR.RawSubjectPublicKeyInfo))
+	require.NoError(t, err)
+	regional := Issuer{Chain: []*x509.Certificate{region, root}, Signer: regionKey}
 	key, err := GenerateKey("ed25519")
 	require.NoError(t, err)
 	req, err := CreateCSR(key, pkix.Name{})
@@ -185,9 +218,14 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	profile.Scope = &restricted
 	profile.PermittedIPs = []netip.Prefix{prefix("10.1.2.0/27"), prefix("fd42::/120")}
 	profile.MaxPathLen = 0
-	inter, err := issuer.IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
+	approved := sha256.Sum256(req.RawSubjectPublicKeyInfo)
+	beyondRegion := profile
+	beyondRegion.PermittedIPs = []netip.Prefix{prefix("10.1.0.0/16"), prefix("fd42::/120")}
+	_, err = regional.IssueCA(req, beyondRegion, approved)
+	require.ErrorContains(t, err, "exceeds issuer permission")
+	inter, err := regional.IssueCA(req, profile, approved)
 	require.NoError(t, err)
-	delegated := Issuer{Chain: []*x509.Certificate{inter, root}, Signer: key}
+	delegated := Issuer{Chain: []*x509.Certificate{inter, region, root}, Signer: key}
 	leafKey, err := GenerateKey("p256")
 	require.NoError(t, err)
 	req, err = CreateCSR(leafKey, pkix.Name{})
@@ -211,7 +249,7 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
 	roots.AddCert(root)
-	chain := []*x509.Certificate{cert, inter}
+	chain := []*x509.Certificate{cert, inter, region}
 	_, err = VerifyChain(chain, roots, cluster, id, x509.ExtKeyUsageServerAuth, now)
 	require.NoError(t, err)
 	_, err = VerifyChain(chain, roots, Cluster{}, id, x509.ExtKeyUsageServerAuth, now)
@@ -269,7 +307,7 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 			require.NoError(t, err)
 			peer, err := NewPeerID(e.IPv4, e.IPv6)
 			require.NoError(t, err)
-			_, err = VerifyChain([]*x509.Certificate{external, inter}, roots, cluster, peer, x509.ExtKeyUsageServerAuth, now)
+			_, err = VerifyChain([]*x509.Certificate{external, inter, region}, roots, cluster, peer, x509.ExtKeyUsageServerAuth, now)
 			require.Error(t, err)
 		})
 	}

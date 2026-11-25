@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
@@ -24,6 +25,28 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create CA: %w", err)
 	}
+	root := issuer.Chain[0]
+	siteKey, err := pki.GenerateKey("ed25519")
+	if err != nil {
+		return err
+	}
+	siteCSR, err := pki.CreateCSR(siteKey, pkix.Name{CommonName: "Demo site"})
+	if err != nil {
+		return err
+	}
+	approved, err := x509.MarshalPKIXPublicKey(siteKey.Public())
+	if err != nil {
+		return err
+	}
+	site, err := issuer.IssueCA(siteCSR, pki.CAProfile{
+		Subject: siteCSR.Subject, NotBefore: root.NotBefore, NotAfter: root.NotAfter,
+		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/27"), netip.MustParsePrefix("fd13::/120")},
+		Scope:        &pki.Scope{Network: "demo"},
+	}, sha256.Sum256(approved))
+	if err != nil {
+		return err
+	}
+	siteIssuer := pki.Issuer{Chain: []*x509.Certificate{site, root}, Signer: siteKey}
 	key, err := pki.GenerateKey("ed25519")
 	if err != nil {
 		return err
@@ -42,18 +65,18 @@ func run() error {
 		return err
 	}
 	enrollment.Name = "alice"
-	leaf, err := issuer.IssueLeaf(csr, enrollment)
+	leaf, err := siteIssuer.IssueLeaf(csr, enrollment)
 	if err != nil {
 		return fmt.Errorf("issue leaf: %w", err)
 	}
 
 	roots := x509.NewCertPool()
-	roots.AddCert(issuer.Chain[0])
-	cluster, err := pki.ReadClusterCA(issuer.Chain[0])
+	roots.AddCert(root)
+	cluster, err := pki.ReadClusterCA(root)
 	if err != nil {
 		return err
 	}
-	_, err = pki.VerifyChain([]*x509.Certificate{leaf}, roots, cluster, id, x509.ExtKeyUsageServerAuth, time.Now())
+	_, err = pki.VerifyChain([]*x509.Certificate{leaf, site}, roots, cluster, id, x509.ExtKeyUsageServerAuth, time.Now())
 	if err != nil {
 		return fmt.Errorf("verify server identity: %w", err)
 	}

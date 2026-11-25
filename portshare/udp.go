@@ -29,7 +29,8 @@ const (
 )
 
 // UDP owns a physical packet socket. Its two branches share the local address
-// and preserve each datagram's payload, boundary and source.
+// and preserve each datagram's payload, boundary and source. A terminal read
+// error on the physical socket is reported on both open branches.
 type UDP struct {
 	raw       net.PacketConn
 	mesh      *meshSocket
@@ -80,7 +81,12 @@ func NewUDP(socket net.PacketConn) *UDP {
 		}
 	}
 	p.mesh, p.other = &meshSocket{branch()}, branch()
-	go p.read()
+	go func() {
+		err := p.read()
+		p.mesh.shutdown(err)
+		p.other.shutdown(err)
+		close(p.stopped)
+	}()
 	return p
 }
 
@@ -94,6 +100,8 @@ func (p *UDP) Other() net.PacketConn { return p.other }
 // Close closes the physical socket and releases both branches.
 func (p *UDP) Close() error {
 	p.once.Do(func() {
+		p.mesh.Close()
+		p.other.Close()
 		p.err = p.raw.Close()
 		<-p.stopped
 	})
@@ -123,25 +131,27 @@ func (p *UDP) ownsCID(cid []byte) bool {
 	return hmac.Equal(cid[nonceLen:], p.readMAC.Sum(p.digest[:0])[:meshCIDLen-nonceLen])
 }
 
-func (p *UDP) read() {
-	defer close(p.stopped)
-	defer p.mesh.Close()
-	defer p.other.Close()
+func (p *UDP) read() error {
 	defer clear(p.pending)
 	defer clear(p.routes)
 	buf := make([]byte, 65535)
 	var sweep time.Time
 	if err := p.raw.SetReadDeadline(sweep); err != nil {
-		return
+		return err
 	}
 	for {
 		if sweep.IsZero() && (len(p.pending) != 0 || len(p.routes) != 0) {
 			sweep = time.Now().Add(time.Second)
 			if err := p.raw.SetReadDeadline(sweep); err != nil {
-				return
+				return err
 			}
 		}
 		n, from, err := p.raw.ReadFrom(buf)
+		if err != nil {
+			if timeout, ok := errors.AsType[net.Error](err); !ok || !timeout.Timeout() {
+				return err
+			}
+		}
 		now := time.Now()
 		if !sweep.IsZero() && !now.Before(sweep) {
 			for k, f := range p.pending {
@@ -156,14 +166,11 @@ func (p *UDP) read() {
 			}
 			sweep = time.Time{}
 			if e := p.raw.SetReadDeadline(sweep); e != nil {
-				return
+				return e
 			}
 		}
 		if err != nil {
-			if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
-				continue
-			}
-			return
+			continue
 		}
 		p.route(datagram{bytes.Clone(buf[:n]), from}, now)
 	}

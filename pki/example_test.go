@@ -17,7 +17,7 @@ func ExampleVerifyObjectSignature() {
 		panic(err)
 	}
 	// The receiving application pins the cluster CA and approves this publisher.
-	cluster, err := pki.ReadClusterCA(opts[0].ClusterCA)
+	cluster, err := pki.ReadClusterCA(opts[0].Auth.ClusterCA)
 	if err != nil {
 		panic(err)
 	}
@@ -25,7 +25,7 @@ func ExampleVerifyObjectSignature() {
 	if err != nil {
 		panic(err)
 	}
-	report, cert := []byte("ready"), opts[0].Certificates.Client
+	report, cert := []byte("ready"), opts[0].Auth.Certificates.Client
 	// Check the envelope against the wire budget before asking the signer to sign.
 	if err := pki.CheckObjectSize(cluster.Network(), "report", report, cert); err != nil {
 		panic(err)
@@ -40,7 +40,7 @@ func ExampleVerifyObjectSignature() {
 	}
 	// Authorize reports only from the configured publisher. Use the content
 	// after its signing chain, EKU and exact identity have been verified.
-	_, err = pki.VerifyChain(chain, opts[0].Roots, cluster, publisher, x509.ExtKeyUsageCodeSigning, time.Now())
+	_, err = pki.VerifyChain(chain, opts[0].Auth.Roots, cluster, publisher, x509.ExtKeyUsageCodeSigning, time.Now())
 	if err != nil {
 		panic(err)
 	}

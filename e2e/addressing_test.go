@@ -1,6 +1,9 @@
 package e2e_test
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"net"
 	"net/netip"
 	"slices"
@@ -9,8 +12,10 @@ import (
 	"time"
 
 	"code.d7z.net/d7z-team/nebula"
+	"code.d7z.net/d7z-team/nebula/pki"
 
 	"github.com/stretchr/testify/require"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -30,8 +35,23 @@ func TestGroupDatagrams(t *testing.T) {
 	l.top.Members[r.index].Transit = true
 	l.top.EnableBroadcast, l.top.EnableMulticast = true, true
 	l.top.Members[b.index].MulticastGroups = []netip.Addr{netip.MustParseAddr("239.1.2.3"), netip.MustParseAddr("ff02::123")}
+	// Independent site issuers contribute addresses to the same logical link.
+	for _, h := range []*host{a, b} {
+		key, err := pki.GenerateKey("ed25519")
+		require.NoError(t, err)
+		csr, err := pki.CreateCSR(key, pkix.Name{CommonName: h.ip.String()})
+		require.NoError(t, err)
+		root := l.issuer.Chain[0]
+		m := l.top.Members[h.index]
+		site, err := l.issuer.IssueCA(csr, pki.CAProfile{
+			Subject: csr.Subject, NotBefore: root.NotBefore, NotAfter: root.NotAfter,
+			PermittedIPs: []netip.Prefix{netip.PrefixFrom(m.IPv4, 31).Masked(), netip.PrefixFrom(m.IPv6, 127).Masked()},
+		}, sha256.Sum256(csr.RawSubjectPublicKeyInfo))
+		require.NoError(t, err)
+		h.options.Auth.Certificates = issueCredentials(t, pki.Issuer{Chain: []*x509.Certificate{site, root}, Signer: key}, m, "ed25519")
+	}
 	l.start()
-	require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.RelayOnly))
+	require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.RelayOnly))
 	l.connect(a, b, "relay")
 	sender, receiver := l.business(a), l.business(b)
 	for i, dst := range []string{"255.255.255.255", "10.13.0.255", "239.1.2.3", "ff02::123", "ff02::1"} {
@@ -71,7 +91,7 @@ func TestAnycastService(t *testing.T) {
 	l := newLab(t)
 	client := l.host("wan", "192.0.2.1", "", "udp", true)
 	servers := []*host{l.host("wan", "192.0.2.2", "", "udp", true), l.host("wan", "192.0.2.3", "", "udp", true)}
-	vips := []netip.Addr{netip.MustParseAddr("10.13.0.200"), netip.MustParseAddr("fd42::c8")}
+	vips := []netip.Addr{netip.MustParseAddr("192.0.2.200"), netip.MustParseAddr("fd42::c8")}
 	for _, h := range servers {
 		l.top.Members[h.index].AnycastIPs = vips
 	}
@@ -84,6 +104,7 @@ func TestAnycastService(t *testing.T) {
 	}
 	l.start()
 	clientStack := l.business(client)
+	clientStack.SetRouteTable(append(clientStack.GetRouteTable(), route("192.0.2.200/32", "", 1)))
 	backends := []*stack.Stack{l.business(servers[0]), l.business(servers[1])}
 	for i, vip := range vips {
 		proto := ipv4.ProtocolNumber
@@ -153,8 +174,65 @@ func TestAnycastTCPPathChange(t *testing.T) {
 	c, s := tcpPair(t, l.business(client), l.business(instance), vip.String(), ipv4.ProtocolNumber)
 	roundTrip(t, c, s)
 	require.Eventually(t, direct.Load, time.Second, time.Millisecond)
-	require.NoError(t, client.node.SetPeerPathPolicy(instance.ip, nebula.RelayOnly))
+	require.NoError(t, client.node.SetPeerPathPolicy(instance.node.ID(), nebula.RelayOnly))
 	l.connect(client, instance, "relay")
 	roundTrip(t, c, s)
 	require.Eventually(t, relayed.Load, time.Second, time.Millisecond)
+}
+
+func TestRelayTCPWithDuplicateInstance(t *testing.T) {
+	l := newLab(t)
+	client := l.host("west", "192.0.2.1", "", "udp", true)
+	relay := l.host("west", "192.0.2.2", "", "udp", true)
+	l.addUnderlay(relay, "east", "2001:db8::2", "", "udp", true)
+	server := l.host("east", "2001:db8::3", "", "udp", true)
+	l.link(client, relay)
+	l.link(relay, server)
+	l.top.Members[relay.index].Transit = true
+	duplicate := &host{index: server.index, ip: server.ip, options: nebula.Options{Auth: nebula.AuthOptions{Roots: l.roots, ClusterCA: l.issuer.Chain[0]}}}
+	l.addUnderlay(duplicate, "west", "192.0.2.4", "", "udp", false)
+	l.start()
+	l.connect(client, server, "relay")
+	clientStack := l.business(client)
+	c, s := tcpPair(t, clientStack, l.business(server), server.ip.String(), ipv4.ProtocolNumber)
+	other, r := tcpPair(t, clientStack, l.business(relay), relay.ip.String(), ipv4.ProtocolNumber)
+	roundTrip(t, c, s)
+	duplicate.options.Topology = l.top
+	duplicate.options.Auth.Certificates = server.options.Auth.Certificates
+	var err error
+	duplicate.node, err = nebula.New(t.Context(), duplicate.options)
+	require.NoError(t, err)
+	t.Cleanup(func() { duplicate.node.Close() })
+	var misdelivered atomic.Int32
+	_, err = duplicate.node.OpenIPPort(nebula.IPPortOptions{Deliver: func(nebula.PeerID, []byte) { misdelivered.Add(1) }})
+	require.NoError(t, err)
+	require.NoError(t, duplicate.node.Start())
+	ep := nebula.Endpoint{Network: "udp", Address: netip.AddrPortFrom(netip.MustParseAddr("192.0.2.4"), meshPort)}
+	_, err = client.node.ConnectEndpoint(t.Context(), ep)
+	require.ErrorIs(t, err, nebula.ErrInstanceConflict)
+	require.Eventually(t, func() bool {
+		return slices.ContainsFunc(client.node.InspectIP(server.ip), func(o nebula.IPObservation) bool {
+			return o.Source == "conflict" && o.Decision == "held out" && o.Instance == duplicate.node.ControlStatus().Instance
+		})
+	}, 4*time.Second, 10*time.Millisecond)
+	roundTrip(t, c, s)
+	roundTrip(t, other, r)
+	require.Zero(t, misdelivered.Load())
+	p, ok := client.node.PreferredPath(server.node.ID())
+	require.True(t, ok)
+	require.Equal(t, server.node.ControlStatus().Instance, p.Instance)
+	require.NoError(t, server.node.Close())
+	require.Eventually(t, func() bool {
+		_, ok := client.node.PreferredPath(server.node.ID())
+		return !ok
+	}, 4*time.Second, 10*time.Millisecond)
+	holds := client.node.InstanceConflicts()
+	require.Len(t, holds, 1)
+	require.Equal(t, server.node.ID(), holds[0].Peer)
+	raw := make([]byte, 20)
+	raw[0], raw[3], raw[8], raw[9] = 0x45, 20, 64, 253
+	copy(raw[12:16], client.ip.AsSlice())
+	copy(raw[16:20], server.ip.AsSlice())
+	require.IsType(t, &tcpip.ErrNotPermitted{}, clientStack.WriteRawPacket(1, ipv4.ProtocolNumber, buffer.MakeWithData(raw)))
+	roundTrip(t, other, r)
 }

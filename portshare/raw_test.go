@@ -211,6 +211,9 @@ func TestUDPBranchDeadlines(t *testing.T) {
 	go func() { _, _, err := p.Other().ReadFrom(buf); read <- err }()
 	require.NoError(t, p.Other().SetReadDeadline(time.Now()))
 	require.ErrorIs(t, wait(read), os.ErrDeadlineExceeded)
+	require.NoError(t, p.Close())
+	_, _, err = p.Other().ReadFrom(buf)
+	require.ErrorIs(t, err, net.ErrClosed)
 }
 
 func TestUDPByteReplay(t *testing.T) {

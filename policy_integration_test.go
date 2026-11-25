@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"sync/atomic"
@@ -25,7 +26,7 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	f.cfg.Members[0].BytesPerSecond = 1
 	var denied atomic.Bool
-	f.opts[0].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+	f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		if denied.Load() && !c.Local {
 			return time.Time{}, errors.New("peer withdrawn")
 		}
@@ -88,13 +89,13 @@ func TestClearPendingByPeer(t *testing.T) {
 func TestLiveCertificateExpiry(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	o := &f.opts[1]
-	existing, err := x509.ParseCertificate(o.Certificates.Client.Certificate[0])
+	existing, err := x509.ParseCertificate(o.Auth.Certificates.Client.Certificate[0])
 	require.NoError(t, err)
 	existing.ExtraExtensions = existing.Extensions
 	existing.NotAfter = time.Now().Truncate(time.Second).Add(2 * time.Second)
 	der, err := x509.CreateCertificate(rand.Reader, existing, f.ca, existing.PublicKey, f.key)
 	require.NoError(t, err)
-	o.Certificates.Client = tls.Certificate{Certificate: [][]byte{der}, PrivateKey: o.Certificates.Client.PrivateKey}
+	o.Auth.Certificates.Client = tls.Certificate{Certificate: [][]byte{der}, PrivateKey: o.Auth.Certificates.Client.PrivateKey}
 	f.start()
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
 	fresh := f.issue(labPeer(f.ips[1]), pki.Scope{})
@@ -119,10 +120,10 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 		return tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: key}
 	}
 	creds := LocalCertificates{Client: issue(x509.ExtKeyUsageClientAuth), Server: issue(x509.ExtKeyUsageServerAuth), Object: issue(x509.ExtKeyUsageCodeSigning)}
-	f.opts[0].Certificates = creds
+	f.opts[0].Auth.Certificates = creds
 	var deny atomic.Bool
 	var node atomic.Pointer[Node]
-	f.opts[1].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+	f.opts[1].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		if n := node.Load(); n != nil {
 			_ = n.Paths()
 		} // host callbacks may query live state
@@ -161,8 +162,8 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	wrong.Object = creds.Client
 	require.Error(t, x.ReloadCertificates(t.Context(), wrong))
 	untrusted := newFixture(t, "tcp", "tcp")
-	f.opts[0].Roots.AddCert(untrusted.ca)
-	require.Error(t, y.ReloadCertificates(t.Context(), untrusted.opts[1].Certificates))
+	f.opts[0].Auth.Roots.AddCert(untrusted.ca)
+	require.Error(t, y.ReloadCertificates(t.Context(), untrusted.opts[1].Auth.Certificates))
 	require.Error(t, x.ReloadCertificates(t.Context(), LocalCertificates{Client: creds.Server, Server: creds.Server, Object: creds.Object}))
 }
 
@@ -177,7 +178,7 @@ func TestConcurrentTopologyAndCredentialUpdates(t *testing.T) {
 	seed.Members = slices.Delete(seed.Members, 2, 3)
 	updates := []func() error{
 		func() error { return n.ApplyTopology(t.Context(), seed) },
-		func() error { return n.ReloadCertificates(t.Context(), f.opts[0].Certificates) },
+		func() error { return n.ReloadCertificates(t.Context(), f.opts[0].Auth.Certificates) },
 		func() error { return n.Revalidate(t.Context()) },
 	}
 	errs := make(chan error, len(updates))
@@ -208,10 +209,13 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	local.Members = slices.Clone(f.cfg.Members)
 	local.Members = slices.Delete(local.Members, 2, 3)
 	require.NoError(t, local.Validate(f.cluster))
-	deadline := time.Now().Add(time.Hour)
+	deadline := time.Now().Add(15 * time.Minute)
 	var limit atomic.Pointer[time.Time]
 	limit.Store(&deadline)
-	f.opts[0].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+	f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+		if c.Local && c.Usage == x509.ExtKeyUsageCodeSigning {
+			return deadline, nil
+		}
 		if !c.Local && c.Usage != x509.ExtKeyUsageCodeSigning {
 			return *limit.Load(), nil
 		}
@@ -230,6 +234,10 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 		status := n.ControlStatus()
 		require.True(t, status.Ready)
 		require.False(t, status.Started)
+		if i == 0 {
+			require.Equal(t, deadline, status.AuthorizedUntil)
+			require.True(t, status.CertificateExpires.After(status.AuthorizedUntil))
+		}
 		require.NoError(t, n.Start())
 	}
 	n := f.nodes[0]
@@ -237,18 +245,18 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	require.ErrorIs(t, n.ConnectPeer(t.Context(), third), ErrPeerUnavailable)
 	// Caller-owned maps and slices may be reused after ApplyTopology.
 	m := local.Members[0]
-	m.Topics[0] = "app/changed"
-	require.Equal(t, "app/test", n.policy.Load().members[labPeer(a)].Topics[0])
+	m.PublishTopics[0] = "app/changed"
+	require.Equal(t, "app/test", n.policy.Load().members[labPeer(a)].PublishTopics[0])
 	// Preflight and installation report the same conflicting address. The
 	// installed view still admits the peer after the failed update.
-	conflict, err := pki.NewPeerID(b, labPeer(a).IPv6())
+	conflict, err := pki.NewPeerID(b, labPeer(third).IPv6())
 	require.NoError(t, err)
 	m.IPv4 = conflict.IPv4()
 	m.IPv6 = conflict.IPv6()
 	local.Members = append(local.Members, m)
-	err = local.Validate(f.cluster)
-	require.Error(t, err)
-	require.EqualError(t, n.ApplyTopology(t.Context(), local), err.Error())
+	want := fmt.Sprintf("duplicate primary address %s: %s and %s", b, labPeer(b), conflict)
+	require.EqualError(t, local.Validate(f.cluster), want)
+	require.EqualError(t, n.ApplyTopology(t.Context(), local), want)
 	require.NoError(t, n.ConnectPeer(t.Context(), b))
 	require.NoError(t, n.ApplyTopology(t.Context(), f.cfg))
 	require.NoError(t, n.ConnectPeer(t.Context(), third))
@@ -301,7 +309,7 @@ func TestPeerNameAndTLSAdmission(t *testing.T) {
 			cfg := a.tlsConfig(b.id, false)
 			change(cfg)
 			d := tls.Dialer{Config: cfg}
-			c, err := d.DialContext(t.Context(), "tcp", b.o.TCP4.Addr().String())
+			c, err := d.DialContext(t.Context(), "tcp", b.o.Transport.TCP4.Addr().String())
 			if c != nil {
 				c.Close()
 			}
@@ -330,9 +338,9 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	require.NoError(t, <-done)
 	require.Len(t, a.Paths(), 1)
 	require.Equal(t, b.id, a.Paths()[0].Peer)
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv6(), Blocked))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, Blocked))
 	require.ErrorIs(t, a.ConnectPeer(t.Context(), b.id.IPv4()), ErrPathPolicy)
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), Auto))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, Auto))
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv6()))
 	next, err := pki.NewPeerID(b.id.IPv4(), netip.MustParseAddr("fd42::99"))
 	require.NoError(t, err)
@@ -354,6 +362,16 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	owner, ok := a.LookupPeer(b.id.IPv4())
 	require.True(t, ok)
 	require.Equal(t, next, owner)
+	// Both identities share an IPv4 address. Editing the old binding must
+	// leave the replacement's configuration independent.
+	require.NoError(t, a.SetPeerPathPolicy(b.id, DirectOnly))
+	configured, effective := a.PeerPathPolicy(b.id)
+	require.Equal(t, DirectOnly, configured)
+	require.Equal(t, Blocked, effective)
+	configured, effective = a.PeerPathPolicy(next)
+	require.Equal(t, Auto, configured)
+	require.Equal(t, Auto, effective)
+	require.NoError(t, a.SetPeerPathPolicy(b.id, Auto))
 	require.ErrorIs(t, a.ConnectPeerID(t.Context(), b.id), ErrPathPolicy)
 	require.ErrorIs(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), next.IPv4(), "stale binding")), ErrPeerUnavailable)
 	require.Error(t, a.ConnectPeer(t.Context(), next.IPv4()))
@@ -365,7 +383,7 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	aIP, bIP := f.ips[0], f.ips[1]
 	id := labPeer(bIP)
 	f.cfg.Members[1].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("192.0.0.0/16")}
-	f.opts[1].Certificates.Client = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
+	f.opts[1].Auth.Certificates.Client = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), id.IPv6()))
@@ -395,8 +413,8 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writeFrame(stream, denied))
 	require.Eventually(t, func() bool { return sink.Stats().RejectedInbound == 1 }, time.Second, time.Millisecond)
-	require.NoError(t, a.SetPeerPathPolicy(bIP, Blocked))
-	require.NoError(t, a.SetPeerPathPolicy(id.IPv6(), Auto))
+	require.NoError(t, a.SetPeerPathPolicy(id, Blocked))
+	require.NoError(t, a.SetPeerPathPolicy(id, Auto))
 	require.NoError(t, a.ConnectPeer(t.Context(), id.IPv6()))
 	require.NoError(t, out.WriteIP(labPeer(bIP), denied))
 	select {

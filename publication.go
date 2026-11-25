@@ -139,7 +139,7 @@ func (n *Node) verifyPublication(ctx context.Context, p *topologyView, record st
 		!ValidTopic(e.Topic) || len(e.Nonce) != 32 || !now.Before(e.Expires) || e.Expires.After(now.Add(publicationLifetime+time.Second)) {
 		return DeliveredPublication{}, time.Time{}, errors.New("invalid publication")
 	}
-	if !slices.ContainsFunc(p.members[origin].Topics, func(prefix string) bool {
+	if !slices.ContainsFunc(p.members[origin].PublishTopics, func(prefix string) bool {
 		return e.Topic == prefix || strings.HasPrefix(e.Topic, prefix+"/")
 	}) {
 		return DeliveredPublication{}, time.Time{}, ErrPathPolicy

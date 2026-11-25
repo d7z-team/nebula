@@ -17,8 +17,11 @@ type Endpoint struct {
 	Address netip.AddrPort `json:"address"`
 }
 
+// Valid reports whether e identifies a physical TCP or UDP peer at a nonzero port.
 func (e Endpoint) Valid() bool {
-	return (e.Network == "udp" || e.Network == "tcp") && e.Address.IsValid() && e.Address.Port() != 0 && !e.Address.Addr().IsUnspecified() && !e.Address.Addr().IsMulticast() && !e.Address.Addr().Is4In6()
+	ip := e.Address.Addr()
+	return (e.Network == "udp" || e.Network == "tcp") && e.Address.Port() != 0 &&
+		ip.IsValid() && !ip.IsUnspecified() && !ip.IsMulticast() && !ip.Is4In6() && ip != limitedBroadcast
 }
 
 // PeerID identifies a member by its two certified overlay addresses.
@@ -33,20 +36,24 @@ type Member struct {
 	// Endpoints lists physical addresses outside the member subnets and anycast
 	// pools. A member that dials its neighbors can serve as a hop with an empty list.
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
-	// RoutedPrefixes enables downstream prefixes within the session certificate's authority.
+	// Restricted limits direct connections to the neighbors in Links.
+	Restricted bool `json:"restricted,omitempty"`
+	// Transit authorizes this member to relay mesh circuits.
+	Transit bool `json:"transit,omitempty"`
+
+	// RoutedPrefixes permits this gateway to send and receive downstream traffic
+	// within its certificate grants. The host selects the next hop, including for default routes.
 	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
 	// AnycastIPs permits this member to carry the listed service addresses.
 	AnycastIPs []netip.Addr `json:"anycastIPs,omitempty"`
 	// MulticastGroups subscribes this member to exact multicast destinations.
 	MulticastGroups []netip.Addr `json:"multicastGroups,omitempty"`
-	// Transit authorizes this member to relay mesh circuits.
-	Transit bool `json:"transit,omitempty"`
-	// Restricted limits direct connections to the neighbors in Links.
-	Restricted bool `json:"restricted,omitempty"`
-	// BytesPerSecond shapes this member's total outbound application bytes. Zero is unlimited.
+	// BytesPerSecond is the total outbound application byte rate enforced by
+	// this member on its own node. Zero is unlimited.
 	BytesPerSecond int `json:"bytesPerSecond,omitempty"`
-	// Topics grants publication on each topic and its descendants.
-	Topics []string `json:"topics,omitempty"`
+	// PublishTopics grants publication on each topic and its descendants.
+	// Forwarding neighbors can read publications regardless of subscriptions.
+	PublishTopics []string `json:"publishTopics,omitempty"`
 }
 
 // Clone returns an independent copy of the member's routing and application grants.
@@ -56,7 +63,7 @@ func (m Member) Clone() Member {
 	m.RoutedPrefixes = slices.Clone(m.RoutedPrefixes)
 	m.AnycastIPs = slices.Clone(m.AnycastIPs)
 	m.MulticastGroups = slices.Clone(m.MulticastGroups)
-	m.Topics = slices.Clone(m.Topics)
+	m.PublishTopics = slices.Clone(m.PublishTopics)
 	return m
 }
 
@@ -71,10 +78,10 @@ type Topology struct {
 type topologyView struct {
 	cluster              pki.Cluster
 	broadcast, multicast bool
-	subnets              map[netip.Prefix][]PeerID
-	directed             map[netip.Addr]netip.Prefix
+	allMembers           []PeerID
+	directedBroadcast    netip.Addr
 	instances            map[netip.Addr][]PeerID
-	groups               map[multicastGroup][]PeerID
+	groups               map[netip.Addr][]PeerID
 	members              map[PeerID]Member
 	owners               map[netip.Addr]PeerID
 	endpointOwners       map[Endpoint][]PeerID
@@ -85,16 +92,10 @@ func (c *topologyView) physicalEndpoint(ep Endpoint) bool {
 	return ep.Valid() && !c.cluster.Subnet(ip).IsValid() && !c.cluster.InAnycastPool(ip)
 }
 
-type multicastGroup struct {
-	addr netip.Addr
-	link netip.Prefix
-}
-
 var (
 	limitedBroadcast = netip.MustParseAddr("255.255.255.255")
 	allHosts         = netip.MustParseAddr("224.0.0.1")
 	allNodes         = netip.MustParseAddr("ff02::1")
-	localGroups      = netip.MustParsePrefix("224.0.0.0/24")
 )
 
 func validGroup(a netip.Addr) bool {
@@ -108,31 +109,14 @@ func validGroup(a netip.Addr) bool {
 	return true
 }
 
-func (s *topologyView) memberSubnet(peer PeerID, a netip.Addr) netip.Prefix {
-	if a.Is4() {
-		return s.cluster.Subnet(peer.IPv4())
-	}
-	return s.cluster.Subnet(peer.IPv6())
-}
-
-func (s *topologyView) groupKey(peer PeerID, a netip.Addr) multicastGroup {
-	k := multicastGroup{addr: a}
-	if localGroups.Contains(a) || a.Is6() && a.As16()[1]&15 == 2 {
-		k.link = s.memberSubnet(peer, a)
-	}
-	return k
-}
-
 // groupRecipients classifies group addresses even when distribution is disabled.
-func (s *topologyView) groupRecipients(from PeerID, dst netip.Addr) ([]PeerID, bool, error) {
-	subnet, directed := s.directed[dst]
+func (s *topologyView) groupRecipients(dst netip.Addr) ([]PeerID, bool, error) {
 	switch {
-	case dst == limitedBroadcast || directed:
-		link := s.memberSubnet(from, dst)
-		if !s.broadcast || directed && subnet != link {
+	case dst == limitedBroadcast || dst == s.directedBroadcast && dst.IsValid():
+		if !s.broadcast {
 			return nil, true, ErrPathPolicy
 		}
-		return s.subnets[link], true, nil
+		return s.allMembers, true, nil
 	case dst.IsMulticast():
 		if !s.multicast || !validGroup(dst) {
 			return nil, true, ErrPathPolicy
@@ -141,9 +125,9 @@ func (s *topologyView) groupRecipients(from PeerID, dst netip.Addr) ([]PeerID, b
 			return nil, true, nil
 		}
 		if dst == allHosts || dst == allNodes {
-			return s.subnets[s.memberSubnet(from, dst)], true, nil
+			return s.allMembers, true, nil
 		}
-		return s.groups[s.groupKey(from, dst)], true, nil
+		return s.groups[dst], true, nil
 	default:
 		return nil, false, nil
 	}
@@ -162,16 +146,12 @@ func (c Topology) compile(cluster pki.Cluster) (*topologyView, error) {
 	if !pki.ValidName(c.Network) || c.Network != cluster.Network() || len(c.Members) == 0 {
 		return nil, errors.New("cluster network and members required")
 	}
+	v4, _ := cluster.MemberPrefixes()
 	s := &topologyView{
 		cluster: cluster, broadcast: c.EnableBroadcast, multicast: c.EnableMulticast,
-		subnets: make(map[netip.Prefix][]PeerID), directed: make(map[netip.Addr]netip.Prefix),
-		instances: make(map[netip.Addr][]PeerID), groups: make(map[multicastGroup][]PeerID), members: make(map[PeerID]Member, len(c.Members)),
+		directedBroadcast: pki.Broadcast(v4), allMembers: make([]PeerID, 0, len(c.Members)),
+		instances: make(map[netip.Addr][]PeerID), groups: make(map[netip.Addr][]PeerID), members: make(map[PeerID]Member, len(c.Members)),
 		owners: make(map[netip.Addr]PeerID), endpointOwners: make(map[Endpoint][]PeerID),
-	}
-	for _, subnet := range cluster.Subnets() {
-		if a := pki.Broadcast(subnet); a.IsValid() {
-			s.directed[a] = subnet
-		}
 	}
 	for _, m := range c.Members {
 		if err := s.indexMember(m); err != nil {
@@ -188,9 +168,7 @@ func (c Topology) compile(cluster pki.Cluster) (*topologyView, error) {
 	for _, peers := range s.groups {
 		slices.SortFunc(peers, comparePeer)
 	}
-	for _, peers := range s.subnets {
-		slices.SortFunc(peers, comparePeer)
-	}
+	slices.SortFunc(s.allMembers, comparePeer)
 	return s, nil
 }
 
@@ -210,18 +188,16 @@ func (s *topologyView) indexMember(m Member) error {
 			return fmt.Errorf("invalid routed prefix %s", p)
 		}
 	}
-	for _, topic := range m.Topics {
+	for _, topic := range m.PublishTopics {
 		if !ValidTopic(topic) {
 			return fmt.Errorf("invalid topic %q", topic)
 		}
 	}
 	for _, ip := range []netip.Addr{m.IPv4, m.IPv6} {
-		if _, exists := s.owners[ip]; exists {
-			return fmt.Errorf("duplicate address %s", ip)
+		if owner, exists := s.owners[ip]; exists {
+			return fmt.Errorf("duplicate primary address %s: %s and %s", ip, owner, id)
 		}
 		s.owners[ip] = id
-		subnet := s.cluster.Subnet(ip)
-		s.subnets[subnet] = append(s.subnets[subnet], id)
 	}
 	for _, ep := range m.Endpoints {
 		if !s.physicalEndpoint(ep) {
@@ -249,9 +225,9 @@ func (s *topologyView) indexMember(m Member) error {
 		if !validGroup(group) {
 			return fmt.Errorf("invalid multicast group %s", group)
 		}
-		key := s.groupKey(id, group)
-		s.groups[key] = append(s.groups[key], id)
+		s.groups[group] = append(s.groups[group], id)
 	}
+	s.allMembers = append(s.allMembers, id)
 	s.members[id] = m
 	return nil
 }
@@ -266,7 +242,8 @@ func (s *topologyView) acceptsIdentity(id PeerID) bool {
 	return true
 }
 
-// LookupPeer returns the configured or authenticated owner of a primary address from local state.
+// LookupPeer returns the local binding for a primary address. A confirmed instance
+// conflict retains this binding even after the last usable path closes.
 func (n *Node) LookupPeer(primary netip.Addr) (PeerID, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -290,6 +267,13 @@ func (n *Node) ownerLocked(addr netip.Addr) PeerID {
 	}
 	if !p.cluster.Subnet(addr).IsValid() {
 		return PeerID{}
+	}
+	// A confirmed dispute keeps both primaries bound even after cache expiry
+	// and loss of the incumbent's last path.
+	for peer, conflict := range n.conflicts {
+		if !conflict.confirmedAt.IsZero() && (peer.IPv4() == addr || peer.IPv6() == addr) {
+			return peer
+		}
 	}
 	if id, ok := n.discoveredOwners[addr]; ok && time.Now().Before(n.discovered[id].authorizedUntil) {
 		return id

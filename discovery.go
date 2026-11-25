@@ -63,21 +63,6 @@ func (n *Node) endpointsLocked(peer PeerID) []Endpoint {
 	})
 }
 
-func (n *Node) observedEndpoints(now time.Time) []Endpoint {
-	n.mu.Lock()
-	eps := make([]Endpoint, 0, len(n.observations))
-	for observer, entry := range n.observations {
-		if now.Before(entry.expires) {
-			eps = append(eps, Endpoint{"udp", entry.endpoint})
-		} else {
-			delete(n.observations, observer)
-		}
-	}
-	n.mu.Unlock()
-	slices.SortFunc(eps, func(a, b Endpoint) int { return a.Address.Compare(b.Address) })
-	return eps
-}
-
 func (n *Node) receiveAdvert(s *session, a advert) {
 	p := n.policy.Load()
 	if !n.memberOf(p) {
@@ -87,7 +72,7 @@ func (n *Node) receiveAdvert(s *session, a advert) {
 	if len(a.Record) > 0 {
 		n.learnIntroduction(n.ctx, a.Record, nil)
 	}
-	if !n.o.HideEndpoints && s.q != nil && p.physicalEndpoint(Endpoint{"udp", a.Observed}) {
+	if !n.o.Transport.HideEndpoints && s.q != nil && p.physicalEndpoint(Endpoint{"udp", a.Observed}) {
 		n.mu.Lock()
 		if p == n.policy.Load() && n.usableLocked(s) {
 			n.observations[observer{s.peer, a.Observed.Addr().Is6()}] = observation{a.Observed, time.Now().Add(time.Minute)}
@@ -100,7 +85,7 @@ func (n *Node) receiveAdvert(s *session, a advert) {
 func (n *Node) rendezvous(ctx context.Context, target PeerID) bool {
 	ctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
 	defer cancel()
-	if n.runLookup(ctx, target.IPv4(), &target) {
+	if len(n.runLookup(ctx, target.IPv4(), &target)) > 0 {
 		n.punch(target)
 		return true
 	}

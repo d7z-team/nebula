@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -16,9 +17,15 @@ import (
 	"code.d7z.net/d7z-team/nebula/pki"
 )
 
-const maxIntroductionEndpoints = 16
+const (
+	maxIntroductionEndpoints = 16
+	introductionLifetime     = time.Minute
+	introductionRefreshLead  = 10 * time.Second
+	introductionClockSkew    = 5 * time.Second
+)
 
 type introduction struct {
+	Instance       InstanceID     `json:"instance"`
 	Endpoints      []Endpoint     `json:"endpoints"`
 	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
 	Expires        time.Time      `json:"expires"`
@@ -26,8 +33,10 @@ type introduction struct {
 
 type learnedIntroduction struct {
 	introduction
-	record          statement
-	authorizedUntil time.Time
+	record              statement
+	authorizedUntil     time.Time
+	fingerprint         [sha256.Size]byte
+	firstSeen, lastSeen time.Time
 }
 
 type cachedIntroduction struct {
@@ -39,8 +48,8 @@ type cachedIntroduction struct {
 }
 
 // Keep configured endpoints ahead of listener addresses and optional observations.
-func (n *Node) introductionEndpoints(p *topologyView, observed []Endpoint) ([]Endpoint, int) {
-	if n.o.HideEndpoints {
+func (n *Node) introductionEndpoints(p *topologyView, includeObserved bool) ([]Endpoint, int) {
+	if n.o.Transport.HideEndpoints {
 		return nil, 0
 	}
 	var endpoints []Endpoint
@@ -54,25 +63,40 @@ func (n *Node) introductionEndpoints(p *topologyView, observed []Endpoint) ([]En
 			}
 		}
 	}
-	add(n.o.AdvertiseEndpoints...)
+	add(n.o.Transport.AdvertiseEndpoints...)
 	add(p.members[n.id].Endpoints...)
-	for _, pc := range []net.PacketConn{n.o.UDP4, n.o.UDP6} {
+	for _, pc := range []net.PacketConn{n.o.Transport.UDP4, n.o.Transport.UDP6} {
 		if pc != nil {
 			add(Endpoint{"udp", addrPort(pc.LocalAddr())})
 		}
 	}
-	for _, l := range []net.Listener{n.o.TCP4, n.o.TCP6} {
+	for _, l := range []net.Listener{n.o.Transport.TCP4, n.o.Transport.TCP6} {
 		if l != nil {
 			add(Endpoint{"tcp", addrPort(l.Addr())})
 		}
 	}
 	fixed := len(endpoints)
+	if !includeObserved {
+		return endpoints, fixed
+	}
+	var observed []Endpoint
+	now := time.Now()
+	n.mu.Lock()
+	for source, entry := range n.observations {
+		if !now.Before(entry.expires) {
+			delete(n.observations, source)
+		} else if fixed < maxIntroductionEndpoints {
+			observed = append(observed, Endpoint{"udp", entry.endpoint})
+		}
+	}
+	n.mu.Unlock()
+	slices.SortFunc(observed, func(a, b Endpoint) int { return a.Address.Compare(b.Address) })
 	add(observed...)
 	return endpoints, fixed
 }
 
 func (n *Node) buildIntroduction(p *topologyView, signer tls.Certificate, endpoints []Endpoint, expires time.Time) (introduction, error) {
-	intro := introduction{Endpoints: endpoints, Expires: expires.UTC()}
+	intro := introduction{Instance: n.instance, Endpoints: endpoints, Expires: expires.UTC()}
 	scope, _, err := pki.CertificateScope(signer.Leaf)
 	if err != nil {
 		return introduction{}, err
@@ -97,7 +121,7 @@ func (n *Node) buildIntroduction(p *topologyView, signer tls.Certificate, endpoi
 }
 
 func (n *Node) validateIntroduction(p *topologyView, signer tls.Certificate) error {
-	endpoints, _ := n.introductionEndpoints(p, nil)
+	endpoints, _ := n.introductionEndpoints(p, false)
 	// A future refresh can use all nine fractional digits of RFC 3339.
 	expires := time.Unix(time.Now().Unix(), 999999999)
 	intro, err := n.buildIntroduction(p, signer, endpoints, expires)
@@ -123,15 +147,15 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 		return cachedIntroduction{}
 	}
 	now := time.Now()
-	endpoints, fixed := n.introductionEndpoints(p, n.observedEndpoints(now))
+	endpoints, fixed := n.introductionEndpoints(p, true)
 	n.introMu.Lock()
 	defer n.introMu.Unlock()
 	cache := &n.introCache
 	signer := n.cred.Load().Object
-	if cache.policy == p && cache.cred == signer.Leaf && now.Add(10*time.Second).Before(cache.Expires) && slices.Equal(endpoints, cache.candidates) {
+	if cache.policy == p && cache.cred == signer.Leaf && now.Add(introductionRefreshLead).Before(cache.Expires) && slices.Equal(endpoints, cache.candidates) {
 		return *cache
 	}
-	intro, err := n.buildIntroduction(p, signer, endpoints, now.Add(time.Minute))
+	intro, err := n.buildIntroduction(p, signer, endpoints, now.Add(introductionLifetime))
 	if err != nil {
 		return cachedIntroduction{}
 	}
@@ -157,12 +181,12 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 	p := n.policy.Load()
 	identity, body, end, err := n.verifyStatement(ctx, "introduction", record, p)
 	a := identity.ID
-	if err != nil || a == n.id {
+	if err != nil {
 		return a, false
 	}
 	var v introduction
 	now := time.Now()
-	if json.Unmarshal(body, &v) != nil || !now.Before(v.Expires) || v.Expires.After(now.Add(65*time.Second)) || len(v.Endpoints) > maxIntroductionEndpoints {
+	if json.Unmarshal(body, &v) != nil || v.Instance == (InstanceID{}) || !now.Before(v.Expires) || v.Expires.After(now.Add(introductionLifetime+introductionClockSkew)) || len(v.Endpoints) > maxIntroductionEndpoints {
 		return a, false
 	}
 	if reply != nil && !v.match(*reply, a, p.cluster.Subnet(reply.IP).IsValid()).IsValid() {
@@ -178,18 +202,49 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 			return a, false
 		}
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.policy.Load() != p || n.modes[a] == Blocked || n.conflictingOwnerLocked(a) {
-		return a, false
-	}
 	if v.Expires.Before(end) {
 		end = v.Expires
 	}
+	intro := learnedIntroduction{
+		introduction: v, record: record, authorizedUntil: end,
+		fingerprint: sha256.Sum256(identity.leaf.Raw), firstSeen: now, lastSeen: now,
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.policy.Load() != p || n.modes[a] == Blocked {
+		return a, false
+	}
+	bound, _ := n.deliveryInstanceLocked(a)
+	if a == n.id {
+		bound = n.instance
+	}
+	addressConflict := n.conflictingOwnerLocked(a)
+	if addressConflict || bound != (InstanceID{}) && bound != v.Instance {
+		decision := "instance mismatch"
+		if addressConflict {
+			decision = "address conflict"
+		}
+		n.recordObservationLocked(intro.observation(a, decision), v.RoutedPrefixes)
+		return a, false
+	}
+	if a == n.id {
+		return a, false
+	}
 	old := n.discovered[a]
 	if now.Before(old.authorizedUntil) && old.Expires.After(v.Expires) {
-		// Independently valid introductions may arrive out of order during rendezvous.
+		if old.Instance != v.Instance {
+			n.recordObservationLocked(intro.observation(a, "different signed instance"), v.RoutedPrefixes)
+			return a, false
+		}
 		return a, true
+	}
+	if old.Instance == v.Instance && old.fingerprint == intro.fingerprint {
+		intro.firstSeen = old.firstSeen
+		if slices.Equal(old.record, record) {
+			intro.lastSeen = old.lastSeen
+		}
+	} else if now.Before(old.authorizedUntil) && old.Instance != v.Instance {
+		n.recordObservationLocked(old.observation(a, "different signed instance"), old.RoutedPrefixes)
 	}
 	n.forgetIntroductionLocked(a, old)
 	for _, e := range v.Endpoints {
@@ -198,7 +253,7 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 		}
 		n.introduced[e][a] = end
 	}
-	n.discovered[a] = learnedIntroduction{v, record, end}
+	n.discovered[a] = intro
 	n.discoveredOwners[a.IPv4()] = a
 	n.discoveredOwners[a.IPv6()] = a
 	return a, true

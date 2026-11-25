@@ -231,7 +231,7 @@ func TestNATPaths(t *testing.T) {
 			l.link(b, r)
 			l.start()
 			for _, pair := range [][2]*host{{a, b}, {b, a}} {
-				require.NoError(t, pair[0].node.SetPeerPathPolicy(pair[1].ip, nebula.DirectOnly))
+				require.NoError(t, pair[0].node.SetPeerPathPolicy(pair[1].node.ID(), nebula.DirectOnly))
 			}
 			for _, h := range []*host{a, b} {
 				l.connect(h, r, "udp")
@@ -248,8 +248,8 @@ func TestNATPaths(t *testing.T) {
 					require.ErrorIs(t, a.node.ConnectPeer(t.Context(), b.ip), nebula.ErrPeerUnavailable)
 				}
 				require.Positive(t, l.net.packets(probe))
-				require.NoError(t, a.node.SetPeerPathPolicy(b.ip, nebula.Auto))
-				require.NoError(t, b.node.SetPeerPathPolicy(a.ip, nebula.Auto))
+				require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Auto))
+				require.NoError(t, b.node.SetPeerPathPolicy(a.node.ID(), nebula.Auto))
 				p := l.connect(a, b, "relay")
 				require.Equal(t, []nebula.PeerID{labPeer(a.ip), labPeer(r.ip), labPeer(b.ip)}, p.Circuit)
 			} else {

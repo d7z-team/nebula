@@ -27,6 +27,7 @@ func TestOfflinePKI(t *testing.T) {
 	issuer := command("issue", "-role", "ca", "-name", "Lab CA", "-in", "issuer.csr", "-approved-key", issuerHash,
 		"-ca", "ca.pem", "-ca-key", "ca.key", "-network", "lab", "-routes", "192.0.2.0/24", "-cluster", "-anycast-pools", "10.0.0.128/26", "-permit-ips", "10.0.0.0/24,fd42::/64")
 	require.NoError(t, os.WriteFile("issuer.pem", []byte(issuer), 0o600))
+	require.Contains(t, command("inspect", "-in", "issuer.pem"), "memberIPv4=10.0.0.0/24 memberIPv6=fd42::/64")
 	command("keygen", "-out", "node.key")
 	command("request", "-key", "node.key", "-name", "client", "-out", "node.csr")
 	hash := strings.TrimSpace(command("inspect", "-in", "node.csr", "-fingerprint"))

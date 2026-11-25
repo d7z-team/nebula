@@ -19,15 +19,15 @@ Bob 的拓扑条目授予 `app/demo` 子树的发布权。Alice 订阅完整主�
 
 先在仓库根目录按 PKI 指南的命令签发 Alice 和 Bob 的 PEM 文件。以下命令沿用同一 shell 的 `$lab` 临时目录。实际部署时，每台机器只需自己的叶证书链、私钥、可信根、固定的集群 CA 和宿主批准的拓扑。[签发证书](pki.md#签发证书) · [示例源码](../examples/peer/main.go)
 
-将以下拓扑保存到凭据目录，并记下输出的目录路径。Bob 在启动后按命令行提供的物理 UDP 端点连接 Alice，Alice 通过同一会话发送回执。两端分别拥有请求或回执主题的发布权。
+将以下拓扑保存到凭据目录，并记下输出的目录路径。示例只接受一个完整的拓扑 JSON 对象，遇到未知字段会在绑定端口前报告文件名和字段名。Bob 在启动后按命令行提供的物理 UDP 端点连接 Alice，Alice 通过同一会话发送回执。两端分别拥有请求或回执主题的发布权。
 
 ```sh
 cat > "$lab/topology.json" <<'JSON'
 {
   "network": "demo",
   "members": [
-    {"ipv4":"10.13.0.1", "ipv6":"fd13::1", "topics":["app/peer/receipt"]},
-    {"ipv4":"10.13.0.2", "ipv6":"fd13::2", "topics":["app/peer/request"]}
+    {"ipv4":"10.13.0.1", "ipv6":"fd13::1", "publishTopics":["app/peer/receipt"]},
+    {"ipv4":"10.13.0.2", "ipv6":"fd13::2", "publishTopics":["app/peer/request"]}
   ]
 }
 JSON
@@ -42,7 +42,7 @@ go run ./examples/peer -listen 127.0.0.1:4242 -peer fd13::2 \
   -key "$lab/alice.key" -topology "$lab/topology.json"
 ```
 
-在第二个终端进入同一仓库根目录，将 `lab` 设为前面输出的目录，先用 Bob 的凭据接入并查询 Alice 的 IPv6 地址。命令打印签名记录中的成员和匹配前缀后退出。
+在第二个终端进入同一仓库根目录，将 `lab` 设为前面输出的目录。用 Bob 的凭据接入并查询 Alice 的 IPv6 地址，成功时会输出 `fd13::1 via 10.13.0.1@fd13::1 (fd13::1/128)`。
 
 ```sh
 go run ./examples/peer -connect 127.0.0.1:4242 -resolve fd13::1 \

@@ -37,6 +37,7 @@ type ipResolution struct {
 	cancel   context.CancelFunc
 	waiters  int
 	deadline time.Time
+	answered map[PeerID]bool
 	err      error
 }
 
@@ -48,6 +49,18 @@ const maxLookupAnswers = 64
 // specific prefix. Network results can also be partial. Discovery does not dial
 // peers or authorize downstream traffic.
 func (n *Node) ResolveIP(ctx context.Context, ip netip.Addr) ([]IPMatch, error) {
+	return n.resolveIP(ctx, ip, false)
+}
+
+// RefreshIP queries existing neighbors for a downstream unicast address even
+// when a cached route matches. It returns currently valid matches seen in the
+// bounded search, most specific first, including this node's own advertisement.
+// Neighbors may answer from their caches. Missing replies do not withdraw routes.
+func (n *Node) RefreshIP(ctx context.Context, ip netip.Addr) ([]IPMatch, error) {
+	return n.resolveIP(ctx, ip, true)
+}
+
+func (n *Node) resolveIP(ctx context.Context, ip netip.Addr, refresh bool) ([]IPMatch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -61,57 +74,65 @@ func (n *Node) ResolveIP(ctx context.Context, ip netip.Addr) ([]IPMatch, error) 
 	if !n.ready(p) {
 		return nil, ErrPathPolicy
 	}
-	if !p.discoveryAddress(ip) {
+	if !p.discoveryAddress(ip) || refresh && p.cluster.Subnet(ip).IsValid() {
 		return nil, ErrInvalidPacketAddress
 	}
-	until := time.Now().Add(n.o.DialTimeout)
-	if deadline, ok := ctx.Deadline(); ok && deadline.Before(until) {
-		until = deadline
+	if !refresh {
+		if hits := n.ipMatches(ip, nil); len(hits) > 0 {
+			return hits, nil
+		}
 	}
-	var exhausted error
+	until := n.exchangeDeadline(ctx)
 	for {
-		answers := n.cachedAnswers(query{IP: ip})
-		if len(answers) > 0 {
-			out := make([]IPMatch, 0, len(answers))
-			for _, answer := range answers {
-				match := answer.match
-				match.Endpoints = slices.Clone(match.Endpoints)
-				out = append(out, match)
-			}
-			slices.SortFunc(out, func(a, b IPMatch) int {
-				if a.Prefix.Bits() != b.Prefix.Bits() {
-					return b.Prefix.Bits() - a.Prefix.Bits()
-				}
-				return comparePeer(a.Peer, b.Peer)
-			})
-			return out, nil
-		}
-		if exhausted != nil {
-			return nil, exhausted
-		}
-		roundDeadline, searchErr := n.awaitResolution(ctx, ip, until)
+		round, err := n.awaitResolution(ctx, ip, until)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if n.ctx.Err() != nil {
 			return nil, ErrNodeClosed
 		}
+		if round == nil {
+			return nil, err
+		}
+		var peers map[PeerID]bool
+		if refresh {
+			peers = round.answered
+		}
+		if hits := n.ipMatches(ip, peers); len(hits) > 0 {
+			return hits, nil
+		}
 		// A later caller can use its remaining budget after a shorter shared round times out.
-		if searchErr == context.DeadlineExceeded && roundDeadline.Before(until) && time.Now().Before(until) {
+		if err == context.DeadlineExceeded && round.deadline.Before(until) && time.Now().Before(until) {
 			continue
 		}
-		exhausted = searchErr
-		if exhausted == nil {
-			exhausted = ErrPeerUnavailable
+		if err == nil {
+			err = ErrPeerUnavailable
 		}
+		return nil, err
 	}
 }
 
-func (n *Node) awaitResolution(ctx context.Context, ip netip.Addr, until time.Time) (time.Time, error) {
+func (n *Node) ipMatches(ip netip.Addr, peers map[PeerID]bool) []IPMatch {
+	answers := n.cachedAnswers(query{IP: ip}, peers)
+	out := make([]IPMatch, len(answers))
+	for i, answer := range answers {
+		out[i] = answer.match
+		out[i].Endpoints = slices.Clone(answer.match.Endpoints)
+	}
+	slices.SortFunc(out, func(a, b IPMatch) int {
+		if a.Prefix.Bits() != b.Prefix.Bits() {
+			return b.Prefix.Bits() - a.Prefix.Bits()
+		}
+		return comparePeer(a.Peer, b.Peer)
+	})
+	return out
+}
+
+func (n *Node) awaitResolution(ctx context.Context, ip netip.Addr, until time.Time) (*ipResolution, error) {
 	n.mu.Lock()
 	if err := n.state.runningError(); err != nil {
 		n.mu.Unlock()
-		return until, err
+		return nil, err
 	}
 	call := n.resolutions[ip]
 	if call == nil {
@@ -119,7 +140,7 @@ func (n *Node) awaitResolution(ctx context.Context, ip netip.Addr, until time.Ti
 		call = &ipResolution{done: make(chan struct{}), cancel: cancel, deadline: until}
 		n.resolutions[ip] = call
 		n.wg.Go(func() {
-			n.runLookup(search, ip, nil)
+			call.answered = n.runLookup(search, ip, nil)
 			n.mu.Lock()
 			call.err = search.Err()
 			// Socket deadlines can wake the last branch before the context timer runs.
@@ -145,11 +166,11 @@ func (n *Node) awaitResolution(ctx context.Context, ip netip.Addr, until time.Ti
 			call.cancel()
 		}
 		n.mu.Unlock()
-		return until, ctx.Err()
+		return nil, ctx.Err()
 	case <-n.ctx.Done():
-		return until, ErrNodeClosed
+		return nil, ErrNodeClosed
 	case <-call.done:
-		return call.deadline, call.err
+		return call, call.err
 	}
 }
 
@@ -157,8 +178,7 @@ func (p *topologyView) discoveryAddress(ip netip.Addr) bool {
 	if ip.Zone() != "" || !isTunnelUnicast(ip) || p.cluster.InAnycastPool(ip) {
 		return false
 	}
-	_, broadcast := p.directed[ip]
-	return !broadcast
+	return ip != p.directedBroadcast
 }
 
 func (i introduction) match(q query, id PeerID, clusterIP bool) netip.Prefix {
@@ -168,12 +188,17 @@ func (i introduction) match(q query, id PeerID, clusterIP bool) netip.Prefix {
 	if q.IP == id.IPv4() || q.IP == id.IPv6() {
 		return netip.PrefixFrom(q.IP, q.IP.BitLen())
 	}
+	if clusterIP || q.Target != nil {
+		return netip.Prefix{}
+	}
+	return longestPrefix(q.IP, i.RoutedPrefixes)
+}
+
+func longestPrefix(ip netip.Addr, prefixes []netip.Prefix) netip.Prefix {
 	var best netip.Prefix
-	if !clusterIP && q.Target == nil {
-		for _, prefix := range i.RoutedPrefixes {
-			if prefix.Contains(q.IP) && prefix.Bits() > best.Bits() {
-				best = prefix
-			}
+	for _, prefix := range prefixes {
+		if prefix.Contains(ip) && prefix.Bits() > best.Bits() {
+			best = prefix
 		}
 	}
 	return best
@@ -184,7 +209,9 @@ type lookupAnswer struct {
 	record statement
 }
 
-func (n *Node) cachedAnswers(q query) []lookupAnswer {
+// A nil peer set accepts all matches. A refresh reads only records from
+// peers that answered its round.
+func (n *Node) cachedAnswers(q query, peers map[PeerID]bool) []lookupAnswer {
 	// Live rendezvous requires a reply from the target itself.
 	if q.Target != nil && *q.Target != n.id {
 		return nil
@@ -192,7 +219,8 @@ func (n *Node) cachedAnswers(q query) []lookupAnswer {
 	p := n.policy.Load()
 	primary := p.cluster.Subnet(q.IP).IsValid()
 	var local cachedIntroduction
-	if q.IP == n.id.IPv4() || q.IP == n.id.IPv6() || !primary && len(p.members[n.id].RoutedPrefixes) > 0 {
+	localCandidate := q.IP == n.id.IPv4() || q.IP == n.id.IPv6() || !primary && len(p.members[n.id].RoutedPrefixes) > 0
+	if localCandidate && (peers == nil || peers[n.id]) {
 		local = n.localIntroduction(p)
 	}
 	n.mu.Lock()
@@ -216,16 +244,22 @@ func (n *Node) cachedAnswers(q query) []lookupAnswer {
 		if cred.until.Before(end) {
 			end = cred.until
 		}
-		add(n.id, learnedIntroduction{local.introduction, local.record, end})
+		add(n.id, learnedIntroduction{introduction: local.introduction, record: local.record, authorizedUntil: end})
 	}
-	if q.Target != nil {
+	switch {
+	case q.Target != nil:
 		return answers
-	}
-	if primary {
+	case peers != nil:
+		for id := range peers {
+			if intro, ok := n.discovered[id]; ok {
+				add(id, intro)
+			}
+		}
+	case primary:
 		if owner, ok := n.discoveredOwners[q.IP]; ok {
 			add(owner, n.discovered[owner])
 		}
-	} else {
+	default:
 		for id, intro := range n.discovered {
 			add(id, intro)
 		}
@@ -233,22 +267,20 @@ func (n *Node) cachedAnswers(q query) []lookupAnswer {
 	return answers
 }
 
-func (n *Node) runLookup(ctx context.Context, ip netip.Addr, target *PeerID) bool {
+func (n *Node) runLookup(ctx context.Context, ip netip.Addr, target *PeerID) map[PeerID]bool {
 	origin := n.localIntroduction(n.policy.Load()).record
 	if len(origin) == 0 || ctx.Err() != nil {
-		return false
+		return map[PeerID]bool{}
 	}
 	var nonce [16]byte
 	rand.Read(nonce[:])
 	q := query{ID: hex.EncodeToString(nonce[:]), IP: ip, Target: target, Origin: origin, Visited: []PeerID{n.id}}
-	found := false
-	n.forwardLookup(ctx, q, func(statement) bool { found = true; return true })
-	return found
+	return n.forwardLookup(ctx, q, nil)
 }
 
 // Each branch streams bounded, individual CMS records so one large chain
 // cannot crowd other gateways out of the same control frame.
-func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement) bool) {
+func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement) bool) map[PeerID]bool {
 	clusterIP := n.Cluster().Subnet(q.IP).IsValid()
 	seen := make(map[PeerID]bool)
 	send := func(id PeerID, record statement) bool {
@@ -256,15 +288,21 @@ func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement)
 			return true
 		}
 		seen[id] = true
-		return yield(record) && !clusterIP && len(seen) < maxLookupAnswers
+		return (yield == nil || yield(record)) && !clusterIP && len(seen) < maxLookupAnswers
 	}
-	for _, answer := range n.cachedAnswers(q) {
+	// At the origin, only our own advertisement can answer for a downstream
+	// prefix without a neighbor reply. Other cached routes remain available to ResolveIP.
+	var cachedPeers map[PeerID]bool
+	if yield == nil && !clusterIP {
+		cachedPeers = map[PeerID]bool{n.id: true}
+	}
+	for _, answer := range n.cachedAnswers(q, cachedPeers) {
 		if !send(answer.match.Peer, answer.record) {
-			return
+			return seen
 		}
 	}
 	if ctx.Err() != nil || len(q.Visited) >= maxCircuitNodes {
-		return
+		return seen
 	}
 	n.mu.Lock()
 	var neighbors []*session
@@ -281,7 +319,7 @@ func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement)
 	}
 	n.mu.Unlock()
 	if len(neighbors) == 0 {
-		return
+		return seen
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	jobs := make(chan *session, len(neighbors))
@@ -320,6 +358,7 @@ func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement)
 		}
 	}
 	cancel()
+	return seen
 }
 
 func (n *Node) queryNeighbor(ctx context.Context, s *session, q query, results chan<- statement) {
@@ -381,7 +420,7 @@ func (n *Node) handleLookup(s *session, c net.Conn, b []byte) {
 	n.mu.Unlock()
 	// A probe to the origin would disclose our physical source address even
 	// when the signed introduction contains no endpoints.
-	if q.Target != nil && *q.Target == n.id && !n.o.HideEndpoints {
+	if q.Target != nil && *q.Target == n.id && !n.o.Transport.HideEndpoints {
 		n.punch(origin)
 	}
 	q.Visited = append(q.Visited, n.id)

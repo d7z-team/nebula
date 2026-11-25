@@ -58,9 +58,10 @@ func NodeOptions(hosts ...Host) ([]nebula.Options, error) {
 			return nil, fmt.Errorf("issue certificate for %s: %w", host.IPv4, err)
 		}
 		o := &options[i]
-		o.Roots = roots
-		o.ClusterCA = issuer.Chain[0]
-		o.Certificates.Client = tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: key}
+		o.Auth = nebula.AuthOptions{
+			Roots: roots, ClusterCA: issuer.Chain[0],
+			Certificates: nebula.LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: key}},
+		}
 		o.Topology = nebula.Topology{Network: "demo", Members: make([]nebula.Member, len(hosts))}
 		for j, h := range hosts {
 			o.Topology.Members[j] = h.Member.Clone()
@@ -94,7 +95,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 	endpoints := make(map[nebula.PeerID]nebula.Endpoint, len(options))
 	for i := range prepared {
 		o := &prepared[i]
-		chain, err := pki.ParseChain(o.Certificates.Client.Certificate)
+		chain, err := pki.ParseChain(o.Auth.Certificates.Client.Certificate)
 		if err != nil {
 			return nil, err
 		}
@@ -113,7 +114,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 				return nil, err
 			}
 			owners = append(owners, pc)
-			o.UDP4 = pc
+			o.Transport.UDP4 = pc
 			address = pc.LocalAddr().(*net.UDPAddr).AddrPort()
 		case "tcp":
 			listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -121,13 +122,13 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 				return nil, err
 			}
 			owners = append(owners, listener)
-			o.TCP4 = listener
+			o.Transport.TCP4 = listener
 			address = listener.Addr().(*net.TCPAddr).AddrPort()
 		default:
 			return nil, fmt.Errorf("unknown transport %q", transport)
 		}
 		ep := nebula.Endpoint{}
-		if !o.HideEndpoints {
+		if !o.Transport.HideEndpoints {
 			ep = nebula.Endpoint{Network: transport, Address: address}
 		}
 		endpoints[identity.ID] = ep

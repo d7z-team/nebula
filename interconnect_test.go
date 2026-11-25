@@ -96,14 +96,17 @@ func TestRelaySearchContinuesAcrossDials(t *testing.T) {
 		f.link(i, last)
 	}
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 		f.cfg.Members[i].Restricted = true
 		f.cfg.Members[i].Transit = i > 0 && i < last
 	}
 	f.start()
 	a, r, b := f.nodes[0], f.nodes[1], f.nodes[last]
+	configured, effective := a.PeerPathPolicy(b.id)
+	require.Equal(t, Auto, configured)
+	require.Equal(t, RelayOnly, effective)
 	for i := 2; i < last-1; i++ {
-		require.NoError(t, r.SetPeerPathPolicy(f.ips[i], Blocked))
+		require.NoError(t, r.SetPeerPathPolicy(f.nodes[i].id, Blocked))
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -119,7 +122,7 @@ func TestRelaySearchAfterLastCandidate(t *testing.T) {
 	f.link(1, 2)
 	f.cfg.Members[1].Transit = true
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	// The only transit node initially declines the canary's one candidate.
 	view := f.cfg
@@ -128,7 +131,7 @@ func TestRelaySearchAfterLastCandidate(t *testing.T) {
 	f.opts[1].Topology = view
 	f.start()
 	a, relay, b := f.nodes[0], f.nodes[1], f.nodes[2]
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
 	require.Error(t, a.dialRelay(t.Context(), b.id, 1))
 	require.NoError(t, relay.ApplyTopology(t.Context(), f.cfg))
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
@@ -142,14 +145,14 @@ func TestIntroductionLookupAndAuthorization(t *testing.T) {
 	until := time.Now().Add(20 * time.Second)
 	var cutoff atomic.Int64
 	cutoff.Store(until.UnixNano())
-	f.opts[0].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+	f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		if c.Usage == x509.ExtKeyUsageCodeSigning && !c.Local {
 			return time.Unix(0, cutoff.Load()), nil
 		}
 		return time.Time{}, nil
 	}
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.start()
 	hub := f.nodes[0]
@@ -192,7 +195,7 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	ep := Endpoint{"tcp", addrPort(backup.Addr())}
 	f.cfg.Members[1].Endpoints = append(f.cfg.Members[1].Endpoints, ep)
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
@@ -265,8 +268,8 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
 	f := newFixture(t, slices.Repeat([]string{"tcp"}, 19)...)
 	last := len(f.opts) - 1
-	first, late := f.opts[1].TCP4.Addr().String(), f.opts[last].TCP4.Addr().String()
-	f.opts[0].DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+	first, late := f.opts[1].Transport.TCP4.Addr().String(), f.opts[last].Transport.TCP4.Addr().String()
+	f.opts[0].Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
 		if address == first || address == late {
 			return (&net.Dialer{}).DialContext(ctx, network, address)
 		}
@@ -277,7 +280,7 @@ func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
 	for _, i := range []int{0, 1, last} {
 		o := f.opts[i]
 		o.Topology = f.cfg
-		o.Interval = 25 * time.Millisecond
+		o.MaintenanceInterval = 25 * time.Millisecond
 		o.DialTimeout = 150 * time.Millisecond
 		n, err := New(t.Context(), o)
 		require.NoError(t, err)
@@ -325,15 +328,15 @@ func TestTCPListenerRecoveryAndFailure(t *testing.T) {
 	for _, kind := range []string{"dedicated", "shared"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newFixture(t, "tcp", "tcp")
-			l := &interruptedListener{Listener: f.opts[1].TCP4, stop: make(chan struct{}), fatal: errors.New("listener unavailable")}
+			l := &interruptedListener{Listener: f.opts[1].Transport.TCP4, stop: make(chan struct{}), fatal: errors.New("listener unavailable")}
 			stop := sync.OnceFunc(func() { close(l.stop) })
 			defer stop()
-			f.opts[1].TCP4 = l
+			f.opts[1].Transport.TCP4 = l
 			var shared *portshare.TCP
 			if kind == "shared" {
 				shared = portshare.NewTCP(l)
 				t.Cleanup(func() { shared.Close() })
-				f.opts[1].TCP4 = shared.Mesh()
+				f.opts[1].Transport.TCP4 = shared.Mesh()
 			}
 			f.start()
 			a, b := f.nodes[0], f.nodes[1]
@@ -355,7 +358,7 @@ func TestCloseDuringReceiveLimitExchange(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	d := tls.Dialer{Config: a.tlsConfig(b.id, false)}
-	c, err := d.DialContext(t.Context(), "tcp", f.opts[1].TCP4.Addr().String())
+	c, err := d.DialContext(t.Context(), "tcp", f.opts[1].Transport.TCP4.Addr().String())
 	require.NoError(t, err)
 	defer c.Close()
 	// Send only the first byte of the two-byte client preface.
@@ -380,10 +383,10 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 	f.cfg.Members[2].Transit = true
 	for i, opts := range f.opts {
 		opts.Topology = f.cfg
-		opts.Interval = time.Hour
+		opts.MaintenanceInterval = time.Hour
 		opts.DialTimeout = 600 * time.Millisecond
 		if i == 1 || i == 2 {
-			opts.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+			opts.Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
 				select {
 				case <-time.After(375 * time.Millisecond):
 				case <-ctx.Done():
@@ -405,7 +408,7 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 	a, b := f.nodes[0], f.nodes[3]
 	_, err := a.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
 	require.NoError(t, err)
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
 	path, ok := a.PreferredPath(b.id)
 	require.True(t, ok)
@@ -428,7 +431,7 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
 	f.cfg.Members[0].BytesPerSecond = 1
-	f.opts[0].Interval = 40 * time.Millisecond
+	f.opts[0].MaintenanceInterval = 40 * time.Millisecond
 	f.start()
 	a, b, c := f.nodes[0], f.nodes[1], f.nodes[2]
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
@@ -446,20 +449,42 @@ func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond)
 }
 
+type failingUDPReader struct {
+	net.PacketConn
+	err error
+}
+
+func (s failingUDPReader) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, from, err := s.PacketConn.ReadFrom(b)
+	if err == nil {
+		return 0, nil, s.err
+	}
+	return n, from, err
+}
+
 func TestUDPListenerFailure(t *testing.T) {
 	for _, kind := range []string{"dedicated", "shared"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newFixture(t, "udp")
-			socket := f.opts[0].UDP4
+			socket := failingUDPReader{f.opts[0].Transport.UDP4, errors.New("physical UDP reader failed")}
+			f.opts[0].Transport.UDP4 = socket
+			var other net.PacketConn
 			if kind == "shared" {
 				shared := portshare.NewUDP(socket)
 				t.Cleanup(func() { shared.Close() })
-				f.opts[0].UDP4 = shared.Mesh()
+				f.opts[0].Transport.UDP4 = shared.Mesh()
+				other = shared.Other()
 			}
 			f.start()
 			n := f.nodes[0]
-			require.NoError(t, socket.Close())
+			_, err := socket.WriteTo([]byte{1}, socket.LocalAddr())
+			require.NoError(t, err)
 			require.Eventually(t, func() bool { return n.ControlStatus().ListenerErrors["udp4"] != "" }, time.Second, time.Millisecond)
+			require.Contains(t, n.ControlStatus().ListenerErrors["udp4"], socket.err.Error())
+			if other != nil {
+				_, _, err := other.ReadFrom(make([]byte, 1))
+				require.ErrorIs(t, err, socket.err)
+			}
 			require.True(t, n.ControlStatus().Ready)
 		})
 	}

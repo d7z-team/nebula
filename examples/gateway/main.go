@@ -1,4 +1,4 @@
-// Command gateway routes IPv4 and IPv6 between a mesh client and a downstream LAN.
+// Command gateway routes IPv4 and IPv6 through a site gateway and a default exit.
 package main
 
 import (
@@ -31,16 +31,22 @@ func main() {
 }
 
 func run() error {
-	client, gw := demo.NewHost(1), demo.NewHost(2)
-	lan4, lan6 := netip.MustParsePrefix("172.30.0.0/24"), netip.MustParsePrefix("2001:db8:42::/64")
-	gw.CertificateRoutes = []netip.Prefix{lan4, lan6}
-	gw.RoutedPrefixes = []netip.Prefix{lan4, lan6}
-	options, err := demo.NodeOptions(client, gw)
+	client, site, exit := demo.NewHost(1), demo.NewHost(2), demo.NewHost(3)
+	site.RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("172.30.0.0/24"), netip.MustParsePrefix("2001:db8:42::/64")}
+	exit.RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+	site.CertificateRoutes, exit.CertificateRoutes = site.RoutedPrefixes, exit.RoutedPrefixes
+	// Each gateway has an independent downstream network in this example.
+	gateways := []struct {
+		demo.Host
+		lan4, lan6 netip.Prefix
+	}{
+		{site, site.RoutedPrefixes[0], site.RoutedPrefixes[1]},
+		{exit, netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("2001:db8:99::/64")},
+	}
+	options, err := demo.NodeOptions(client, site, exit)
 	if err != nil {
 		return err
 	}
-	// The client starts with only its own membership. The host has independently
-	// approved the gateway identity and the two LAN prefixes below.
 	for i := range options {
 		options[i].Topology.Members = []nebula.Member{options[i].Topology.Members[i]}
 	}
@@ -58,25 +64,26 @@ func run() error {
 			return err
 		}
 	}
-	ep := options[1].Topology.Members[0].Endpoints[0]
-	if _, err := nodes[0].ConnectEndpoint(ctx, ep); err != nil {
-		return err
-	}
-	host4, host6 := netip.MustParseAddr("172.30.0.20"), netip.MustParseAddr("2001:db8:42::20")
-	for _, dst := range []netip.Addr{host4, host6} {
-		matches, err := nodes[0].ResolveIP(ctx, dst)
-		if err != nil {
+	// Discover the default exit first, then refresh after the site gateway joins.
+	// Only install gateways and prefixes approved by the application.
+	view := options[0].Topology
+	for i, gw := range slices.Backward(gateways) {
+		if _, err := nodes[0].ConnectEndpoint(ctx, options[i+1].Topology.Members[0].Endpoints[0]); err != nil {
 			return err
 		}
-		approved := slices.ContainsFunc(matches, func(m nebula.IPMatch) bool {
-			return m.Peer.IPv4() == gw.IPv4 && m.Peer.IPv6() == gw.IPv6 && slices.Contains(gw.RoutedPrefixes, m.Prefix)
-		})
-		if !approved {
-			return fmt.Errorf("no approved gateway for %s", dst)
+		for _, lan := range []netip.Prefix{gw.lan4, gw.lan6} {
+			matches, err := nodes[0].RefreshIP(ctx, lan.Addr().Next().Next())
+			if err != nil {
+				return err
+			}
+			if !slices.ContainsFunc(matches, func(m nebula.IPMatch) bool {
+				return m.Peer.IPv4() == gw.IPv4 && m.Peer.IPv6() == gw.IPv6 && slices.Contains(gw.RoutedPrefixes, m.Prefix)
+			}) {
+				return fmt.Errorf("missing approved gateway for %s", lan)
+			}
 		}
+		view.Members = append(view.Members, gw.Member)
 	}
-	view := options[0].Topology
-	view.Members = append(view.Members, gw.Member)
 	if err := nodes[0].ApplyTopology(ctx, view); err != nil {
 		return err
 	}
@@ -85,66 +92,66 @@ func run() error {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 	}
-	clientStack, router, host := stack.New(stackOptions), stack.New(stackOptions), stack.New(stackOptions)
-	defer clientStack.Destroy()
-	defer router.Destroy()
-	defer host.Destroy()
 	const vpn, lan tcpip.NICID = 1, 2
-	for i, s := range []*stack.Stack{clientStack, router} {
-		var opts nebulagvisor.Options
-		if i == 0 {
-			opts.ObserveReceive = func(from nebula.PeerID, packet []byte) {
-				fmt.Printf("IPv%d packet received via mesh member %s\n", packet[0]>>4, from)
-			}
-		}
-		ep, err := nebulagvisor.NewEndpoint(nodes[i], opts)
+	overlay4, overlay6 := nodes[0].Cluster().MemberPrefixes()
+	var onLink netip.Addr
+	clientStack := stack.New(stackOptions)
+	defer clientStack.Destroy()
+	clientNIC, err := nebulagvisor.NewEndpoint(nodes[0], nebulagvisor.Options{
+		ObserveReceive: func(from nebula.PeerID, packet []byte) { fmt.Printf("IPv%d reply via %s\n", packet[0]>>4, from) },
+	})
+	if err != nil {
+		return err
+	}
+	if err := addNIC(clientStack, vpn, clientNIC, netip.PrefixFrom(client.IPv4, overlay4.Bits()), netip.PrefixFrom(client.IPv6, overlay6.Bits())); err != nil {
+		return err
+	}
+	defer clientStack.RemoveNIC(vpn)
+	routes := []tcpip.Route{route(overlay4, onLink, vpn), route(overlay6, onLink, vpn)}
+	for _, gw := range gateways {
+		routes = append(routes, route(gw.RoutedPrefixes[0], gw.IPv4, vpn), route(gw.RoutedPrefixes[1], gw.IPv6, vpn))
+	}
+	clientStack.SetRouteTable(routes)
+	deadline, _ := ctx.Deadline()
+	for i, gw := range gateways {
+		router, host := stack.New(stackOptions), stack.New(stackOptions)
+		defer router.Destroy()
+		defer host.Destroy()
+		mesh, err := nebulagvisor.NewEndpoint(nodes[i+1], nebulagvisor.Options{})
 		if err != nil {
 			return err
 		}
-		id, cluster := nodes[i].ID(), nodes[i].Cluster()
-		if err := addNIC(s, vpn, ep, netip.PrefixFrom(id.IPv4(), cluster.Subnet(id.IPv4()).Bits()), netip.PrefixFrom(id.IPv6(), cluster.Subnet(id.IPv6()).Bits())); err != nil {
+		if err := addNIC(router, vpn, mesh, netip.PrefixFrom(gw.IPv4, overlay4.Bits()), netip.PrefixFrom(gw.IPv6, overlay6.Bits())); err != nil {
 			return err
 		}
-		defer s.RemoveNIC(vpn)
-	}
-	gw4, gw6 := netip.MustParseAddr("172.30.0.1"), netip.MustParseAddr("2001:db8:42::1")
-	routerLAN, hostLAN := pipe.New("", "", 1500)
-	if err := addNIC(router, lan, routerLAN, netip.PrefixFrom(gw4, lan4.Bits()), netip.PrefixFrom(gw6, lan6.Bits())); err != nil {
-		return err
-	}
-	defer router.RemoveNIC(lan)
-	if err := addNIC(host, lan, hostLAN, netip.PrefixFrom(host4, lan4.Bits()), netip.PrefixFrom(host6, lan6.Bits())); err != nil {
-		return err
-	}
-	defer host.RemoveNIC(lan)
-	for _, id := range []tcpip.NICID{vpn, lan} {
-		for _, family := range []tcpip.NetworkProtocolNumber{ipv4.ProtocolNumber, ipv6.ProtocolNumber} {
-			if _, e := router.SetNICForwarding(id, family, true); e != nil {
-				return fmt.Errorf("enable forwarding on NIC %d: %s", id, e)
+		defer router.RemoveNIC(vpn)
+		lan4, lan6 := gw.lan4, gw.lan6
+		gw4, gw6 := lan4.Addr().Next(), lan6.Addr().Next()
+		dst4, dst6 := gw4.Next(), gw6.Next()
+		left, right := pipe.New("", "", 1500)
+		if err := addNIC(router, lan, left, netip.PrefixFrom(gw4, lan4.Bits()), netip.PrefixFrom(gw6, lan6.Bits())); err != nil {
+			return err
+		}
+		defer router.RemoveNIC(lan)
+		if err := addNIC(host, lan, right, netip.PrefixFrom(dst4, lan4.Bits()), netip.PrefixFrom(dst6, lan6.Bits())); err != nil {
+			return err
+		}
+		defer host.RemoveNIC(lan)
+		for _, id := range []tcpip.NICID{vpn, lan} {
+			for _, family := range []tcpip.NetworkProtocolNumber{ipv4.ProtocolNumber, ipv6.ProtocolNumber} {
+				if _, e := router.SetNICForwarding(id, family, true); e != nil {
+					return fmt.Errorf("enable forwarding on NIC %d: %s", id, e)
+				}
 			}
 		}
-	}
-
-	overlay4, overlay6 := nodes[0].Cluster().Subnet(client.IPv4), nodes[0].Cluster().Subnet(client.IPv6)
-	var onLink netip.Addr
-	clientStack.SetRouteTable([]tcpip.Route{
-		route(overlay4, onLink, vpn), route(overlay6, onLink, vpn),
-		route(lan4, gw.IPv4, vpn), route(lan6, gw.IPv6, vpn),
-	})
-	router.SetRouteTable([]tcpip.Route{
-		route(overlay4, onLink, vpn), route(overlay6, onLink, vpn),
-		route(lan4, onLink, lan), route(lan6, onLink, lan),
-	})
-	host.SetRouteTable([]tcpip.Route{
-		route(lan4, onLink, lan), route(lan6, onLink, lan),
-		route(overlay4, gw4, lan), route(overlay6, gw6, lan),
-	})
-	deadline, _ := ctx.Deadline()
-	if err := echo(clientStack, host, client.IPv4, host4, deadline); err != nil {
-		return fmt.Errorf("IPv4 echo: %w", err)
-	}
-	if err := echo(clientStack, host, client.IPv6, host6, deadline); err != nil {
-		return fmt.Errorf("IPv6 echo: %w", err)
+		router.SetRouteTable([]tcpip.Route{route(overlay4, onLink, vpn), route(overlay6, onLink, vpn), route(lan4, onLink, lan), route(lan6, onLink, lan)})
+		host.SetRouteTable([]tcpip.Route{route(lan4, onLink, lan), route(lan6, onLink, lan), route(overlay4, gw4, lan), route(overlay6, gw6, lan)})
+		if err := echo(clientStack, host, client.IPv4, dst4, deadline); err != nil {
+			return err
+		}
+		if err := echo(clientStack, host, client.IPv6, dst6, deadline); err != nil {
+			return err
+		}
 	}
 	return nil
 }

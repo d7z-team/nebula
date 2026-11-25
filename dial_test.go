@@ -22,7 +22,7 @@ func TestConnectPeerAfterSuccessfulPathIsWithdrawn(t *testing.T) {
 		refused := errors.New("replacement dial refused")
 		release := make(chan struct{})
 		var dials atomic.Int32
-		f.opts[0].DialTCP = func(context.Context, string, string) (net.Conn, error) {
+		f.opts[0].Transport.DialTCP = func(context.Context, string, string) (net.Conn, error) {
 			dials.Add(1)
 			<-release
 			return nil, refused
@@ -96,12 +96,12 @@ func TestPeerPolicyChangeDuringDirectDial(t *testing.T) {
 			f.link(1, 2)
 			f.cfg.Members[1].Transit = true
 			for i := range f.opts {
-				f.opts[i].Interval = time.Hour
+				f.opts[i].MaintenanceInterval = time.Hour
 			}
 			f.opts[0].DialTimeout = 4 * time.Second
 			target := f.cfg.Members[2].Endpoints[0].Address.String()
 			entered, release := make(chan struct{}), make(chan struct{})
-			f.opts[0].DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+			f.opts[0].Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
 				if address != target {
 					return (&net.Dialer{}).DialContext(ctx, network, address)
 				}
@@ -119,7 +119,7 @@ func TestPeerPolicyChangeDuringDirectDial(t *testing.T) {
 			defer cancel()
 			require.NoError(t, a.ConnectPeerID(ctx, r.id))
 			require.NoError(t, r.ConnectPeerID(ctx, b.id))
-			require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), DirectOnly))
+			require.NoError(t, a.SetPeerPathPolicy(b.id, DirectOnly))
 			result := make(chan error, 1)
 			go func() { result <- a.ConnectPeerID(ctx, b.id) }()
 			select {
@@ -127,7 +127,7 @@ func TestPeerPolicyChangeDuringDirectDial(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
-			require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), mode))
+			require.NoError(t, a.SetPeerPathPolicy(b.id, mode))
 			close(release)
 			err := <-result
 			path, ok := a.PreferredPath(b.id)
@@ -163,7 +163,7 @@ func TestConnectEndpointTrustAndRestrictions(t *testing.T) {
 func TestConnectEndpointRecoveryAfterUDPBlackout(t *testing.T) {
 	f := newFixture(t, "udp", "udp")
 	for i := range f.opts {
-		f.opts[i].Interval = 40 * time.Millisecond
+		f.opts[i].MaintenanceInterval = 40 * time.Millisecond
 		f.opts[i].DialTimeout = 180 * time.Millisecond
 	}
 	f.startDiscovery(1, -1)
@@ -206,7 +206,7 @@ func TestConnectEndpointSharesDial(t *testing.T) {
 			entered, release := make(chan struct{}, 1), make(chan struct{})
 			var dials atomic.Int32
 			f.opts[0].DialTimeout = 3 * time.Second
-			f.opts[0].DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+			f.opts[0].Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
 				dials.Add(1)
 				select {
 				case entered <- struct{}{}:
@@ -268,7 +268,7 @@ func TestConnectEndpointSharesDial(t *testing.T) {
 				require.Equal(t, b.ID(), id)
 				require.Len(t, a.Paths(), 1)
 				require.EqualValues(t, 1, dials.Load())
-				require.NoError(t, a.SetPeerPathPolicy(id.IPv4(), Blocked))
+				require.NoError(t, a.SetPeerPathPolicy(id, Blocked))
 				_, err = a.ConnectEndpoint(t.Context(), ep)
 				require.Error(t, err)
 				require.Empty(t, a.Paths())
@@ -298,7 +298,7 @@ func TestConnectEndpointRequiresServerAuthorization(t *testing.T) {
 			f := newFixture(t, transport, transport)
 			bID := labPeer(f.ips[1])
 			denied := errors.New("server use denied")
-			f.opts[0].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+			f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 				if c.Member == bID && c.Usage == x509.ExtKeyUsageServerAuth {
 					return time.Time{}, denied
 				}
@@ -323,6 +323,8 @@ func TestConfiguredPhysicalEndpoints(t *testing.T) {
 		{"10.13.0.2:443", false},
 		{"[fd42::c8]:443", false},
 		{"[fd42::2%eth0]:443", false},
+		{"255.255.255.255:443", false},
+		{"127.0.0.1:443", true},
 		{"192.168.1.2:443", true},
 		{"[fe80::2%eth0]:443", true},
 	} {
@@ -330,7 +332,7 @@ func TestConfiguredPhysicalEndpoints(t *testing.T) {
 			ep := Endpoint{"tcp", netip.MustParseAddrPort(tc.address)}
 			opts := f.opts[0]
 			opts.Topology = f.cfg
-			opts.AdvertiseEndpoints = []Endpoint{ep}
+			opts.Transport.AdvertiseEndpoints = []Endpoint{ep}
 			n, advertiseErr := New(t.Context(), opts)
 			if n != nil {
 				t.Cleanup(func() { n.Close() })

@@ -20,7 +20,7 @@ func main() {
 
 func run() error {
 	a, b := demo.NewHost(1), demo.NewHost(2)
-	b.Topics = []string{"app/demo"}
+	b.PublishTopics = []string{"app/demo"}
 	nodes, err := demo.NewNodes(context.Background(), "udp", a, b)
 	if err != nil {
 		return err

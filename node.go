@@ -3,6 +3,7 @@ package nebula
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ var (
 	ErrNodeNotStarted      = errors.New("node not started")
 	ErrNodeAlreadyStarted  = errors.New("node already started")
 	ErrNodeClosed          = errors.New("node closed")
+	ErrInstanceConflict    = errors.New("peer instance conflict")
 	ErrPeerUnavailable     = errors.New("peer unavailable")
 	ErrPathPolicy          = errors.New("path denied")
 	ErrPacketTooLarge      = errors.New("packet exceeds receive limit")
@@ -34,17 +36,46 @@ var (
 	ErrNextHopRequired     = errors.New("next hop required")
 )
 
-// Options configures a node's transports, credentials and initial topology.
+// Options configures one node. Durations and limits use defaults when zero
+// and reject negative values.
 type Options struct {
+	Auth      AuthOptions
+	Transport TransportOptions
+	Topology  Topology
+	// MaintenanceInterval sets the cadence of neighbor and path maintenance. Zero selects two seconds.
+	MaintenanceInterval time.Duration
+	// DialTimeout is the base timeout for dialing, handshakes, control exchanges
+	// and transport writes. Circuit setup budgets one timeout per remaining hop.
+	// Zero selects four seconds.
+	DialTimeout time.Duration
+	// MaxCircuits limits concurrent circuits at this node. Zero selects 128.
+	MaxCircuits int
+	// MaxIPSize bounds a complete inner packet in bytes and is advertised to authenticated peers.
+	// The range is 1280 through 65535. Zero selects 65535.
+	MaxIPSize int
+	// InboundPolicy optionally filters authenticated, address-authorized IP packets.
+	// Calls run on receive tasks and may overlap.
+	InboundPolicy func(peer PeerID, source, destination netip.Addr) bool
+}
+
+// AuthOptions sets the node's trust anchors, local credentials and chain policy.
+type AuthOptions struct {
 	// Roots is the explicit trust store. New takes a private copy.
 	Roots *x509.CertPool
 	// ClusterCA pins the certificate defining this mesh within Roots.
-	ClusterCA    *x509.Certificate
+	ClusterCA *x509.Certificate
+	// Certificates supplies the initial credentials for this identity.
+	// Use Node.ReloadCertificates to replace them.
 	Certificates LocalCertificates
-	Topology     Topology
 	// CheckChain may deny a verified chain or shorten its lifetime. A zero deadline
-	// accepts the chain until expiry. Calls may run concurrently.
+	// accepts the chain until expiry. Calls may run concurrently. Call Node.Revalidate
+	// after changing the host policy to recheck existing authorizations.
 	CheckChain func(context.Context, ChainCheck) (time.Time, error)
+}
+
+// TransportOptions specifies physical listeners, outbound TCP dialing and
+// the endpoints this node publishes in its signed introductions.
+type TransportOptions struct {
 	// UDP sockets carry QUIC and hole punches for their respective address families.
 	// Sockets implementing meshwire.SharedSocket configure the node's QUIC transport at startup.
 	UDP4, UDP6 net.PacketConn
@@ -61,24 +92,15 @@ type Options struct {
 	// Direct neighbors still see the connection address. Use Member.Restricted
 	// and Member.Links to limit which members may connect directly.
 	HideEndpoints bool
-	// Interval is the path maintenance interval. The default is two seconds.
-	Interval time.Duration
-	// DialTimeout bounds individual dial and control exchanges. The default is four seconds.
-	DialTimeout time.Duration
-	// MaxCircuits limits concurrent circuits at this node. The default is 128.
-	MaxCircuits int
-	// MaxIPSize bounds a complete inner packet in bytes and is advertised to authenticated peers.
-	// The range is 1280 through 65535. Zero selects 65535.
-	MaxIPSize int
-	// InboundPolicy optionally filters authenticated, address-authorized IP packets.
-	// Calls run on receive tasks and may overlap.
-	InboundPolicy func(peer PeerID, source, destination netip.Addr) bool
 }
 
 // Node manages the transports and peer sessions for one mesh identity.
 type Node struct {
 	o                      Options
 	id                     PeerID
+	instance               InstanceID
+	conflicts              map[PeerID]instanceConflict
+	evidence               []claimObservation
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	mu                     sync.Mutex
@@ -88,7 +110,7 @@ type Node struct {
 	done                   chan struct{}
 	cred                   atomic.Pointer[credentials]
 	policy                 atomic.Pointer[topologyView]
-	admissions             uint64 // increments when a session or publication joins the live set
+	admissions             uint64 // generation of session, publication and conflict admissions
 	introMu                sync.Mutex
 	introCache             cachedIntroduction
 	transports             map[bool]*udpTransport
@@ -151,21 +173,21 @@ func New(parent context.Context, o Options) (*Node, error) {
 	if parent == nil {
 		return nil, errors.New("parent context required")
 	}
-	if o.Roots == nil {
+	if o.Auth.Roots == nil {
 		return nil, errors.New("explicit trust roots required")
 	}
-	o.Roots = o.Roots.Clone()
-	cluster, err := pki.ReadClusterCA(o.ClusterCA)
+	o.Auth.Roots = o.Auth.Roots.Clone()
+	cluster, err := pki.ReadClusterCA(o.Auth.ClusterCA)
 	if err != nil {
 		return nil, err
 	}
-	o.ClusterCA = nil
+	o.Auth.ClusterCA = nil
 	view, err := o.Topology.compile(cluster)
 	if err != nil {
 		return nil, err
 	}
 	o.Topology = Topology{}
-	c, err := prepareCertificates(o.Certificates)
+	c, err := prepareCertificates(o.Auth.Certificates)
 	if err != nil {
 		return nil, err
 	}
@@ -173,14 +195,23 @@ func New(parent context.Context, o Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	o.Certificates = LocalCertificates{}
-	if o.Interval <= 0 {
-		o.Interval = 2 * time.Second
+	o.Auth.Certificates = LocalCertificates{}
+	if o.MaintenanceInterval < 0 {
+		return nil, errors.New("negative MaintenanceInterval")
 	}
-	if o.DialTimeout <= 0 {
+	if o.MaintenanceInterval == 0 {
+		o.MaintenanceInterval = 2 * time.Second
+	}
+	if o.DialTimeout < 0 {
+		return nil, errors.New("negative DialTimeout")
+	}
+	if o.DialTimeout == 0 {
 		o.DialTimeout = 4 * time.Second
 	}
-	if o.MaxCircuits <= 0 {
+	if o.MaxCircuits < 0 {
+		return nil, errors.New("negative MaxCircuits")
+	}
+	if o.MaxCircuits == 0 {
 		o.MaxCircuits = 128
 	}
 	if o.MaxIPSize == 0 {
@@ -189,15 +220,15 @@ func New(parent context.Context, o Options) (*Node, error) {
 	if o.MaxIPSize < 1280 || o.MaxIPSize > MaxIPPacketSize {
 		return nil, errors.New("invalid IP size")
 	}
-	if o.DialTCP == nil {
-		o.DialTCP = (&net.Dialer{}).DialContext
+	if o.Transport.DialTCP == nil {
+		o.Transport.DialTCP = (&net.Dialer{}).DialContext
 	}
-	for _, ep := range o.AdvertiseEndpoints {
+	for _, ep := range o.Transport.AdvertiseEndpoints {
 		if !view.physicalEndpoint(ep) {
 			return nil, fmt.Errorf("invalid advertised physical endpoint %v", ep)
 		}
 	}
-	o.AdvertiseEndpoints = slices.Clone(o.AdvertiseEndpoints)
+	o.Transport.AdvertiseEndpoints = slices.Clone(o.Transport.AdvertiseEndpoints)
 	ctx, cancel := context.WithCancel(parent)
 	n := &Node{
 		o:                      o,
@@ -206,6 +237,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 		cancel:                 cancel,
 		done:                   make(chan struct{}),
 		peers:                  make(map[PeerID]*peerPaths),
+		conflicts:              make(map[PeerID]instanceConflict),
 		modes:                  make(map[PeerID]PathMode),
 		attempts:               make(map[PeerID]*peerAttempt),
 		directDials:            make(map[endpointDialKey]*endpointAttempt),
@@ -225,6 +257,9 @@ func New(parent context.Context, o Options) (*Node, error) {
 		backgroundSlots:        make(chan struct{}, 8),
 		neighborDialSlots:      make(chan struct{}, 4),
 		sharedAddressDialSlots: make(chan struct{}, 8),
+	}
+	for n.instance == (InstanceID{}) {
+		rand.Read(n.instance[:])
 	}
 	c.until, err = n.credentialDeadline(ctx, view, c)
 	if err != nil {
@@ -286,12 +321,12 @@ func (n *Node) Start() error {
 		return ErrNodeAlreadyStarted
 	}
 	n.state = running
-	if n.o.UDP4 != nil || n.o.UDP6 != nil {
+	if n.o.Transport.UDP4 != nil || n.o.Transport.UDP6 != nil {
 		n.sizeQuery = make([]byte, MaxIPPacketSize+1)
 	}
 	n.transports = make(map[bool]*udpTransport, 2)
 	listeners := make(map[string]*quic.Listener, 2)
-	for family, udp := range map[string]net.PacketConn{"udp4": n.o.UDP4, "udp6": n.o.UDP6} {
+	for family, udp := range map[string]net.PacketConn{"udp4": n.o.Transport.UDP4, "udp6": n.o.Transport.UDP6} {
 		if udp == nil {
 			continue
 		}
@@ -319,7 +354,7 @@ func (n *Node) Start() error {
 			}
 		})
 	}
-	for family, listener := range map[string]net.Listener{"tcp4": n.o.TCP4, "tcp6": n.o.TCP6} {
+	for family, listener := range map[string]net.Listener{"tcp4": n.o.Transport.TCP4, "tcp6": n.o.Transport.TCP6} {
 		if listener == nil {
 			continue
 		}
@@ -380,7 +415,7 @@ func (n *Node) Close() error {
 	n.mu.Unlock()
 	// Let QUIC flush its close frame, even when another service has the
 	// physical writer. A stalled write must not hold up shutdown indefinitely.
-	sockets := [...]net.PacketConn{n.o.UDP4, n.o.UDP6}
+	sockets := [...]net.PacketConn{n.o.Transport.UDP4, n.o.Transport.UDP6}
 	deadline := time.Now().Add(n.o.DialTimeout)
 	for _, pc := range sockets {
 		if pc != nil {
@@ -390,7 +425,7 @@ func (n *Node) Close() error {
 	for _, s := range sessions {
 		s.close()
 	}
-	for _, l := range []net.Listener{n.o.TCP4, n.o.TCP6} {
+	for _, l := range []net.Listener{n.o.Transport.TCP4, n.o.Transport.TCP6} {
 		if l != nil {
 			l.Close()
 		}

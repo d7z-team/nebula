@@ -177,7 +177,7 @@ func TestNodeNativeEndpointDiagnostics(t *testing.T) {
 	require.Zero(t, n)
 	require.IsType(t, &tcpip.ErrHostUnreachable{}, e)
 
-	require.NoError(t, a.SetPeerPathPolicy(gateway.ID().IPv4(), nebula.Blocked))
+	require.NoError(t, a.SetPeerPathPolicy(gateway.ID(), nebula.Blocked))
 	pkt.EgressRoute.NextHop = tcpip.AddrFromSlice(gateway.ID().IPv4().AsSlice())
 	n, e = ep.WritePackets(list)
 	require.Zero(t, n)

@@ -58,6 +58,8 @@ type session struct {
 	n                             *Node
 	lease                         *circuitLease
 	peer                          PeerID
+	instance                      InstanceID
+	registeredAt, lastAlive       time.Time
 	localIdentity, remoteIdentity pki.Identity
 	remoteIPLimit                 int
 	localEndpoint                 netip.AddrPort
@@ -88,28 +90,29 @@ func (s *session) remoteEndpoint() netip.AddrPort {
 	return s.endpoint
 }
 
-// exchangeIPLimit runs on the first QUIC bidirectional stream or directly on TLS before yamux.
-func exchangeIPLimit(c io.ReadWriter, local int, outgoing bool) (int, error) {
-	var send, recv [2]byte
-	binary.BigEndian.PutUint16(send[:], uint16(local))
-	if outgoing {
-		if _, err := c.Write(send[:]); err != nil {
-			return 0, err
+// The first QUIC stream, or TLS before yamux, carries both session parameters.
+func (s *session) exchangeParameters(c io.ReadWriter) error {
+	var out, in [18]byte
+	binary.BigEndian.PutUint16(out[:2], uint16(s.n.o.MaxIPSize))
+	copy(out[2:], s.n.instance[:])
+	if s.outgoing {
+		if _, err := c.Write(out[:]); err != nil {
+			return err
 		}
 	}
-	if _, err := io.ReadFull(c, recv[:]); err != nil {
-		return 0, err
+	if _, err := io.ReadFull(c, in[:]); err != nil {
+		return err
 	}
-	limit := int(binary.BigEndian.Uint16(recv[:]))
-	if limit < 1280 {
-		return 0, errors.New("invalid peer IP receive limit")
+	s.remoteIPLimit = int(binary.BigEndian.Uint16(in[:2]))
+	copy(s.instance[:], in[2:])
+	if s.remoteIPLimit < 1280 || s.instance == (InstanceID{}) {
+		return errors.New("invalid peer session parameters")
 	}
-	if !outgoing {
-		if _, err := c.Write(send[:]); err != nil {
-			return 0, err
-		}
+	if !s.outgoing {
+		_, err := c.Write(out[:])
+		return err
 	}
-	return limit, nil
+	return nil
 }
 
 func (s *session) open(ctx context.Context) (net.Conn, error) {
@@ -160,7 +163,7 @@ func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, out
 		deadline, _ := ctx.Deadline()
 		stream.SetDeadline(deadline)
 		stop := context.AfterFunc(ctx, func() { stream.CancelRead(0); stream.CancelWrite(0) })
-		s.remoteIPLimit, err = exchangeIPLimit(stream, n.o.MaxIPSize, s.outgoing)
+		err = s.exchangeParameters(stream)
 		stop()
 		// Release any unread bytes on the reserved stream.
 		qStream{stream, q}.Close()
@@ -173,12 +176,17 @@ func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, out
 	return n.register(s)
 }
 
-func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []PeerID, out bool, lease *circuitLease) (*session, error) {
+// exchangeDeadline caps a single exchange by both the caller and the node.
+func (n *Node) exchangeDeadline(ctx context.Context) time.Time {
 	deadline := time.Now().Add(n.o.DialTimeout)
 	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
-		deadline = end
+		return end
 	}
-	_ = raw.SetDeadline(deadline)
+	return deadline
+}
+
+func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []PeerID, out bool, lease *circuitLease) (*session, error) {
+	raw.SetDeadline(n.exchangeDeadline(ctx))
 	stop := context.AfterFunc(ctx, func() { raw.Close() })
 	defer stop()
 	cfg := n.tlsConfig(peer, !out)
@@ -194,12 +202,11 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	}
 	s := &session{n: n, kind: "tcp", state: t.ConnectionState(), endpoint: addrPort(raw.RemoteAddr()), path: path, peer: peer, outgoing: out, lease: lease}
 	s.localEndpoint = addrPort(raw.LocalAddr())
-	limit, err := exchangeIPLimit(t, n.o.MaxIPSize, out)
+	err := s.exchangeParameters(t)
 	if err != nil {
 		raw.Close()
 		return nil, err
 	}
-	s.remoteIPLimit = limit
 	raw.SetDeadline(time.Time{})
 	cfgMux := yamux.DefaultConfig()
 	cfgMux.LogOutput = io.Discard
@@ -231,10 +238,7 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 // authorizationDeadline uses only the two certificate chains presented during this handshake.
 func (s *session) authorizationDeadline(ctx context.Context, p *topologyView) (time.Time, error) {
 	n := s.n
-	local, remote := x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth
-	if s.outgoing {
-		local, remote = remote, local
-	}
+	local, remote := handshakeUsages(s.outgoing)
 	end, err := n.authorizeChain(ctx, p, n.id, s.localChain, local)
 	if err != nil {
 		return time.Time{}, err
@@ -283,14 +287,17 @@ func (n *Node) register(s *session) (*session, error) {
 		}
 		n.mu.Unlock()
 	}
-	if n.state != running || !n.sessionAllowedLocked(s) || n.conflictingOwnerLocked(s.peer) {
+	if err := n.admitSessionLocked(s); err != nil {
 		n.mu.Unlock()
 		s.close()
-		return nil, ErrPathPolicy
+		return nil, err
 	}
+	s.registeredAt = time.Now()
+	s.lastAlive = s.registeredAt
 	paths := n.peers[s.peer]
-	if paths == nil {
-		paths = &peerPaths{lastCanary: time.Now()}
+	firstPath := paths == nil
+	if firstPath {
+		paths = &peerPaths{lastCanary: s.registeredAt}
 		n.peers[s.peer] = paths
 	}
 	var replaced, standby *session
@@ -348,7 +355,11 @@ func (n *Node) register(s *session) (*session, error) {
 			}
 		})
 	}
+	port := n.port
 	n.mu.Unlock()
+	if firstPath && port != nil {
+		port.syncInstanceQueue(s.peer)
+	}
 	if replaced != nil {
 		replaced.close()
 	}
@@ -361,7 +372,12 @@ func (n *Node) serveSession(s *session) {
 		s.close()
 		n.mu.Lock()
 		n.removeSessionLocked(s)
+		_, held := n.conflicts[s.peer]
+		port := n.port
 		n.mu.Unlock()
+		if held && port != nil {
+			port.syncInstanceQueue(s.peer)
+		}
 	}()
 	for {
 		var c net.Conn
@@ -394,6 +410,8 @@ func writeFrame(w io.Writer, b []byte) error {
 	return err
 }
 
+var errFrameTooLarge = errors.New("frame too large")
+
 func readFrame(r io.Reader, limit int) ([]byte, error) {
 	var size [4]byte
 	if _, err := io.ReadFull(r, size[:]); err != nil {
@@ -401,7 +419,7 @@ func readFrame(r io.Reader, limit int) ([]byte, error) {
 	}
 	n := binary.BigEndian.Uint32(size[:])
 	if uint64(n) > uint64(limit) {
-		return nil, errors.New("frame too large")
+		return nil, errFrameTooLarge
 	}
 	b := make([]byte, int(n))
 	_, err := io.ReadFull(r, b)
@@ -422,11 +440,7 @@ func (s *session) openRequest(ctx context.Context, op byte, body []byte) (net.Co
 	if err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(s.n.o.DialTimeout)
-	if t, ok := ctx.Deadline(); ok && t.Before(deadline) {
-		deadline = t
-	}
-	c.SetDeadline(deadline)
+	c.SetDeadline(s.n.exchangeDeadline(ctx))
 	if _, err = c.Write([]byte{op}); err == nil {
 		err = writeFrame(c, body)
 	}
@@ -455,8 +469,16 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 	if op[0] == opIP {
 		c.SetDeadline(time.Time{})
 		for {
-			b, err := readFrame(c, MaxIPPacketSize)
+			b, err := readFrame(c, n.o.MaxIPSize)
 			if err != nil {
+				if err == errFrameTooLarge {
+					n.mu.Lock()
+					port := n.port
+					n.mu.Unlock()
+					if port != nil {
+						port.recordInbound(0, ErrPacketTooLarge)
+					}
+				}
 				return
 			}
 			n.receiveIP(s, b)

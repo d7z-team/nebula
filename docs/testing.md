@@ -11,7 +11,7 @@ go test -race -count=1 -timeout=5m ./e2e -args -extended
 go test -race -count=1 -timeout=5m ./e2e -args -extended -portshare
 ```
 
-常规 CI 在 Linux、macOS 和 Windows 上运行单元测试和自带凭据的示例。Linux 另以共享端口重跑端到端场景。双进程示例由 `TestPeerProcesses` 使用磁盘凭据验证。[示例入口](../README.md#examples) · [CI 配置](../.github/workflows/test.yml)
+常规 CI 在 Linux、macOS 和 Windows 上运行 `go test ./...` 及八个自带凭据的示例。Linux 还运行竞态检查、共享端口端到端场景和打过补丁的 gVisor 网关测试。双进程的磁盘凭据、拓扑读取与签名回执由 `TestPeerProcesses` 验证。[示例入口](../README.md#examples) · [CI 配置](../.github/workflows/test.yml)
 
 quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理套接字的缓冲区小于期望值，QUIC 会按实际大小运行。Linux 上可用 `sysctl net.core.rmem_max net.core.wmem_max` 查看内核上限。使用 gVisor 等虚拟套接字时，也可能看到 `connection doesn't allow setting of receive buffer size`。诊断测试失败时，先定位 `--- FAIL` 对应的断言。[quic-go 缓冲区说明](https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes)
 
@@ -23,9 +23,10 @@ quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理�
 | 限速后切路或建邻失败 | `TestChaosPathLossWhileShaping` 和 `TestChaosRelayOnlyWhileShaping` 核对在途包的错误、后续包的顺序及实际路径。`TestNeighborDialWhilePublicationsArePaced` 在发布持续等待带宽时新增邻居。[发送队列](../addressing_test.go) · [邻居维护](../interconnect_test.go) |
 | 中继首次建链失败 | `TestColdCircuitAcrossSlowHops` 延迟下游两跳，在第一条电路上验收实际 IP 包。`TestRelaySearchContinuesAcrossDials` 检查后续拨号能否继续搜索候选。[中继测试](../interconnect_test.go) |
 | NAT、移动换址或双栈切换 | `TestNATPaths` 检查打洞报文和最终认证路径，`TestGatewayLayouts` 覆盖多层 NAT 及回环。`TestChaosMobileHandover` 连续四次更换公网 IPv4 和端口。`TestDualUnderlayFamilyFailover` 切断外层 IPv4，两者都在原有业务连接上核对回执。[NAT 场景](../e2e/nat_test.go) · [移动换址](../e2e/chaos_test.go) · [双栈切换](../e2e/mesh_test.go) |
-| 查询结果缺少预期端点或前缀 | `TestAdvertRetainsUsableNATMapping` 核对邻居再次上报后返回的有效端点。`TestGatewayIntroductionBudget` 签发接近尺寸上限的网关介绍，核对路由和可容纳的观测。`TestHiddenIntroduction` 检查会合应答和离线缓存。[发现测试](../lookup_test.go) |
-| 地址授权或网关转发异常 | 任播示例检查排空期间新旧连接的去向。网关测试检查下游看到的源地址、IPv4 TTL 和 IPv6 Hop Limit。CI 的 `gateway` 作业另外验证应用 gVisor 转发补丁后的构建。[任播示例](../examples/anycast/main.go) · [组播与任播](../e2e/addressing_test.go) · [网关测试](../e2e/forwarding_test.go) · [网关构建](integration.md#gvisor-的-ipv4-网关构建) |
-| 握手、换证或签名失败 | 签发测试覆盖双栈 SAN、委派和有效期。CMS 测试比较不同签名算法的尺寸预检与实际签名。握手测试记录换证前后会话使用的证书序列号。[证书边界](../pki/boundaries_test.go) · [CMS](../pki/pki_test.go) · [握手](../authentication_test.go) |
+| 查询结果缺少预期端点或前缀 | `TestRefreshIPWithCachedDefault` 核对站点网关加入和本轮缺席时，刷新结果与有效缓存各自包含的成员。`TestAdvertRetainsUsableNATMapping` 核对邻居再次上报后返回的有效端点。`TestGatewayIntroductionBudget` 签发接近尺寸上限的网关介绍，核对路由和可容纳的观测。`TestHiddenIntroduction` 检查会合应答和离线缓存。[发现测试](../lookup_test.go) |
+| 主地址重复或同一地址对出现多个实例 | `TestChainDeadlineAndTopologyAdmission` 检查重复地址报错和原拓扑。`TestInspectAddressClaims` 核对运行中观察到的竞争声明。`TestRelayTCPWithDuplicateInstance` 检查长连接，`TestInstanceConflictRecovery` 验证选定实例后恢复交付。[拓扑校验](../policy_integration_test.go) · [实例诊断](../instance_test.go) · [中继长连接](../e2e/addressing_test.go) |
+| 地址授权或网关转发异常 | 任播示例检查排空期间新旧连接的去向。双栈默认出口测试以两个 /0 签发网关凭据，检查下游源地址、IPv4 TTL 和 IPv6 Hop Limit。`TestChaosDefaultExitWithdrawal` 在排队和整形同时发生时撤回一台客户端的默认出口，验证站点路径和另一客户端的默认出口。CI 的 `gateway` 作业另外验证应用 gVisor 转发补丁后的构建。[任播示例](../examples/anycast/main.go) · [组播与任播](../e2e/addressing_test.go) · [网关测试](../e2e/forwarding_test.go) · [网关构建](integration.md#gvisor-的-ipv4-网关构建) |
+| 握手、换证或签名失败 | 签发测试覆盖双栈 SAN、委派和有效期。CMS 测试比较不同签名算法的尺寸预检与实际签名。握手测试记录换证前后各会话使用的证书；`TestAuthorizedPKIXPaths` 验证宿主可按签发者区分序列号相同的两张可信证书。[授权链测试](../identity_boundaries_test.go) · [证书边界](../pki/boundaries_test.go) · [CMS](../pki/pki_test.go) · [握手](../authentication_test.go) |
 | 协议互通、端口复用或消息补发异常 | 线协议测试检查帧字节、字段及纳秒精度。共享端口测试验证同一端口的 mesh 和多站点 HTTPS、HTTP/3。主题消息测试核对推送和缓存补取。[线协议](../wire_test.go) · [共享端口](../portshare_test.go) · [主题消息](../publication_test.go) |
 
 ## 重放故障
@@ -34,11 +35,11 @@ quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理�
 
 ```sh
 go test -race -count=10 -run '^(TestConnectEndpointSharesDial|TestPeerPolicyChangeDuringDirectDial|TestGroupSendUsesInboundPathWhileWaitingForDialSlot)$' .
-go test -race -count=5 -run '^(TestColdCircuitAcrossSlowHops|TestChaosRelayOnlyWhileShaping|TestNeighborDialWhilePublicationsArePaced)$' .
+go test -race -count=5 -run '^(TestColdCircuitAcrossSlowHops|TestChaosRelayOnlyWhileShaping|TestChaosDefaultExitWithdrawal|TestNeighborDialWhilePublicationsArePaced)$' .
 go test -v -count=1 -run '^TestNATPaths$/^(port|destination-specific)$' ./e2e
 ```
 
-端到端测试的 `-extended` 开关启用较长的故障场景或追加故障步骤。`-seed` 指定八步故障序列，`-v` 输出每一步的操作、路径和业务回执。记录提交号、种子和首次失败步骤即可在同一版本重放该序列。定时和手动 CI 会重放种子 1 至 10。[混沌场景](../e2e/chaos_test.go)
+用 `-extended` 启用较长的故障场景。`TestSeededChaos` 用 `-seed` 生成八步故障序列，`-v` 显示操作和业务回执。记录提交号、种子和首次失败步骤，可在同一版本重放操作顺序。定时和手动 CI 会重放种子 1 至 10。[混沌场景](../e2e/chaos_test.go)
 
 ```sh
 go test -race -v -count=1 -run '^TestChaosMobileHandover$' ./e2e -args -extended

@@ -19,8 +19,8 @@ func (n *Node) ApplyTopology(ctx context.Context, t Topology) error {
 }
 
 // Revalidate reapplies the host's current chain decisions to local credentials,
-// sessions and cached publications. Success means the review completed, including
-// any withdrawals. Use ControlStatus and Paths to inspect the outcome.
+// sessions, instance conflict claims and cached publications. Success means the
+// review completed, including withdrawals. ControlStatus, Paths and InspectIP report the outcome.
 func (n *Node) Revalidate(ctx context.Context) error { return n.updateView(ctx, nil) }
 
 // Evaluate application callbacks outside node locks. Admissions and credential
@@ -32,6 +32,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		}
 		n.mu.Lock()
 		old, c, seq := n.policy.Load(), n.cred.Load(), n.admissions
+		conflicts := maps.Clone(n.conflicts)
 		ss, publications := n.sessionListLocked(), maps.Clone(n.publications)
 		n.mu.Unlock()
 		p := next
@@ -58,6 +59,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 				deadlines[i] = d
 			}
 		}
+		n.recheckConflicts(ctx, p, conflicts)
 		for id, publication := range publications {
 			_, until, err := n.verifyPublication(ctx, p, publication.record)
 			if err != nil {
@@ -80,8 +82,12 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 			n.mu.Unlock()
 			continue
 		}
+		n.conflicts = conflicts
 		for i, s := range ss {
 			s.until = deadlines[i]
+			if hold, ok := conflicts[s.peer]; ok && hold.selected && hold.keep == s.instance && time.Now().Before(s.until) && !s.closed.Load() {
+				delete(conflicts, s.peer)
+			}
 		}
 		for id := range n.publications {
 			if publication, ok := publications[id]; ok {

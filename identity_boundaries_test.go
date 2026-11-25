@@ -9,7 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
-	"math/big"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -33,6 +33,8 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	require.NoError(t, err)
 	req, err := pki.CreateCSR(key, pkix.Name{CommonName: "intermediate"})
 	require.NoError(t, err)
+	v4, v6 := f.cluster.MemberPrefixes()
+	profile.PermittedIPs = []netip.Prefix{v4, v6}
 	profile.Subject = req.Subject
 	profile.MaxPathLen = 0
 	profile.NotBefore = now.Add(-time.Minute)
@@ -57,62 +59,52 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	require.True(t, paths[0][2].Equal(f.ca))
 	view, err := f.cfg.compile(f.cluster)
 	require.NoError(t, err)
-	n := &Node{id: labPeer(f.ips[0]), o: Options{Roots: roots}}
+	n := &Node{id: labPeer(f.ips[0]), o: Options{Auth: AuthOptions{Roots: roots}}}
 	cutoff := now.Add(time.Minute)
-	var accepted *x509.Certificate
-	n.o.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+	accepted := root
+	n.o.Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		require.True(t, c.Local)
 		require.Equal(t, leaf.Raw, c.Chain[0].Raw)
-		if accepted == nil || !accepted.Equal(c.Chain[len(c.Chain)-1]) {
+		if !accepted.Equal(c.Chain[len(c.Chain)-1]) {
 			return time.Time{}, errors.New("root denied")
 		}
 		return cutoff, nil
 	}
-	for _, accepted = range []*x509.Certificate{root, f.ca} {
-		until, err := n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
-		if accepted == root {
-			require.Error(t, err)
-		} else {
-			require.NoError(t, err)
-			require.Equal(t, cutoff, until)
-		}
-	}
-	cutoff = now.Add(time.Hour)
-	until, err := n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
-	require.NoError(t, err)
-	require.Equal(t, leaf.NotAfter, until)
-	accepted = nil
 	_, err = n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
 	require.ErrorIs(t, err, ErrPathPolicy)
+	accepted = f.ca
+	until, err := n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	require.NoError(t, err)
+	require.Equal(t, cutoff, until)
+	cutoff = now.Add(time.Hour)
+	until, err = n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	require.NoError(t, err)
+	require.Equal(t, leaf.NotAfter, until)
 
-	// Serial numbers are scoped to the issuer. Exercise the host policy with
-	// the same leaf key, subject and serial signed by two different issuers.
+	// Both issuers are trusted in this cluster and use the same leaf serial.
 	template := *leaf
 	template.ExtraExtensions = leaf.Extensions
-	template.SerialNumber = big.NewInt(17)
-	for _, issuer := range []pki.Issuer{{Chain: []*x509.Certificate{f.ca}, Signer: f.key}, {Chain: []*x509.Certificate{root}, Signer: rootKey}} {
-		der, err := x509.CreateCertificate(rand.Reader, &template, issuer.Chain[0], leafKey.Public(), issuer.Signer)
-		require.NoError(t, err)
-		other, err := x509.ParseCertificate(der)
-		require.NoError(t, err)
-		n.o.CheckChain = func(_ context.Context, check ChainCheck) (time.Time, error) {
-			if check.Chain[0].SerialNumber.Cmp(big.NewInt(17)) == 0 && check.Chain[1].Equal(f.ca) {
-				return time.Time{}, errors.New("issuer and serial withdrawn")
-			}
-			return time.Time{}, nil
+	der, err := x509.CreateCertificate(rand.Reader, &template, f.ca, leafKey.Public(), f.key)
+	require.NoError(t, err)
+	direct, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	require.Zero(t, leaf.SerialNumber.Cmp(direct.SerialNumber))
+	withdrawn := errors.New("issuer and serial withdrawn")
+	n.o.Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+		if c.Chain[1].Equal(f.ca) && c.Chain[0].SerialNumber.Cmp(direct.SerialNumber) == 0 {
+			return time.Time{}, withdrawn
 		}
-		_, err = n.authorizeChain(t.Context(), view, n.id, []*x509.Certificate{other}, x509.ExtKeyUsageClientAuth)
-		if issuer.Chain[0] == f.ca {
-			require.ErrorIs(t, err, ErrPathPolicy)
-		} else {
-			require.Error(t, err)
-		}
+		return time.Time{}, nil
 	}
+	_, err = n.authorizeChain(t.Context(), view, n.id, []*x509.Certificate{direct}, x509.ExtKeyUsageClientAuth)
+	require.ErrorIs(t, err, withdrawn)
+	_, err = n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	require.NoError(t, err)
 }
 
 func TestCredentialAndFrameBudgets(t *testing.T) {
 	f := newFixture(t, "tcp")
-	set := f.opts[0].Certificates
+	set := f.opts[0].Auth.Certificates
 	leaf, err := x509.ParseCertificate(set.Client.Certificate[0])
 	require.NoError(t, err)
 	// Large noncritical extensions keep the DER length fields and Ed25519

@@ -28,6 +28,10 @@ func (n *Node) removeSessionLocked(s *session) {
 	}
 	if len(paths.sessions) == 0 {
 		delete(n.peers, s.peer)
+		if c, ok := n.conflicts[s.peer]; ok && c.confirmedAt.IsZero() {
+			delete(n.conflicts, s.peer)
+			n.admissions++
+		}
 	}
 }
 
@@ -125,7 +129,7 @@ func (n *Node) directEndpointLocked(peer PeerID, ep Endpoint) (*session, int) {
 }
 
 func (n *Node) maintain() {
-	tick := time.NewTicker(n.o.Interval)
+	tick := time.NewTicker(n.o.MaintenanceInterval)
 	defer tick.Stop()
 	next := 0
 	for {
@@ -153,7 +157,7 @@ func (n *Node) maintain() {
 		slices.SortFunc(ss, func(a, b *session) int { return a.lastProbe.Compare(b.lastProbe) })
 		now := time.Now()
 		for _, s := range ss {
-			if s.probing || now.Sub(s.lastProbe) < n.o.Interval*3/4 {
+			if s.probing || now.Sub(s.lastProbe) < n.o.MaintenanceInterval*3/4 {
 				continue
 			}
 			if !n.tryTaskLocked(n.probeSlots, func() { n.probeSession(s) }) {
@@ -210,6 +214,14 @@ func (n *Node) probeSession(s *session) {
 		return
 	}
 	if failures == 0 {
+		n.mu.Lock()
+		s.lastAlive = time.Now()
+		if c, ok := n.conflicts[s.peer]; ok && c.confirmedAt.IsZero() && !at.Before(c.since) && s.lastAlive.Before(c.confirmBy) && n.usableLocked(s) && c.keep == s.instance {
+			c.confirmedAt = s.lastAlive
+			n.conflicts[s.peer] = c
+			n.admissions++
+		}
+		n.mu.Unlock()
 		ad := n.advert(s)
 		body, _ := json.Marshal(ad)
 		b, err = s.request(n.ctx, opHello, body, maxControlFrame)
@@ -225,9 +237,9 @@ func (n *Node) probeSession(s *session) {
 func (n *Node) probeAlternatePaths(s *session, failures int) {
 	n.mu.Lock()
 	paths := n.peers[s.peer]
-	interval := max(5*n.o.Interval, 5*time.Second)
+	interval := max(5*n.o.MaintenanceInterval, 5*time.Second)
 	if failures == 1 {
-		interval = n.o.Interval
+		interval = n.o.MaintenanceInterval
 	}
 	if paths == nil || !n.usableLocked(s) || time.Since(paths.lastCanary) < interval {
 		n.mu.Unlock()

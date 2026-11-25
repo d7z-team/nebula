@@ -44,14 +44,14 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	tcp := make([]*portshare.TCP, 2)
 	for i := range f.opts {
 		f.sockets[i].limit = 0
-		socks[i] = portshare.NewUDP(f.opts[i].UDP4)
-		tcp[i] = portshare.NewTCP(f.opts[i].TCP4)
+		socks[i] = portshare.NewUDP(f.opts[i].Transport.UDP4)
+		tcp[i] = portshare.NewTCP(f.opts[i].Transport.TCP4)
 		t.Cleanup(func() { socks[i].Close(); tcp[i].Close() })
-		f.opts[i].UDP4 = socks[i].Mesh()
-		f.opts[i].TCP4 = tcp[i].Mesh()
+		f.opts[i].Transport.UDP4 = socks[i].Mesh()
+		f.opts[i].Transport.TCP4 = tcp[i].Mesh()
 	}
 	meter := &countingMeshSocket{SharedSocket: socks[1].Mesh()}
-	f.opts[1].UDP4 = meter
+	f.opts[1].Transport.UDP4 = meter
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	names := []string{"one.example.test", "two.example.test", "third.example.test"}
@@ -164,7 +164,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		get(web1, name, "HTTP/1.1")
 	}
 	get(mkH3(quic.Version2), names[0], "HTTP/3.0")
-	bad := &tls.Config{NextProtos: []string{meshwire.ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.opts[0].Roots, ServerName: f.ips[1].String()}
+	bad := &tls.Config{NextProtos: []string{meshwire.ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.opts[0].Auth.Roots, ServerName: f.ips[1].String()}
 	badCtx, stopBad := context.WithTimeout(t.Context(), 2*time.Second)
 	badConn, badErr := siteTr.Dial(badCtx, f.sockets[1].LocalAddr(), bad, &quic.Config{Versions: []quic.Version{quic.Version1}})
 	if badErr == nil {
@@ -209,7 +209,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	require.Equal(t, "before\n", string(first))
 	deliver()
 	for _, mode := range []PathMode{RelayOnly, Blocked} {
-		require.NoError(t, b.SetPeerPathPolicy(f.ips[0], mode))
+		require.NoError(t, b.SetPeerPathPolicy(a.id, mode))
 		before := meter.writes.Load()
 		attempt()
 		b.punch(a.id)
@@ -222,7 +222,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	end, e := io.ReadAll(ongoing.Body)
 	require.NoError(t, e)
 	require.Equal(t, "after\n", string(end))
-	require.NoError(t, b.SetPeerPathPolicy(f.ips[0], Auto))
+	require.NoError(t, b.SetPeerPathPolicy(a.id, Auto))
 	// Apply a restrictive topology with no authorized neighbors at this listener.
 	top := f.cfg
 	top.Members = slices.Clone(top.Members)
@@ -244,14 +244,14 @@ func TestShareCloseOther(t *testing.T) {
 			f := newFixture(t, network, network)
 			var closeOther func() error
 			if network == "udp" {
-				u := portshare.NewUDP(f.opts[1].UDP4)
+				u := portshare.NewUDP(f.opts[1].Transport.UDP4)
 				t.Cleanup(func() { u.Close() })
-				f.opts[1].UDP4 = u.Mesh()
+				f.opts[1].Transport.UDP4 = u.Mesh()
 				closeOther = u.Other().Close
 			} else {
-				u := portshare.NewTCP(f.opts[1].TCP4)
+				u := portshare.NewTCP(f.opts[1].Transport.TCP4)
 				t.Cleanup(func() { u.Close() })
-				f.opts[1].TCP4 = u.Mesh()
+				f.opts[1].Transport.TCP4 = u.Mesh()
 				closeOther = u.Other().Close
 			}
 			f.start()
@@ -290,10 +290,10 @@ func (c *stalledSiteSocket) WriteTo(b []byte, to net.Addr) (int, error) {
 
 func TestShareShutdownDuringWebsiteWrite(t *testing.T) {
 	f := newFixture(t, "udp", "udp")
-	raw := &stalledSiteSocket{f.opts[1].UDP4, make(chan struct{}), make(chan struct{})}
+	raw := &stalledSiteSocket{f.opts[1].Transport.UDP4, make(chan struct{}), make(chan struct{})}
 	share := portshare.NewUDP(raw)
 	t.Cleanup(func() { share.Close() })
-	f.opts[1].UDP4 = share.Mesh()
+	f.opts[1].Transport.UDP4 = share.Mesh()
 	f.start()
 	resume := sync.OnceFunc(func() { close(raw.resume) })
 	t.Cleanup(resume)
@@ -301,7 +301,7 @@ func TestShareShutdownDuringWebsiteWrite(t *testing.T) {
 	require.Eventually(t, func() bool { return len(f.nodes[1].Paths()) != 0 }, time.Second, time.Millisecond)
 	site := make(chan error, 1)
 	go func() {
-		_, err := share.Other().WriteTo([]byte("site write"), f.opts[0].UDP4.LocalAddr())
+		_, err := share.Other().WriteTo([]byte("site write"), f.opts[0].Transport.UDP4.LocalAddr())
 		site <- err
 	}()
 	<-raw.started

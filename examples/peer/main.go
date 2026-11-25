@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -62,9 +64,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	opts := nebula.Options{Roots: x509.NewCertPool()}
+	opts := nebula.Options{Auth: nebula.AuthOptions{Roots: x509.NewCertPool()}}
 	for _, root := range roots {
-		opts.Roots.AddCert(root)
+		opts.Auth.Roots.AddCert(root)
 	}
 	pin, err := readCertificates(*pinFile)
 	if err != nil {
@@ -73,8 +75,8 @@ func run(ctx context.Context) error {
 	if len(pin) != 1 {
 		return fmt.Errorf("%s must contain exactly one cluster CA", *pinFile)
 	}
-	opts.ClusterCA = pin[0]
-	opts.Certificates.Client, err = tls.LoadX509KeyPair(*certFile, *keyFile)
+	opts.Auth.ClusterCA = pin[0]
+	opts.Auth.Certificates.Client, err = tls.LoadX509KeyPair(*certFile, *keyFile)
 	if err != nil {
 		return err
 	}
@@ -82,8 +84,13 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(view, &opts.Topology); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(view))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&opts.Topology); err != nil {
 		return fmt.Errorf("%s: %w", *viewFile, err)
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("%s: unexpected data after topology", *viewFile)
 	}
 	return exchange(ctx, opts, listen, endpoint, peer, resolve, *message)
 }
@@ -98,9 +105,9 @@ func exchange(ctx context.Context, opts nebula.Options, listen, endpoint netip.A
 		return err
 	}
 	if network == "udp4" {
-		opts.UDP4 = socket
+		opts.Transport.UDP4 = socket
 	} else {
-		opts.UDP6 = socket
+		opts.Transport.UDP6 = socket
 	}
 	node, err := nebula.New(ctx, opts)
 	if err != nil {

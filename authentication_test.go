@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"io"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,7 +30,7 @@ func TestIntroductionAfterSignerReload(t *testing.T) {
 	to.acknowledgedIntro.Store(receiver.advert(&session{peer: sender.id}).Seen)
 	require.Empty(t, sender.advert(to).Record)
 
-	set := f.opts[0].Certificates
+	set := f.opts[0].Auth.Certificates
 	set.Object = f.issue(sender.id, pki.Scope{})
 	require.NoError(t, sender.ReloadCertificates(t.Context(), set))
 	record := sender.advert(to).Record
@@ -71,18 +72,18 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			last := len(f.opts) - 1
 			addr := f.ips[last]
 			id := labPeer(addr)
-			cert := f.opts[last].Certificates.Client
+			cert := f.opts[last].Auth.Certificates.Client
 			old, err := x509.ParseCertificate(cert.Certificate[0])
 			require.NoError(t, err)
 			var denied atomic.Bool
-			f.opts[last].CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+			f.opts[last].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 				if denied.Load() && c.Local && c.Chain[0].Equal(old) {
 					return time.Time{}, errors.New("withdrawn local leaf")
 				}
 				return time.Time{}, nil
 			}
 			for i := range f.opts {
-				f.opts[i].Interval = time.Hour
+				f.opts[i].MaintenanceInterval = time.Hour
 				f.opts[i].DialTimeout = 4 * time.Second
 			}
 			signer := &pausingSigner{Signer: cert.PrivateKey.(crypto.Signer), entered: make(chan struct{}), resume: make(chan struct{})}
@@ -92,7 +93,7 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			// the paused signature belongs to the end-to-end TLS handshake.
 			if kind != "relay" {
 				cert.PrivateKey = signer
-				f.opts[last].Certificates.Server = cert
+				f.opts[last].Auth.Certificates.Server = cert
 			}
 			f.start()
 			a, b := f.nodes[0], f.nodes[last]
@@ -100,9 +101,9 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			if kind == "relay" {
 				require.NoError(t, a.ConnectPeer(t.Context(), f.ips[1]))
 				require.NoError(t, f.nodes[1].ConnectPeer(t.Context(), addr))
-				require.NoError(t, a.SetPeerPathPolicy(addr, RelayOnly))
+				require.NoError(t, a.SetPeerPathPolicy(id, RelayOnly))
 				cert.PrivateKey = signer
-				creds := f.opts[last].Certificates
+				creds := f.opts[last].Auth.Certificates
 				creds.Server = cert
 				require.NoError(t, b.ReloadCertificates(t.Context(), creds))
 			}
@@ -119,7 +120,7 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			require.NoError(t, err)
 			root := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
 			now := time.Now().Truncate(time.Second)
-			inter, err := root.IssueCA(req, pki.CAProfile{Subject: req.Subject, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour / 2)}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
+			inter, err := root.IssueCA(req, pki.CAProfile{Subject: req.Subject, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour / 2), PermittedIPs: []netip.Prefix{netip.PrefixFrom(id.IPv4(), 32), netip.PrefixFrom(id.IPv6(), 128)}}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 			require.NoError(t, err)
 			key, err := pki.GenerateKey("ed25519")
 			require.NoError(t, err)
@@ -160,7 +161,7 @@ func TestReloadRejectsExpiredHostDecision(t *testing.T) {
 	f := newFixture(t, "tcp")
 	var cut time.Time
 	var renew atomic.Bool
-	f.opts[0].CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+	f.opts[0].Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
 		if !renew.Load() {
 			return time.Time{}, nil
 		}

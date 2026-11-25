@@ -80,7 +80,7 @@ func (n *Node) authorizeChain(ctx context.Context, p *topologyView, peer PeerID,
 	if _, local := p.members[n.id]; !local || !p.acceptsIdentity(peer) {
 		return time.Time{}, ErrPathPolicy
 	}
-	paths, err := pki.VerifyChain(chain, n.o.Roots, p.cluster, peer, usage, time.Now())
+	paths, err := pki.VerifyChain(chain, n.o.Auth.Roots, p.cluster, peer, usage, time.Now())
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -98,9 +98,9 @@ func (n *Node) chainDeadline(ctx context.Context, check ChainCheck, paths [][]*x
 				end = c.NotAfter
 			}
 		}
-		if n.o.CheckChain != nil {
+		if n.o.Auth.CheckChain != nil {
 			check.Chain = path
-			limit, err := n.o.CheckChain(ctx, check)
+			limit, err := n.o.Auth.CheckChain(ctx, check)
 			if err != nil {
 				denied = err
 				continue
@@ -187,9 +187,16 @@ func (n *Node) ready(p *topologyView) bool {
 	return n.memberOf(p) && time.Now().Before(n.cred.Load().until)
 }
 
+func handshakeUsages(outgoing bool) (local, remote x509.ExtKeyUsage) {
+	if outgoing {
+		return x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth
+	}
+	return x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth
+}
+
 func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
 	cfg := &tls.Config{
-		RootCAs: n.o.Roots, ClientCAs: n.o.Roots, ClientAuth: tls.RequireAndVerifyClientCert,
+		RootCAs: n.o.Auth.Roots, ClientCAs: n.o.Auth.Roots, ClientAuth: tls.RequireAndVerifyClientCert,
 		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, NextProtos: []string{meshwire.ALPN}, SessionTicketsDisabled: true, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
 	}
 	if server {
@@ -209,29 +216,38 @@ func (n *Node) tlsConfig(peer PeerID, server bool) *tls.Config {
 		if st.NegotiatedProtocol != meshwire.ALPN || len(st.PeerCertificates) == 0 || !n.memberOf(p) {
 			return ErrPathPolicy
 		}
-		usage := x509.ExtKeyUsageServerAuth
-		if server {
-			usage = x509.ExtKeyUsageClientAuth
-		}
+		_, usage := handshakeUsages(!server)
 		ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout)
 		defer cancel()
+		var id pki.Identity
+		var paths [][]*x509.Certificate
+		var err error
 		if !server && peer == (PeerID{}) {
-			identity, err := pki.ReadIdentity(st.PeerCertificates[0])
-			if err != nil || identity.ID == n.id {
-				return ErrPathPolicy
+			id, err = pki.ReadIdentity(st.PeerCertificates[0])
+			if err == nil {
+				paths, err = pki.VerifyChain(st.PeerCertificates, n.o.Auth.Roots, p.cluster, id.ID, usage, time.Now())
 			}
-			_, err = n.authorizeChain(ctx, p, identity.ID, st.PeerCertificates, usage)
-			return err
+		} else {
+			id, paths, err = pki.VerifiedPeer(st.VerifiedChains, p.cluster, usage)
 		}
-		identity, paths, err := pki.VerifiedPeer(st.VerifiedChains, p.cluster, usage)
 		if err != nil {
 			return err
 		}
-		if !p.acceptsIdentity(identity.ID) || identity.ID == n.id || peer != (PeerID{}) && identity.ID != peer {
+		if _, err = n.chainDeadline(ctx, ChainCheck{Member: id.ID, Usage: usage}, paths); err != nil {
+			return err
+		}
+		if !p.acceptsIdentity(id.ID) || id.ID == n.id {
+			n.mu.Lock()
+			if n.policy.Load() == p {
+				n.recordObservationLocked(certificateObservation(id.ID, InstanceID{}, st.PeerCertificates[0], usage, "certificate", "address conflict"), nil)
+			}
+			n.mu.Unlock()
 			return ErrPathPolicy
 		}
-		_, err = n.chainDeadline(ctx, ChainCheck{Member: identity.ID, Usage: usage}, paths)
-		return err
+		if peer != (PeerID{}) && peer != id.ID {
+			return ErrPathPolicy
+		}
+		return nil
 	}
 	return cfg
 }
@@ -256,23 +272,36 @@ func (n *Node) statementBody(value any) ([]byte, error) {
 	return json.Marshal(publishedStatement[any]{n.id, value})
 }
 
-func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (pki.Identity, []byte, time.Time, error) {
-	var identity pki.Identity
+type statementSigner struct {
+	pki.Identity
+	leaf *x509.Certificate
+}
+
+func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (statementSigner, []byte, time.Time, error) {
+	var signer statementSigner
 	b, chain, err := pki.VerifyObjectSignature(s, p.cluster.Network(), kind)
 	if err != nil {
-		return identity, nil, time.Time{}, err
+		return signer, nil, time.Time{}, err
 	}
-	identity, err = pki.ReadIdentity(chain[0])
+	signer.Identity, err = pki.ReadIdentity(chain[0])
 	if err != nil {
-		return identity, nil, time.Time{}, err
+		return signer, nil, time.Time{}, err
 	}
-	end, err := n.authorizeChain(ctx, p, identity.ID, chain, x509.ExtKeyUsageCodeSigning)
+	signer.leaf = chain[0]
+	if _, ok := p.members[n.id]; !ok || kind != "introduction" && !p.acceptsIdentity(signer.ID) {
+		return signer, nil, time.Time{}, ErrPathPolicy
+	}
+	paths, err := pki.VerifyChain(chain, n.o.Auth.Roots, p.cluster, signer.ID, x509.ExtKeyUsageCodeSigning, time.Now())
 	if err != nil {
-		return identity, nil, time.Time{}, err
+		return signer, nil, time.Time{}, err
+	}
+	end, err := n.chainDeadline(ctx, ChainCheck{Member: signer.ID, Local: kind != "introduction" && signer.ID == n.id, Usage: x509.ExtKeyUsageCodeSigning}, paths)
+	if err != nil {
+		return signer, nil, time.Time{}, err
 	}
 	var obj publishedStatement[json.RawMessage]
-	if json.Unmarshal(b, &obj) != nil || obj.Publisher != identity.ID {
-		return identity, nil, time.Time{}, ErrPathPolicy
+	if json.Unmarshal(b, &obj) != nil || obj.Publisher != signer.ID {
+		return signer, nil, time.Time{}, ErrPathPolicy
 	}
-	return identity, obj.Value, end, nil
+	return signer, obj.Value, end, nil
 }

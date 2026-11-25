@@ -107,7 +107,7 @@ func VerifiedPeer(paths [][]*x509.Certificate, cluster Cluster, usage x509.ExtKe
 		if len(path) == 0 || !path[0].Equal(leaf) {
 			continue
 		}
-		ca, err := checkDelegation(identity.Scope, path[1:])
+		ca, err := checkDelegation(&identity.Scope, path[1:])
 		if err == nil && ca != nil && string(ca.Raw) == cluster.certificate {
 			accepted = append(accepted, path)
 		}

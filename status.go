@@ -14,6 +14,8 @@ import (
 type PathStatus struct {
 	AuthorizedUntil time.Time
 	Peer            PeerID
+	// Instance identifies the authenticated remote run.
+	Instance InstanceID
 	// Transport is "udp" (QUIC), "tcp" (TLS), or "relay" (an end-to-end circuit).
 	Transport, ALPN     string
 	TLSGroup            tls.CurveID
@@ -80,7 +82,7 @@ func (n *Node) PreferredPath(peer PeerID) (PathStatus, bool) {
 func (s *session) pathStatusLocked(active bool) PathStatus {
 	leaf := s.state.PeerCertificates[0]
 	st := PathStatus{
-		Peer: s.peer, Transport: s.kind, Endpoint: s.remoteEndpoint(), RemoteIPLimit: s.remoteIPLimit, Circuit: slices.Clone(s.path),
+		Peer: s.peer, Instance: s.instance, Transport: s.kind, Endpoint: s.remoteEndpoint(), RemoteIPLimit: s.remoteIPLimit, Circuit: slices.Clone(s.path),
 		AuthorizedUntil: s.until, ALPN: s.state.NegotiatedProtocol, TLSGroup: s.state.CurveID, TLSVersion: s.state.Version,
 		LocalSerial: s.localChain[0].SerialNumber.String(), Serial: leaf.SerialNumber.String(), Expires: leaf.NotAfter, Active: active,
 		DatagramSize: s.budget.Load(), StreamFallbacks: s.overflow.Load(),
@@ -100,10 +102,15 @@ func (s *session) pathStatusLocked(active bool) PathStatus {
 
 // ControlStatus describes local node readiness and cumulative transport activity.
 type ControlStatus struct {
-	Peer               PeerID
+	Peer PeerID
+	// Instance identifies this Node for its lifetime.
+	Instance           InstanceID
 	Serial             string
 	CertificateExpires time.Time
-	Started, Closed    bool
+	// AuthorizedUntil bounds local credentials across all three usages, including
+	// CA and host-imposed limits. Zero means no credential set is authorized.
+	AuthorizedUntil time.Time
+	Started, Closed bool
 	// LastError records the most recent failed peer connection attempt.
 	LastError string
 	// ListenerErrors records terminal listener errors keyed by udp4, udp6, tcp4 or tcp6.
@@ -119,10 +126,11 @@ type ControlStatus struct {
 func (n *Node) ControlStatus() ControlStatus {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	v := ControlStatus{Circuits: len(n.circuits), BytesScheduled: n.bytesScheduled.Load(), DialFailures: n.dialFailures.Load(), LastError: n.lastConnectError, ListenerErrors: maps.Clone(n.listenerErrors)}
+	v := ControlStatus{Instance: n.instance, Circuits: len(n.circuits), BytesScheduled: n.bytesScheduled.Load(), DialFailures: n.dialFailures.Load(), LastError: n.lastConnectError, ListenerErrors: maps.Clone(n.listenerErrors)}
 	credentials := n.cred.Load()
 	leaf := credentials.Client.Leaf
 	v.Peer, v.Serial, v.CertificateExpires = n.id, leaf.SerialNumber.String(), leaf.NotAfter
+	v.AuthorizedUntil = credentials.until
 	v.Started, v.Closed = n.state == running, n.state == closed
 	if p := n.policy.Load(); p != nil {
 		v.Ready = !v.Closed && n.ready(p)

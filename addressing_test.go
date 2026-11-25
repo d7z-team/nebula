@@ -12,29 +12,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestScopedGroups(t *testing.T) {
-	f := newFixture(t, "tcp", "tcp", "tcp")
+func TestClusterGroupRecipients(t *testing.T) {
+	f := newFixture(t, "", "", "")
 	a := netip.MustParseAddr
-	first, second := labPeer(f.ips[0]), labPeer(f.ips[1])
-	third := &f.cfg.Members[2]
-	third.IPv4, third.IPv6 = a("10.14.0.3"), a("fd43::3")
-	for i := range f.cfg.Members {
-		f.cfg.Members[i].MulticastGroups = []netip.Addr{a("224.0.0.22"), a("ff02::123"), a("ff05::123"), a("239.1.1.1"), a("239.1.1.1")}
-	}
+	all := []PeerID{labPeer(f.ips[0]), labPeer(f.ips[1]), labPeer(f.ips[2])}
+	subscribers := all[1:2]
+	f.cfg.Members[1].MulticastGroups = []netip.Addr{a("224.0.0.22"), a("ff02::123"), a("ff05::123"), a("239.1.1.1"), a("239.1.1.1")}
 	f.cfg.EnableMulticast, f.cfg.EnableBroadcast = true, true
 	view, err := f.cfg.compile(f.cluster)
 	require.NoError(t, err)
-	for dst, count := range map[string]int{"255.255.255.255": 2, "10.13.0.255": 2, "224.0.0.1": 2, "ff02::1": 2, "224.0.0.22": 2, "ff02::123": 2, "ff01::1": 0, "239.1.1.1": 3, "ff05::123": 3, "239.1.1.2": 0} {
-		peers, group, err := view.groupRecipients(first, a(dst))
+	for dst, want := range map[string][]PeerID{
+		"255.255.255.255": all, "10.13.0.255": all, "224.0.0.1": all, "ff02::1": all,
+		"224.0.0.22": subscribers, "ff02::123": subscribers, "ff05::123": subscribers, "239.1.1.1": subscribers,
+		"ff01::1": nil, "239.1.1.2": nil,
+	} {
+		peers, group, err := view.groupRecipients(a(dst))
 		require.NoError(t, err)
 		require.True(t, group)
-		require.Len(t, peers, count)
-		if count > 0 {
-			require.Contains(t, peers, second)
-		}
+		require.Equal(t, want, peers, dst)
 	}
-	_, _, err = view.groupRecipients(first, a("10.14.0.255"))
-	require.ErrorIs(t, err, ErrPathPolicy)
 }
 
 func TestBoundedGroupQueues(t *testing.T) {
@@ -75,13 +71,13 @@ func TestBoundedGroupQueues(t *testing.T) {
 func TestIngressVIPAndGroupAuthority(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	a, b := f.ips[0], f.ips[1]
-	vip, group := netip.MustParseAddr("10.13.0.200"), netip.MustParseAddr("239.1.2.3")
+	vip, group := netip.MustParseAddr("198.51.100.200"), netip.MustParseAddr("239.1.2.3")
 	any := netip.MustParsePrefix("0.0.0.0/0")
 	// The topology activates the VIP, but neither handshake credential grants it.
 	for i, m := range f.cfg.Members {
 		f.cfg.Members[i].AnycastIPs = []netip.Addr{vip}
 		f.cfg.Members[i].RoutedPrefixes = []netip.Prefix{any}
-		f.opts[i].Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{RoutedPrefixes: []netip.Prefix{any}})
+		f.opts[i].Auth.Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{RoutedPrefixes: []netip.Prefix{any}})
 	}
 	f.cfg.EnableMulticast = true
 	f.cfg.Members[1].MulticastGroups = []netip.Addr{group}
@@ -196,11 +192,11 @@ func TestResolveNextHopWithTopologyChange(t *testing.T) {
 
 func TestAnycastSubmissionAndWithdrawal(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	vip := netip.MustParseAddr("10.13.0.200")
+	vip := netip.MustParseAddr("198.51.100.200")
 	for i := 1; i < len(f.opts); i++ {
 		m := &f.cfg.Members[i]
 		m.AnycastIPs = []netip.Addr{vip}
-		f.opts[i].Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{AnycastIPs: m.AnycastIPs})
+		f.opts[i].Auth.Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{AnycastIPs: m.AnycastIPs})
 	}
 	// The client initially has an endpoint only for B.
 	endpoints := f.cfg.Members[1].Endpoints
@@ -278,7 +274,7 @@ func TestAnycastSubmissionAndWithdrawal(t *testing.T) {
 }
 
 // Return once the first packet is waiting for bandwidth and the rest are queued.
-func queueShapedPackets(t *testing.T, a, b *Node, bodies ...string) (*IPPort, <-chan TransmitResult, <-chan string) {
+func queueShapedPackets(t *testing.T, a, b *Node, dst netip.Addr, bodies ...string) (*IPPort, <-chan TransmitResult, <-chan string) {
 	t.Helper()
 	received := make(chan string, len(bodies))
 	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- string(pkt[20:]) }})
@@ -288,7 +284,7 @@ func queueShapedPackets(t *testing.T, a, b *Node, bodies ...string) (*IPPort, <-
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
 	for _, body := range bodies {
-		require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), body)))
+		require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), dst, body)))
 	}
 	require.Eventually(t, func() bool {
 		return a.limiter.Tokens() < 0 && port.Stats().Queued == len(bodies)-1
@@ -300,12 +296,12 @@ func TestChaosPathLossWhileShaping(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	f.cfg.Members[0].BytesPerSecond = 1
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
-	port, results, received := queueShapedPackets(t, a, b, "in flight", "queued")
+	port, results, received := queueShapedPackets(t, a, b, b.id.IPv4(), "in flight", "queued")
 	require.Eventually(t, func() bool { return b.preferredSession(a.id, true) != nil }, time.Second, time.Millisecond)
 	b.preferredSession(a.id, true).close()
 	require.Eventually(t, func() bool { _, ok := a.PreferredPath(b.id); return !ok }, time.Second, time.Millisecond)
@@ -332,7 +328,15 @@ func TestReplyViaIngressGateway(t *testing.T) {
 	for i := 1; i < len(f.opts); i++ {
 		m := &f.cfg.Members[i]
 		m.RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
-		f.opts[i].Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{RoutedPrefixes: m.RoutedPrefixes})
+		if i == 1 {
+			m.RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
+		}
+		f.opts[i].Auth.Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{RoutedPrefixes: m.RoutedPrefixes})
+	}
+	var siteOnly atomic.Bool
+	siteID := labPeer(f.ips[2])
+	f.opts[0].InboundPolicy = func(from PeerID, source, dest netip.Addr) bool {
+		return !siteOnly.Load() || from == siteID
 	}
 	f.start()
 	service := f.nodes[0]
@@ -343,10 +347,12 @@ func TestReplyViaIngressGateway(t *testing.T) {
 	requests := make(chan receipt, 2)
 	server, err := service.OpenIPPort(IPPortOptions{Deliver: func(from PeerID, b []byte) { requests <- receipt{from, b} }})
 	require.NoError(t, err)
+	ports := make([]*IPPort, 0, 2)
 	for _, gw := range f.nodes[1:] {
 		replies := make(chan receipt, 2)
 		port, err := gw.OpenIPPort(IPPortOptions{Deliver: func(from PeerID, b []byte) { replies <- receipt{from, b} }})
 		require.NoError(t, err)
+		ports = append(ports, port)
 		body := gw.id.String()
 		require.NoError(t, port.WriteIP(PeerID{}, testIPv4(src, service.id.IPv4(), body)))
 		select {
@@ -365,6 +371,50 @@ func TestReplyViaIngressGateway(t *testing.T) {
 			t.Fatal("missing gateway reply")
 		}
 	}
+	siteOnly.Store(true)
+	for _, port := range ports {
+		require.NoError(t, port.WriteIP(PeerID{}, testIPv4(src, service.id.IPv4(), "site only")))
+	}
+	require.Eventually(t, func() bool { return server.Stats().RejectedInbound == 1 && len(requests) == 1 }, 2*time.Second, time.Millisecond)
+	require.Equal(t, siteID, (<-requests).from)
+}
+
+// Withdraw one client's default exit while it has both a shaped packet and
+// a backlog. The site route and another client's exit decision stay usable.
+func TestChaosDefaultExitWithdrawal(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp", "tcp")
+	dst := netip.MustParseAddr("172.30.0.8")
+	for i, prefix := range []string{"0.0.0.0/0", "172.30.0.0/24"} {
+		m := &f.cfg.Members[i+1]
+		m.RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix(prefix)}
+		f.opts[i+1].Auth.Certificates.Client = f.issue(labPeer(m.IPv4), pki.Scope{RoutedPrefixes: m.RoutedPrefixes})
+	}
+	f.cfg.Members[0].BytesPerSecond = 1
+	f.start()
+	a, exit, site, b := f.nodes[0], f.nodes[1], f.nodes[2], f.nodes[3]
+	require.NoError(t, a.ConnectPeerID(t.Context(), exit.id))
+	out, results, atExit := queueShapedPackets(t, a, exit, dst, "in flight", "queued")
+	for _, addr := range []netip.Addr{a.id.IPv4(), netip.MustParseAddr("10.13.0.99"), netip.MustParseAddr("198.51.100.200")} {
+		require.ErrorIs(t, out.WriteIP(exit.id, testIPv4(a.id.IPv4(), addr, "reserved")), ErrAddressUnauthorized)
+	}
+	f.cfg.Members[1].RoutedPrefixes = nil
+	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
+	require.Eventually(t, func() bool { return len(results) > 0 }, time.Second, time.Millisecond)
+	require.ErrorIs(t, (<-results).Err, ErrAddressUnauthorized)
+	require.EqualValues(t, 2, out.Stats().RejectedOutbound)
+	require.Zero(t, out.Stats().Queued)
+	f.cfg.Members[0].BytesPerSecond = 0
+	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
+	atSite := make(chan string, 1)
+	_, err := site.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { atSite <- string(pkt[20:]) }})
+	require.NoError(t, err)
+	other, err := b.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
+	require.NoError(t, err)
+	require.NoError(t, out.WriteIP(site.id, testIPv4(a.id.IPv4(), dst, "site")))
+	require.NoError(t, other.WriteIP(exit.id, testIPv4(b.id.IPv4(), dst, "exit")))
+	require.Eventually(t, func() bool { return len(atSite) == 1 && len(atExit) == 1 }, 2*time.Second, time.Millisecond)
+	require.Equal(t, "site", <-atSite)
+	require.Equal(t, "exit", <-atExit)
 }
 
 func BenchmarkPacketAuthorization(b *testing.B) {
@@ -410,7 +460,7 @@ func TestChaosRelayOnlyWhileShaping(t *testing.T) {
 	f.cfg.Members[1].Transit = true
 	f.cfg.Members[0].BytesPerSecond = 1
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.start()
 	a, r, b := f.nodes[0], f.nodes[1], f.nodes[2]
@@ -420,8 +470,8 @@ func TestChaosRelayOnlyWhileShaping(t *testing.T) {
 	direct, ok := a.PreferredPath(b.id)
 	require.True(t, ok)
 	require.Equal(t, "tcp", direct.Transport)
-	out, results, received := queueShapedPackets(t, a, b, "in flight", "second", "third")
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	out, results, received := queueShapedPackets(t, a, b, b.id.IPv4(), "in flight", "second", "third")
+	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
 	select {
 	case r := <-results:
 		require.ErrorIs(t, r.Err, ErrPathPolicy)

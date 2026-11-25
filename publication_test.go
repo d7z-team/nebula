@@ -20,14 +20,14 @@ import (
 
 func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
-	pair := &f.opts[0].Certificates.Client
+	pair := &f.opts[0].Auth.Certificates.Client
 	leaf, err := x509.ParseCertificate(pair.Certificate[0])
 	require.NoError(t, err)
 	leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}, Value: make([]byte, (24<<10)-len(leaf.Raw)-len(leaf.RawIssuer)-128)})
 	pair.Certificate[0], err = x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
 	require.NoError(t, err)
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.start()
 	// All three default roles must own their certificate data after New.
@@ -100,7 +100,7 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 func TestPublicationRepairAndPolicyWithdrawal(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
 	// The first delivery uses push. Only the late joiner polls for inventory.
-	f.opts[0].Interval, f.opts[1].Interval = time.Hour, time.Hour
+	f.opts[0].MaintenanceInterval, f.opts[1].MaintenanceInterval = time.Hour, time.Hour
 	f.start()
 	a, mid, b := f.nodes[0], f.nodes[1], f.nodes[2]
 	require.NoError(t, a.ConnectPeer(t.Context(), mid.id.IPv4()))
@@ -142,7 +142,7 @@ func TestPublicationRepairAndPolicyWithdrawal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, id, duplicate)
 	require.Empty(t, sub.Publications())
-	f.cfg.Members[0].Topics = []string{"app/metrics"}
+	f.cfg.Members[0].PublishTopics = []string{"app/metrics"}
 	require.NoError(t, b.ApplyTopology(t.Context(), f.cfg))
 	_, err = b.acceptPublication(t.Context(), nil, cached, "")
 	require.ErrorIs(t, err, ErrPathPolicy)

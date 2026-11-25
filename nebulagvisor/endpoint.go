@@ -114,7 +114,7 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 			return i, &tcpip.ErrClosedForSend{}
 		case errors.Is(err, nebula.ErrNextHopRequired), errors.Is(err, nebula.ErrPeerUnavailable):
 			return i, &tcpip.ErrHostUnreachable{}
-		case errors.Is(err, nebula.ErrAddressUnauthorized), errors.Is(err, nebula.ErrPathPolicy):
+		case errors.Is(err, nebula.ErrAddressUnauthorized), errors.Is(err, nebula.ErrPathPolicy), errors.Is(err, nebula.ErrInstanceConflict):
 			return i, &tcpip.ErrNotPermitted{}
 		default:
 			return i, &tcpip.ErrBadAddress{}

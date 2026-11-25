@@ -53,12 +53,12 @@ func run(port uint) error {
 	if err != nil {
 		return err
 	}
-	options[0].UDP4, options[0].TCP4 = udp.Mesh(), tcp.Mesh()
-	options[1].UDP4, err = net.ListenPacket("udp4", "127.0.0.1:0")
+	options[0].Transport.UDP4, options[0].Transport.TCP4 = udp.Mesh(), tcp.Mesh()
+	options[1].Transport.UDP4, err = net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
-	defer options[1].UDP4.Close()
+	defer options[1].Transport.UDP4.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var peer *nebula.Node

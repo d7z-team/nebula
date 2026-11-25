@@ -78,5 +78,8 @@ func run() error {
 		return err
 	}
 	fmt.Printf("IPv6 reply from %s\n", target.Peer)
+	for _, row := range nodes[1].InspectIP(target.Peer.IPv4()) {
+		fmt.Printf("%s %s: peer=%s instance=%s certificate=%s\n", row.Source, row.Decision, row.Peer, row.Instance, row.CertificateSHA256)
+	}
 	return nil
 }

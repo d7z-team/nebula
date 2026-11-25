@@ -81,9 +81,9 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 		Scope: &pki.Scope{
 			Network: "lab", Cluster: true,
 			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
-			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27"), netip.MustParsePrefix("fd42::c0/123")},
+			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27"), netip.MustParsePrefix("fd42::c0/123"), netip.MustParsePrefix("198.51.100.192/28")},
 		},
-		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("10.14.0.0/24"), netip.MustParsePrefix("fd42::/64"), netip.MustParsePrefix("fd43::/64")},
+		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd42::/64")},
 		MaxPathLen:   -1,
 	})
 	require.NoError(t, e)
@@ -97,8 +97,12 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 
 		id := labPeer(a)
 		cert := f.issue(id, pki.Scope{})
-		o := Options{Roots: roots, ClusterCA: ca, Certificates: LocalCertificates{Client: cert}, Interval: 120 * time.Millisecond, DialTimeout: 700 * time.Millisecond}
-		m := Member{IPv4: a, IPv6: id.IPv6(), Topics: []string{"app/test"}}
+		o := Options{
+			Auth:                AuthOptions{Roots: roots, ClusterCA: ca, Certificates: LocalCertificates{Client: cert}},
+			MaintenanceInterval: 120 * time.Millisecond,
+			DialTimeout:         700 * time.Millisecond,
+		}
+		m := Member{IPv4: a, IPv6: id.IPv6(), PublishTopics: []string{"app/test"}}
 		const loopback = "127.0.0.1:0"
 		var sock *meteredSocket
 		if kind == "udp" || kind == "both" {
@@ -110,7 +114,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 					break
 				}
 				// An ephemeral port assigned by UDP may already be in use by TCP.
-				o.TCP4, e = net.Listen("tcp4", pc.LocalAddr().String())
+				o.Transport.TCP4, e = net.Listen("tcp4", pc.LocalAddr().String())
 				if e == nil {
 					break
 				}
@@ -120,15 +124,15 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 				}
 			}
 			sock = &meteredSocket{UDPConn: pc, sent: map[netip.AddrPort]int{}, limit: 1200}
-			o.UDP4 = sock
+			o.Transport.UDP4 = sock
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "udp", Address: addrPort(pc.LocalAddr())})
 			t.Cleanup(func() { pc.Close() })
 		}
 		if kind == "tcp" {
-			o.TCP4, e = net.Listen("tcp4", loopback)
+			o.Transport.TCP4, e = net.Listen("tcp4", loopback)
 			require.NoError(t, e)
 		}
-		if l := o.TCP4; l != nil {
+		if l := o.Transport.TCP4; l != nil {
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "tcp", Address: addrPort(l.Addr())})
 			t.Cleanup(func() { l.Close() })
 		}
@@ -223,7 +227,7 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	a, b := f.ips[0], f.ips[1]
 	f.link(0, 1)
 	f.cfg.Members[1].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
-	f.opts[1].Certificates.Client = f.issue(labPeer(b), pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
+	f.opts[1].Auth.Certificates.Client = f.issue(labPeer(b), pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
 	f.start()
 	x, y := f.nodes[0], f.nodes[1]
 	require.NoError(t, x.ConnectPeer(t.Context(), b))
@@ -259,7 +263,7 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	f.cfg.Members[0].Links = nil
 	require.NoError(t, x.ApplyTopology(t.Context(), f.cfg))
 	require.ErrorIs(t, out.WriteIP(labPeer(b), packets[2]), ErrAddressUnauthorized)
-	require.NoError(t, x.SetPeerPathPolicy(b, Blocked))
+	require.NoError(t, x.SetPeerPathPolicy(labPeer(b), Blocked))
 	require.Empty(t, x.Paths())
 	require.NoError(t, y.ApplyTopology(t.Context(), f.cfg))
 	require.False(t, y.ControlStatus().Ready)
@@ -272,7 +276,7 @@ func TestTCPFallbackOnInitialDial(t *testing.T) {
 	f.opts[0].DialTimeout = 5 * time.Second
 	started, release := make(chan struct{}, 1), make(chan struct{})
 	var calls atomic.Int32
-	f.opts[0].DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+	f.opts[0].Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
 		calls.Add(1)
 		select {
 		case started <- struct{}{}:
@@ -326,11 +330,11 @@ func TestConnectPeerAcceptsInboundDuringDial(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	vip := netip.MustParseAddr("10.13.0.200")
 	f.cfg.Members[1].AnycastIPs = []netip.Addr{vip}
-	f.opts[1].Certificates.Client = f.issue(labPeer(f.ips[1]), pki.Scope{AnycastIPs: []netip.Addr{vip}})
+	f.opts[1].Auth.Certificates.Client = f.issue(labPeer(f.ips[1]), pki.Scope{AnycastIPs: []netip.Addr{vip}})
 	started, release := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int32
 	f.opts[0].DialTimeout = 10 * time.Second
-	f.opts[0].DialTCP = func(ctx context.Context, _, _ string) (net.Conn, error) {
+	f.opts[0].Transport.DialTCP = func(ctx context.Context, _, _ string) (net.Conn, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 		}
@@ -343,7 +347,7 @@ func TestConnectPeerAcceptsInboundDuringDial(t *testing.T) {
 	}
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), DirectOnly))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, DirectOnly))
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	sent := make(chan TransmitResult, 2)
@@ -401,9 +405,9 @@ func TestMixedRelayOnlyAndTopologyWithdrawal(t *testing.T) {
 	// This relay has its own publishing policy while the whole path is authorized.
 	local := f.cfg
 	local.Members = slices.Clone(f.cfg.Members)
-	local.Members[1].Topics = []string{"app/relay"}
+	local.Members[1].PublishTopics = []string{"app/relay"}
 	require.NoError(t, f.nodes[1].ApplyTopology(ctx, local))
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
 	err := a.ConnectPeer(ctx, b.id.IPv4())
 	if err != nil {
 		for _, n := range f.nodes {
@@ -435,13 +439,13 @@ func TestMixedRelayOnlyAndTopologyWithdrawal(t *testing.T) {
 func TestRelayOnlyEnforcesUnderlayPolicy(t *testing.T) {
 	f := newFixture(t, "both", "both")
 	var tcpDials atomic.Int64
-	f.opts[0].DialTCP = func(context.Context, string, string) (net.Conn, error) {
+	f.opts[0].Transport.DialTCP = func(context.Context, string, string) (net.Conn, error) {
 		tcpDials.Add(1)
 		return nil, errors.New("unexpected dial")
 	}
 	f.start()
 	a, b := f.nodes[0], f.ips[1]
-	require.NoError(t, a.SetPeerPathPolicy(b, RelayOnly))
+	require.NoError(t, a.SetPeerPathPolicy(labPeer(b), RelayOnly))
 	require.Error(t, a.ConnectPeer(t.Context(), b))
 	a.punch(labPeer(b))
 	require.Zero(t, tcpDials.Load())
@@ -480,13 +484,13 @@ func TestParallelCircuitFailover(t *testing.T) {
 	f.opts[0].MaxCircuits = 1
 	f.start()
 	a, b := f.nodes[0], f.nodes[3]
-	require.NoError(t, a.SetPeerPathPolicy(b.id.IPv4(), RelayOnly))
+	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
 	s := a.preferredSession(b.id, false)
 	require.NotNil(t, s)
 	path := slices.Clone(s.path)
 	require.ErrorIs(t, a.startCircuit(t.Context(), path), ErrPathPolicy)
-	require.NoError(t, a.SetPeerPathPolicy(path[1].IPv4(), Blocked))
+	require.NoError(t, a.SetPeerPathPolicy(path[1], Blocked))
 	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
 	next := a.preferredSession(b.id, false)
 	require.NotNil(t, next)
@@ -505,9 +509,9 @@ func BenchmarkMeshIP(b *testing.B) {
 			f := newFixture(b, transport, transport)
 			if shared {
 				for i := range f.opts {
-					mux := portshare.NewUDP(f.opts[i].UDP4)
+					mux := portshare.NewUDP(f.opts[i].Transport.UDP4)
 					b.Cleanup(func() { mux.Close() })
-					f.opts[i].UDP4 = mux.Mesh()
+					f.opts[i].Transport.UDP4 = mux.Mesh()
 				}
 			}
 			f.start()
@@ -545,7 +549,7 @@ func BenchmarkPathStatus(b *testing.B) {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
 			f := newFixture(b, slices.Repeat([]string{"tcp"}, count+1)...)
 			for i := range f.opts {
-				f.opts[i].Interval = time.Hour
+				f.opts[i].MaintenanceInterval = time.Hour
 			}
 			f.start()
 			node := f.nodes[0]
@@ -557,6 +561,33 @@ func BenchmarkPathStatus(b *testing.B) {
 					b.Fatalf("got %d sessions, want %d", got, count)
 				}
 			}
+		})
+	}
+}
+
+func TestNodeOptionLimits(t *testing.T) {
+	f := newFixture(t, "")
+	opts := Options{Auth: f.opts[0].Auth, Topology: f.cfg}
+	n, err := New(t.Context(), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { n.Close() })
+	require.Equal(t, 2*time.Second, n.o.MaintenanceInterval)
+	require.Equal(t, 4*time.Second, n.o.DialTimeout)
+	require.Equal(t, 128, n.o.MaxCircuits)
+	require.Equal(t, MaxIPPacketSize, n.MaxIPSize())
+
+	for _, tc := range []struct {
+		field string
+		opts  Options
+	}{
+		{"MaintenanceInterval", Options{MaintenanceInterval: -time.Second}},
+		{"DialTimeout", Options{DialTimeout: -time.Second}},
+		{"MaxCircuits", Options{MaxCircuits: -1}},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			tc.opts.Auth, tc.opts.Topology = opts.Auth, opts.Topology
+			_, err := New(t.Context(), tc.opts)
+			require.ErrorContains(t, err, tc.field)
 		})
 	}
 }
@@ -573,7 +604,14 @@ func TestNodeLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	sub, err := n.Subscribe("app/test")
 	require.NoError(t, err)
-	require.NoError(t, n.SetPeerPathPolicy(peer, DirectOnly))
+	require.NoError(t, n.SetPeerPathPolicy(labPeer(peer), DirectOnly))
+	offline := labPeer(netip.MustParseAddr("10.13.0.42"))
+	_, known := n.LookupPeer(offline.IPv4())
+	require.False(t, known)
+	require.NoError(t, n.SetPeerPathPolicy(offline, RelayOnly))
+	configured, effective := n.PeerPathPolicy(offline)
+	require.Equal(t, RelayOnly, configured)
+	require.Equal(t, RelayOnly, effective)
 	ip := testIPv4(f.ips[0], peer, "data")
 	checkOperations := func(want error) {
 		t.Helper()

@@ -5,22 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"net"
 	"net/netip"
 	"slices"
 )
 
 // Cluster is an immutable address plan from a cluster CA. Its zero value is invalid.
 type Cluster struct {
-	certificate                      string
-	network                          string
-	subnets, pools, excluded, routes []netip.Prefix
+	certificate             string
+	network                 string
+	ipv4, ipv6              netip.Prefix
+	pools, excluded, routes []netip.Prefix
 }
 
 // Network returns the certified mesh network name.
 func (c Cluster) Network() string { return c.network }
 
-// Subnets returns a copy of the logical member subnets.
-func (c Cluster) Subnets() []netip.Prefix { return slices.Clone(c.subnets) }
+// MemberPrefixes returns the two prefixes defining the logical mesh link.
+func (c Cluster) MemberPrefixes() (ipv4, ipv6 netip.Prefix) { return c.ipv4, c.ipv6 }
 
 // AnycastPools returns a copy of the reserved service address pools.
 func (c Cluster) AnycastPools() []netip.Prefix { return slices.Clone(c.pools) }
@@ -34,10 +36,12 @@ func covers(ranges []netip.Prefix, p netip.Prefix) bool {
 
 // Subnet returns the logical subnet containing addr, or a zero prefix.
 func (c Cluster) Subnet(addr netip.Addr) netip.Prefix {
-	for _, p := range c.subnets {
-		if p.Contains(addr) {
-			return p
-		}
+	p := c.ipv6
+	if addr.Is4() {
+		p = c.ipv4
+	}
+	if p.Contains(addr) {
+		return p
 	}
 	return netip.Prefix{}
 }
@@ -59,19 +63,20 @@ func lastAddress(p netip.Prefix) netip.Addr {
 	return a
 }
 
-// MemberAddresses lazily yields assignable primary addresses in a certified
-// subnet. The caller must atomically reserve a free pair in its own store.
-func (c Cluster) MemberAddresses(subnet netip.Prefix) iter.Seq[netip.Addr] {
+// MemberAddresses yields assignable primaries in a canonical range within a member prefix.
+// The caller reserves a free pair and checks any narrower issuing CA constraints.
+func (c Cluster) MemberAddresses(within netip.Prefix) iter.Seq[netip.Addr] {
 	return func(yield func(netip.Addr) bool) {
-		if !slices.Contains(c.subnets, subnet) {
+		subnet := c.Subnet(within.Addr())
+		if !subnet.IsValid() || within != within.Masked() || within.Bits() < subnet.Bits() {
 			return
 		}
-		first, broadcast := subnet.Addr(), Broadcast(subnet)
+		first, broadcast := within.Addr(), Broadcast(subnet)
 		if reservedSubnetAddress(subnet, first) {
 			first = first.Next()
 		}
 	addresses:
-		for a := first; subnet.Contains(a) && a != broadcast; a = a.Next() {
+		for a := first; within.Contains(a) && a != broadcast; a = a.Next() {
 			for _, ranges := range [][]netip.Prefix{c.pools, c.excluded} {
 				for _, p := range ranges {
 					if p.Contains(a) {
@@ -128,43 +133,91 @@ func ReadClusterCA(cert *x509.Certificate) (Cluster, error) {
 	if err != nil {
 		return Cluster{}, err
 	}
-	return clusterFromScope(parsed, scope)
+	return clusterAddressPlan(parsed, scope)
 }
 
-// Both entry points supply a certificate parsed from DER and its signed scope.
-func clusterFromScope(parsed *x509.Certificate, scope Scope) (Cluster, error) {
+// Validate the same address plan on an issuance template and on a parsed certificate.
+func clusterAddressPlan(parsed *x509.Certificate, scope Scope) (Cluster, error) {
 	if !scope.Cluster || !parsed.IsCA || !parsed.BasicConstraintsValid || parsed.KeyUsage&x509.KeyUsageCertSign == 0 {
 		return Cluster{}, errors.New("cluster CA profile required")
 	}
 	c := Cluster{certificate: string(parsed.Raw), network: scope.Network, pools: scope.AnycastPools, routes: scope.RoutedPrefixes}
-	v4, v6 := false, false
 	for _, r := range parsed.PermittedIPRanges {
-		p, err := netip.ParsePrefix(r.String())
-		if err != nil || !validUnicastPrefix(p) || slices.ContainsFunc(c.subnets, p.Overlaps) {
-			return Cluster{}, fmt.Errorf("invalid or overlapping cluster subnet %v", r)
+		p := constraintPrefix(r)
+		dst := &c.ipv6
+		if p.Addr().Is4() {
+			dst = &c.ipv4
 		}
-		v4 = v4 || p.Addr().Is4()
-		v6 = v6 || p.Addr().Is6()
-		c.subnets = append(c.subnets, p)
+		if !validUnicastPrefix(p) || dst.IsValid() {
+			return Cluster{}, fmt.Errorf("invalid or repeated member prefix for address family: %v", r)
+		}
+		*dst = p
 	}
-	if !v4 || !v6 {
-		return Cluster{}, errors.New("cluster CA requires IPv4 and IPv6 member subnets")
+	if !c.ipv4.IsValid() || !c.ipv6.IsValid() {
+		return Cluster{}, errors.New("cluster CA requires one IPv4 and one IPv6 member prefix")
 	}
 	for _, r := range parsed.ExcludedIPRanges {
-		p, err := netip.ParsePrefix(r.String())
-		if err != nil {
-			return Cluster{}, err
+		p := constraintPrefix(r)
+		if !p.IsValid() {
+			return Cluster{}, fmt.Errorf("invalid excluded IP range %v", r)
 		}
 		c.excluded = append(c.excluded, p)
 	}
 	for _, pool := range c.pools {
-		for _, subnet := range c.subnets {
+		for _, subnet := range []netip.Prefix{c.ipv4, c.ipv6} {
 			if pool.Overlaps(subnet) && pool.Bits() < subnet.Bits() {
 				return Cluster{}, fmt.Errorf("anycast pool %s spans member subnet %s", pool, subnet)
 			}
 		}
 	}
 	return c, nil
+}
+
+func constraintPrefix(r *net.IPNet) netip.Prefix {
+	addr, ok := netip.AddrFromSlice(r.IP)
+	bits, size := r.Mask.Size()
+	if !ok || addr.BitLen() != size {
+		return netip.Prefix{}
+	}
+	return netip.PrefixFrom(addr, bits)
+}
+
+// checkDelegatedRanges validates a delegated CA before signing and on each candidate
+// verification path. Below the cluster CA, both families must be explicit.
+func checkDelegatedRanges(child *x509.Certificate, parents []*x509.Certificate, belowCluster bool) error {
+	var v4, v6 bool
+	for _, r := range child.PermittedIPRanges {
+		p := constraintPrefix(r)
+		if !p.IsValid() || belowCluster && !validUnicastPrefix(p) {
+			return fmt.Errorf("invalid delegated prefix %v", r)
+		}
+		v4 = v4 || p.Addr().Is4()
+		v6 = v6 || p.Addr().Is6()
+		if err := checkPermittedRange(p, parents); err != nil {
+			return err
+		}
+	}
+	if belowCluster && !(v4 && v6) {
+		return errors.New("member issuer requires explicit IPv4 and IPv6 ranges")
+	}
+	return nil
+}
+
+func checkPermittedRange(p netip.Prefix, parents []*x509.Certificate) error {
+	for _, c := range parents {
+		for _, r := range c.ExcludedIPRanges {
+			if p.Overlaps(constraintPrefix(r)) {
+				return fmt.Errorf("issuer excludes addresses in %s", p)
+			}
+		}
+		if len(c.PermittedIPRanges) > 0 && !slices.ContainsFunc(c.PermittedIPRanges, func(r *net.IPNet) bool {
+			allowed := constraintPrefix(r)
+			return allowed.Contains(p.Addr()) && allowed.Bits() <= p.Bits()
+		}) {
+			return fmt.Errorf("IP range %s exceeds issuer permission", p)
+		}
+	}
+	return nil
 }
 
 func validUnicastPrefix(p netip.Prefix) bool {

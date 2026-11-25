@@ -22,11 +22,11 @@ func NewIssuer() (pki.Issuer, error) {
 	root, err := pki.CreateRoot(key, pki.CAProfile{
 		Scope: &pki.Scope{
 			Network: "demo", Cluster: true,
-			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("172.30.0.0/24"), netip.MustParsePrefix("2001:db8:42::/64")},
+			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
 			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27")},
 		},
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd13::/64")},
-		Subject:      pkix.Name{CommonName: "Demo CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
+		MaxPathLen:   1, Subject: pkix.Name{CommonName: "Demo CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
 	})
 	if err != nil {
 		return pki.Issuer{}, err

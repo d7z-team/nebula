@@ -17,6 +17,7 @@ type packetConn struct {
 	in          chan datagram
 	done        chan struct{}
 	once        sync.Once
+	err         error // Published by closing done.
 	read, write deadline
 }
 
@@ -38,12 +39,12 @@ func (d *deadline) set(at time.Time) {
 }
 
 // A deadline change also wakes operations queued behind the other branch's writer.
-func waitFor[T any](ready <-chan T, closed <-chan struct{}, d *deadline) (T, error) {
+func waitFor[T any](ready <-chan T, c *packetConn, d *deadline) (T, error) {
 	var zero T
 	for {
 		select {
-		case <-closed:
-			return zero, net.ErrClosed
+		case <-c.done:
+			return zero, c.err
 		default:
 		}
 		d.mu.Lock()
@@ -63,8 +64,8 @@ func waitFor[T any](ready <-chan T, closed <-chan struct{}, d *deadline) (T, err
 		var err error
 		retry := false
 		select {
-		case <-closed:
-			err = net.ErrClosed
+		case <-c.done:
+			err = c.err
 		case <-alarm:
 			// The deadline may have been extended while the timer was ready.
 			retry = true
@@ -82,7 +83,7 @@ func waitFor[T any](ready <-chan T, closed <-chan struct{}, d *deadline) (T, err
 }
 
 func (c *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	pkt, err := waitFor(c.in, c.done, &c.read)
+	pkt, err := waitFor(c.in, c, &c.read)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -90,7 +91,13 @@ func (c *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 func (c *packetConn) LocalAddr() net.Addr { return c.parent.raw.LocalAddr() }
 func (c *packetConn) Close() error {
+	c.shutdown(net.ErrClosed)
+	return nil
+}
+
+func (c *packetConn) shutdown(err error) {
 	c.once.Do(func() {
+		c.err = err
 		close(c.done)
 		p := c.parent
 		p.writeMu.Lock()
@@ -99,7 +106,6 @@ func (c *packetConn) Close() error {
 			p.raw.SetWriteDeadline(time.Now())
 		}
 	})
-	return nil
 }
 
 func (c *packetConn) SetDeadline(t time.Time) error {
@@ -112,7 +118,7 @@ func (c *packetConn) SetDeadline(t time.Time) error {
 func (c *packetConn) SetReadDeadline(t time.Time) error {
 	select {
 	case <-c.done:
-		return net.ErrClosed
+		return c.err
 	default:
 	}
 	c.read.set(t)
@@ -125,7 +131,7 @@ func (c *packetConn) SetWriteDeadline(t time.Time) error {
 	defer p.writeMu.Unlock()
 	select {
 	case <-c.done:
-		return net.ErrClosed
+		return c.err
 	default:
 	}
 	c.write.set(t)
@@ -137,7 +143,7 @@ func (c *packetConn) SetWriteDeadline(t time.Time) error {
 
 func (c *packetConn) WriteTo(b []byte, to net.Addr) (int, error) {
 	p := c.parent
-	if _, err := waitFor(p.writeSlot, c.done, &c.write); err != nil {
+	if _, err := waitFor(p.writeSlot, c, &c.write); err != nil {
 		return 0, err
 	}
 	defer func() { p.writeSlot <- struct{}{} }()
@@ -145,7 +151,7 @@ func (c *packetConn) WriteTo(b []byte, to net.Addr) (int, error) {
 	select {
 	case <-c.done:
 		p.writeMu.Unlock()
-		return 0, net.ErrClosed
+		return 0, c.err
 	default:
 	}
 	// SetWriteDeadline also holds writeMu when it changes c.write.at.
@@ -162,7 +168,7 @@ func (c *packetConn) WriteTo(b []byte, to net.Addr) (int, error) {
 	if err != nil {
 		select {
 		case <-c.done:
-			return n, net.ErrClosed
+			return n, c.err
 		default:
 		}
 	}

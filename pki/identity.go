@@ -54,7 +54,7 @@ var meshOID = asn1.ObjectIdentifier{1, 2, 840, 113556, 1, 8000, 2554, 0x6823, 0x
 type Scope struct {
 	Network        string
 	RoutedPrefixes []netip.Prefix
-	// Cluster marks the CA defining the logical subnets in its IP name constraints.
+	// Cluster marks the CA whose IP name constraints define the two member prefixes.
 	Cluster bool
 	// AnycastPools delegates ranges to issuers; AnycastIPs grants exact addresses to leaves.
 	AnycastPools []netip.Prefix
@@ -177,10 +177,10 @@ func ReadIdentity(c *x509.Certificate) (Identity, error) {
 }
 
 // checkDelegation checks every mesh issuer on the path and returns its cluster CA, if present.
-func checkDelegation(leaf Scope, ancestors []*x509.Certificate) (*x509.Certificate, error) {
+func checkDelegation(child *Scope, ancestors []*x509.Certificate) (*x509.Certificate, error) {
 	var clusterCA *x509.Certificate
-	issuingCluster := leaf.Cluster
-	for _, c := range ancestors {
+	issuingCluster := child != nil && child.Cluster
+	for i, c := range ancestors {
 		s, ok, err := CertificateScope(c)
 		if err != nil {
 			return nil, err
@@ -193,26 +193,35 @@ func checkDelegation(leaf Scope, ancestors []*x509.Certificate) (*x509.Certifica
 				return nil, errors.New("nested cluster CA")
 			}
 			clusterCA = c
+			for j, issuer := range ancestors[:i+1] {
+				if err := checkDelegatedRanges(issuer, ancestors[j+1:], j < i); err != nil {
+					return nil, err
+				}
+			}
 		}
-		if s.Network != leaf.Network {
+		if child == nil {
+			child = &s
+			continue
+		}
+		if s.Network != child.Network {
 			return nil, errors.New("issuer network mismatch")
 		}
-		for _, p := range leaf.RoutedPrefixes {
+		for _, p := range child.RoutedPrefixes {
 			if !s.AllowsRoute(p) {
 				return nil, fmt.Errorf("issuer does not delegate route %s", p)
 			}
 		}
-		for _, a := range leaf.AnycastIPs {
+		for _, a := range child.AnycastIPs {
 			if !contains(s.AnycastPools, a) {
 				return nil, fmt.Errorf("issuer does not delegate anycast address %s", a)
 			}
 		}
-		for _, p := range leaf.AnycastPools {
+		for _, p := range child.AnycastPools {
 			if !covers(s.AnycastPools, p) {
 				return nil, fmt.Errorf("issuer does not delegate anycast pool %s", p)
 			}
 		}
-		leaf = s
+		child = &s
 	}
 	return clusterCA, nil
 }

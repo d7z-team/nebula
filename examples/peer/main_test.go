@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 
 func TestPeerProcesses(t *testing.T) {
 	alice, bob := demo.NewHost(1), demo.NewHost(2)
-	alice.Topics, bob.Topics = []string{"app/peer/receipt"}, []string{"app/peer/request"}
+	alice.PublishTopics, bob.PublishTopics = []string{"app/peer/receipt"}, []string{"app/peer/request"}
 	opts, err := demo.NodeOptions(alice, bob)
 	require.NoError(t, err)
 	dir := t.TempDir()
@@ -38,9 +38,9 @@ func TestPeerProcesses(t *testing.T) {
 		t.Helper()
 		require.NoError(t, os.WriteFile(filepath.Join(dir, file), pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: der}), 0o600))
 	}
-	writePEM("ca.pem", "CERTIFICATE", opts[0].ClusterCA.Raw)
+	writePEM("ca.pem", "CERTIFICATE", opts[0].Auth.ClusterCA.Raw)
 	for i, name := range []string{"alice", "bob"} {
-		pair := opts[i].Certificates.Client
+		pair := opts[i].Auth.Certificates.Client
 		key, err := x509.MarshalPKCS8PrivateKey(pair.PrivateKey)
 		require.NoError(t, err)
 		writePEM(name+".pem", "CERTIFICATE", pair.Certificate[0])
@@ -53,6 +53,22 @@ func TestPeerProcesses(t *testing.T) {
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
+	for _, tc := range []struct {
+		name, config, want string
+	}{
+		{"unknown member field", strings.Replace(string(data), `"publishTopics"`, `"restrictd":true,"publishTopics"`, 1), `unknown field "restrictd"`},
+		{"second value", string(data) + "\n{}", "unexpected data after topology"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "invalid.json"), []byte(tc.config), 0o600))
+			cmd := exec.CommandContext(ctx, exe, "--", "-cert", "alice.pem", "-key", "alice.key", "-topology", "invalid.json", "-peer", bob.IPv6.String())
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err)
+			require.Contains(t, string(out), "invalid.json: ")
+			require.Contains(t, string(out), tc.want)
+		})
+	}
 	server := exec.CommandContext(ctx, exe, "--", "-cert", "alice.pem", "-key", "alice.key", "-peer", bob.IPv6.String())
 	server.Dir, server.Stderr = dir, os.Stderr
 	stdout, err := server.StdoutPipe()

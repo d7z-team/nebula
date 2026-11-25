@@ -12,7 +12,7 @@
 
 ## 进程内签发与验证
 
-在仓库根目录运行 `go run ./examples/pki`。程序从已批准的公钥 DER（SubjectPublicKeyInfo）计算 SHA-256，在 `Enrollment` 中指定网络、双栈地址、用途和有效期，再把 CSR 交给 `Issuer.IssueLeaf`。验证端单独建立根池，并为 `VerifyChain` 指定预期地址对与 `x509.ExtKeyUsageServerAuth`。预期输出为 `verified 10.13.0.1@fd13::1 on demo for serverAuth`。[完整示例](../examples/pki/main.go) · [获批指纹与签发配置](../examples/demo/credentials.go)
+运行 `go run ./examples/pki`，示例将 `10.13.0.0/27` 和 `fd13::/120` 委派给站点 CA，签发成员证书并验证其服务端用途。预期输出为 `verified 10.13.0.1@fd13::1 on demo for serverAuth`。[完整示例](../examples/pki/main.go)
 
 签发中间 CA 时调用 `issuer.IssueCA(csr, profile, approvedKeyHash)`。第三个参数是经独立渠道批准的公钥 SubjectPublicKeyInfo DER 的 SHA-256，类型为 `[32]byte`。叶证书在 `Enrollment.PublicKeyHash` 传入同类指纹。两种签发均由库核对请求签名和指纹；CLI 从十六进制的 `-approved-key` 读取该参数。根 CA 要签发一级中间 CA 时设 `MaxPathLen: 1` 或 `-path-len 1`。`0` 表示该 CA 可直接签发叶证书。[签发实现](../pki/issuance.go)
 
@@ -58,7 +58,15 @@ MeshScope ::= SEQUENCE {
 Prefix ::= SEQUENCE { address OCTET STRING, bits INTEGER }
 ```
 
-网络名使用 1 至 128 个小写 ASCII 字母、数字、下划线、点或连字符。前缀地址按网络序编码，主机位置零。字段顺序固定，空列表编码为空序列。集群 CA 使用 `-cluster -network demo -permit-ips CIDR,...` 设置角色及标准 IP Name Constraints，可通过 `-anycast-pools` 和 `-routes` 委派 VIP 池与下游路由。叶证书使用 `-anycast-ips IP,...` 批准具体服务地址，保留两个主地址作为 SAN。签发受委派的中间 CA 时使用 `issue -role ca`，签发属于企业根下的集群 CA 时同时使用 `-cluster`。通过 `inspect` 可查看角色、范围和精确授权。[地址规划与实例配置](addressing.md)
+网络名使用 1 至 128 个小写 ASCII 字母、数字、下划线、点或连字符。前缀地址按网络序编码，主机位置零。字段顺序固定，空列表编码为空序列。
+
+| 证书 | 签发配置 | `nebula-pki inspect` |
+| --- | --- | --- |
+| 集群 CA | `-cluster -network demo -permit-ips IPv4网段,IPv6网段` 固定两个成员网段。可用 `-routes` 和 `-anycast-pools` 分别委派下游路由和服务池。企业根下签发时，两个网段都须符合签发链的 IP 约束。 | `memberIPv4`、`memberIPv6` |
+| 站点 CA | `issue -role ca -permit-ips IPv4范围,IPv6范围` 指定双栈签发范围，同族可列多段。每段须在上级许可内，并避开上级排除范围。仅签发普通成员时，指定 `-network` 并留空路由和服务池。 | `permittedIPs` |
+| 成员 | 两个主地址写入 SAN。用 `-routes` 授权下游前缀，用 `-anycast-ips` 授权精确服务地址。 | `peer`、`routes`、`anycastIPs` |
+
+企业 CA 可通过 X.509 名称约束的 `excludedSubtrees` 排除 IP 范围，成员地址校验和枚举均遵守这些约束。使用自带签发工具时，可在宿主分配台账中预留业务地址。签发端先校验集群地址规划，再调用 `crypto.Signer`。成员分配与站点委派的示例见[集群地址与 IP 交付](addressing.md)。
 
 签发节点证书时，`nebula-pki issue` 使用 `-network`、`-ipv4`、`-ipv6` 和经独立批准的 `-approved-key`。默认 `-role node` 同时包含 clientAuth、serverAuth、codeSigning。使用独立凭据时，分别以 `-role client`、`-role server`、`-role object` 签发同一地址对的三张证书，填入 `LocalCertificates.Client`、`Server`、`Object`。PEM 链从叶证书开始，随后依次放入中间 CA。验证单一用途时，给 `nebula-pki verify` 传入相应的 `-role`。[签发与验证示例](#签发证书)
 
@@ -78,11 +86,11 @@ return node.ReloadCertificates(ctx, nebula.LocalCertificates{Client: pair})
 
 成功后，新握手读取新凭据，已建立路径可通过 `node.Paths()` 核对握手实际使用的 `LocalSerial` 和对端 `Serial`。信任根在 `New` 时克隆。变更根池时，用新根构建节点。[凭据生命周期](mesh.md#证书生命周期与宿主授权)
 
-`Options.CheckChain` 接收通过 PKIX 验证的候选链。宿主可以按证书的 SHA-256 指纹维护自己的授权数据，例如在 `New` 前设置以下钩子。这里的 `denied` 是该宿主实例持有的并发映射。
+`Options.Auth.CheckChain` 接收通过 PKIX 验证的候选链。宿主可以按证书的 SHA-256 指纹维护自己的授权数据，例如在 `New` 前设置以下钩子。这里的 `denied` 是该宿主实例持有的并发映射。
 
 ```go
 var denied sync.Map
-opts.CheckChain = func(ctx context.Context, check nebula.ChainCheck) (time.Time, error) {
+opts.Auth.CheckChain = func(ctx context.Context, check nebula.ChainCheck) (time.Time, error) {
     for _, cert := range check.Chain {
         if _, found := denied.Load(sha256.Sum256(cert.Raw)); found {
             return time.Time{}, errors.New("certificate denied by host")
@@ -92,14 +100,14 @@ opts.CheckChain = func(ctx context.Context, check nebula.ChainCheck) (time.Time,
 }
 ```
 
-宿主撤回对某张证书的信任后，更新钩子读取的授权数据，再调用 `Revalidate` 复查本机凭据、现有会话和缓存主题消息。
+监控本机授权有效期时读取 `node.ControlStatus().AuthorizedUntil`，它取客户端、服务端和对象签名三个用途的最早授权截止时间，并包含宿主钩子给出的期限。
+
+撤回信任时，先更新钩子读取的授权数据，再调用 `Revalidate` 复查现有授权。[复查范围](integration.md#选择本机安全策略)
 
 ```go
 denied.Store(sha256.Sum256(withdrawn.Raw), struct{}{})
 return node.Revalidate(ctx)
 ```
-
-只调整网关前缀、VIP 或发布权限时，用 `ApplyTopology` 安装新的成员视图。计划摘除任播实例时，宿主可先将新连接分给其他实例，等旧连接排空后再撤回该成员的 VIP。[任播授权与排空](addressing.md#任播服务)
 
 ## 签名对象
 

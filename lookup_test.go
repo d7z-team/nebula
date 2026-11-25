@@ -23,7 +23,7 @@ func TestConnectEndpointAndIPDiscovery(t *testing.T) {
 			route := netip.MustParsePrefix("172.30.0.0/24")
 			gateway := labPeer(f.ips[3])
 			f.cfg.Members[3].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("172.30.0.0/16")}
-			f.opts[3].Certificates.Client = f.issue(gateway, pki.Scope{RoutedPrefixes: []netip.Prefix{route}})
+			f.opts[3].Auth.Certificates.Client = f.issue(gateway, pki.Scope{RoutedPrefixes: []netip.Prefix{route}})
 			f.startDiscovery(1, -1, 1, 2)
 			a, n := f.nodes[0], f.nodes[3]
 			_, ok := a.LookupPeer(gateway.IPv4())
@@ -75,7 +75,7 @@ func TestRendezvousEndpointOrder(t *testing.T) {
 	static := f.cfg.Members[1].Endpoints
 	f.cfg.Members[1].Endpoints = []Endpoint{static[1], static[0], static[1]}
 	additional := f.cfg.Members[2].Endpoints[0]
-	f.opts[1].AdvertiseEndpoints = []Endpoint{additional, static[0]}
+	f.opts[1].Transport.AdvertiseEndpoints = []Endpoint{additional, static[0]}
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	_, ok := a.learnIntroduction(t.Context(), b.localIntroduction(b.policy.Load()).record, nil)
@@ -95,11 +95,11 @@ func TestHiddenIntroduction(t *testing.T) {
 	target := labPeer(f.ips[0])
 	prefix := netip.MustParsePrefix("172.30.9.0/24")
 	f.cfg.Members[0].RoutedPrefixes = []netip.Prefix{prefix}
-	f.opts[0].Certificates.Client = f.issue(target, pki.Scope{RoutedPrefixes: []netip.Prefix{prefix}})
-	f.opts[0].HideEndpoints = true
-	f.opts[0].AdvertiseEndpoints = []Endpoint{{"udp", netip.MustParseAddrPort("203.0.113.7:4444")}}
+	f.opts[0].Auth.Certificates.Client = f.issue(target, pki.Scope{RoutedPrefixes: []netip.Prefix{prefix}})
+	f.opts[0].Transport.HideEndpoints = true
+	f.opts[0].Transport.AdvertiseEndpoints = []Endpoint{{"udp", netip.MustParseAddrPort("203.0.113.7:4444")}}
 	for i := range f.opts {
-		f.opts[i].Interval = time.Hour
+		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.startDiscovery()
 	h, relay, visitor := f.nodes[0], f.nodes[1], f.nodes[2]
@@ -196,7 +196,7 @@ func TestDownstreamDiscoveryAcrossBranches(t *testing.T) {
 	for i := 2; i < len(f.opts); i++ {
 		prefix := netip.PrefixFrom(dst, 22+i-2).Masked()
 		f.cfg.Members[i].RoutedPrefixes = []netip.Prefix{prefix}
-		f.opts[i].Certificates.Client = f.issue(labPeer(f.ips[i]), pki.Scope{RoutedPrefixes: []netip.Prefix{prefix}})
+		f.opts[i].Auth.Certificates.Client = f.issue(labPeer(f.ips[i]), pki.Scope{RoutedPrefixes: []netip.Prefix{prefix}})
 	}
 	f.startDiscovery(1, -1, 1, 1, 1, 1, 1, 1)
 	a, hub := f.nodes[0], f.nodes[1]
@@ -224,10 +224,52 @@ func TestDownstreamDiscoveryAcrossBranches(t *testing.T) {
 		i := hub.discovered[g.id]
 		return len(i.record) > 0 && len(i.RoutedPrefixes) == 0
 	}, 2*time.Second, 10*time.Millisecond)
-	require.NoError(t, a.Revalidate(t.Context()))
-	got, err = a.ResolveIP(t.Context(), dst)
+	got, err = a.RefreshIP(t.Context(), dst)
 	require.NoError(t, err)
 	require.Len(t, got, 5)
+}
+
+func TestRefreshIPWithCachedDefault(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp", "tcp")
+	dst := netip.MustParseAddr("172.30.0.42")
+	site := netip.PrefixFrom(dst, 24).Masked()
+	for i, prefix := range []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), site} {
+		routes := []netip.Prefix{prefix}
+		f.cfg.Members[i+2].RoutedPrefixes = routes
+		f.opts[i+2].Auth.Certificates.Client = f.issue(labPeer(f.ips[i+2]), pki.Scope{RoutedPrefixes: routes})
+	}
+	f.startDiscovery(1, -1, 1, -1)
+	visitor, hub, gateway := f.nodes[0], f.nodes[1], f.nodes[3]
+	initial, err := visitor.ResolveIP(t.Context(), dst)
+	require.NoError(t, err)
+	require.Len(t, initial, 1)
+	require.Zero(t, initial[0].Prefix.Bits())
+	_, err = hub.ConnectEndpoint(t.Context(), f.cfg.Members[3].Endpoints[0])
+	require.NoError(t, err)
+	cached, err := visitor.ResolveIP(t.Context(), dst)
+	require.NoError(t, err)
+	require.Len(t, cached, 1)
+	require.Equal(t, initial[0].Peer, cached[0].Peer)
+	matches, err := visitor.RefreshIP(t.Context(), dst)
+	require.NoError(t, err)
+	require.Len(t, matches, 2)
+	require.Equal(t, gateway.ID(), matches[0].Peer)
+	require.Equal(t, site, matches[0].Prefix)
+	require.Equal(t, initial[0].Peer, matches[1].Peer)
+	require.Len(t, visitor.Paths(), 1)
+
+	// The visitor still has the site's valid record after the hub stops returning it.
+	require.NoError(t, hub.SetPeerPathPolicy(gateway.ID(), Blocked))
+	refreshed, err := visitor.RefreshIP(t.Context(), dst)
+	require.NoError(t, err)
+	require.Len(t, refreshed, 1)
+	require.Equal(t, initial[0].Peer, refreshed[0].Peer)
+	cached, err = visitor.ResolveIP(t.Context(), dst)
+	require.NoError(t, err)
+	require.Len(t, cached, 2)
+	require.Equal(t, gateway.ID(), cached[0].Peer)
+	_, err = visitor.RefreshIP(t.Context(), gateway.ID().IPv4())
+	require.ErrorIs(t, err, ErrInvalidPacketAddress)
 }
 
 func TestLookupReplyUsesObjectCertificate(t *testing.T) {
@@ -236,8 +278,8 @@ func TestLookupReplyUsesObjectCertificate(t *testing.T) {
 	narrow := netip.MustParsePrefix("172.30.9.0/24")
 	f.cfg.Members[1].RoutedPrefixes = []netip.Prefix{wide}
 	id := labPeer(f.ips[1])
-	f.opts[1].Certificates.Client = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{wide}})
-	f.opts[1].Certificates.Object = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{narrow}})
+	f.opts[1].Auth.Certificates.Client = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{wide}})
+	f.opts[1].Auth.Certificates.Object = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{narrow}})
 	f.start()
 	a, g := f.nodes[0], f.nodes[1]
 	intro := g.localIntroduction(g.policy.Load()).introduction
@@ -257,10 +299,14 @@ func TestConcurrentResolveCancellation(t *testing.T) {
 	for _, mode := range []string{"cancel", "deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newFixture(t, "tcp", "tcp", "tcp")
+			addr := netip.MustParseAddr("172.30.0.42")
+			routes := []netip.Prefix{netip.PrefixFrom(addr, 24).Masked()}
+			f.cfg.Members[2].RoutedPrefixes = routes
+			f.opts[2].Auth.Certificates.Client = f.issue(labPeer(f.ips[2]), pki.Scope{RoutedPrefixes: routes})
 			waiting, release := make(chan struct{}, 1), make(chan struct{})
 
 			var armed atomic.Bool
-			f.opts[1].CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+			f.opts[1].Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
 				if armed.Load() && c.Member == labPeer(f.ips[0]) && c.Usage == x509.ExtKeyUsageCodeSigning {
 					select {
 					case waiting <- struct{}{}:
@@ -276,12 +322,11 @@ func TestConcurrentResolveCancellation(t *testing.T) {
 			}
 			for i := range f.opts {
 				f.opts[i].DialTimeout = 3 * time.Second
-				f.opts[i].Interval = time.Hour
+				f.opts[i].MaintenanceInterval = time.Hour
 			}
 			f.startDiscovery(1, -1, 1)
-			a, g := f.nodes[0], f.nodes[2]
+			a := f.nodes[0]
 			armed.Store(true)
-			addr := g.id.IPv4()
 			var ctx context.Context
 			var cancel context.CancelFunc
 			if mode == "deadline" {
@@ -297,7 +342,7 @@ func TestConcurrentResolveCancellation(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("query did not reach hub")
 			}
-			go func() { _, err := a.ResolveIP(t.Context(), addr); second <- err }()
+			go func() { _, err := a.RefreshIP(t.Context(), addr); second <- err }()
 			require.Eventually(t, func() bool {
 				a.mu.Lock()
 				defer a.mu.Unlock()
@@ -329,14 +374,14 @@ func TestGatewayIntroductionBudget(t *testing.T) {
 	}
 	member.RoutedPrefixes = routes
 	opts := f.opts[0]
-	opts.Certificates.Client = wide
+	opts.Auth.Certificates.Client = wide
 	opts.Topology = f.cfg
 	_, err := New(t.Context(), opts)
 	require.ErrorIs(t, err, pki.ErrDocumentTooLarge)
 
 	// The same topology fits while the object signer authorizes a single route.
 	narrow := f.issue(id, pki.Scope{RoutedPrefixes: routes[:1]})
-	f.opts[0].Certificates.Client = narrow
+	f.opts[0].Auth.Certificates.Client = narrow
 	f.start()
 	n := f.nodes[0]
 	require.ErrorIs(t, n.ReloadCertificates(t.Context(), LocalCertificates{Client: wide}), pki.ErrDocumentTooLarge)

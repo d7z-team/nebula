@@ -20,7 +20,7 @@ udp := portshare.NewUDP(socket)
 defer tcp.Close()
 defer udp.Close()
 
-opts.TCP4, opts.UDP4 = tcp.Mesh(), udp.Mesh()
+opts.Transport.TCP4, opts.Transport.UDP4 = tcp.Mesh(), udp.Mesh()
 node, err := nebula.New(ctx, opts)
 if err != nil {
     return err
@@ -45,7 +45,7 @@ case <-ctx.Done():
 }
 ```
 
-- 物理 TCP 监听遇到暂时性错误时从 5 ms 开始指数退避，最长 1 秒；永久错误通过两个仍打开的分支的 `Accept` 传给各自宿主。
+- 物理 TCP 监听遇到暂时性错误时退避重试。TCP 监听或 UDP 读取循环因错误退出时，两个仍打开的分支都会报告该错误。主动关闭的分支返回 `net.ErrClosed`。
 - TCP 和 UDP 可以分别启用。双栈部署为每个物理地址族分别创建分流器，IPv6 分支传给 `TCP6`、`UDP6`。将可达的公网地址和端口按通常方式放入拓扑端点或签名通告。
 - `udp.Mesh()` 返回公开的 `meshwire.SharedSocket`，可以直接传入节点的 UDP 选项。宿主若只需统计 mesh 流量，可以在包装类型中嵌入该接口并覆盖 `ReadFrom` 或 `WriteTo`。节点会通过包装后的套接字调用 `ConfigureMeshQUIC`。统计整个物理端口的流量时，在调用 `NewUDP` 前包装原始套接字。[接口定义](../meshwire/transport.go)
 - 分流器接管传入的物理套接字。关闭某个逻辑分支只结束该分支的监听或数据报 I/O，另一分支可以继续工作。已经交出的 TCP 连接由接收方关闭。每个逻辑 UDP 分支有独立的读写截止时间；节点关闭时为 QUIC 的最后一次写入留出最多一个 `DialTimeout`。整个服务退出时先关闭节点和网站，再关闭分流器以释放物理端口。[TCP 实现](../portshare/tcp.go) · [UDP 分支](../portshare/packet_conn.go)
