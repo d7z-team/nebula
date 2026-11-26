@@ -36,7 +36,7 @@ func TestListenWithIndependentViews(t *testing.T) {
 	require.NoError(t, err)
 	for i, o := range opts {
 		for _, m := range o.Topology.Members {
-			target := slices.IndexFunc(nodes, func(n *nebula.Node) bool { return n.ID().IPv6() == m.IPv6 })
+			target := slices.IndexFunc(nodes, func(n *nebula.Node) bool { return n.Addresses().IPv6 == m.IPv6 })
 			require.NotEqual(t, -1, target)
 			require.Len(t, m.Endpoints, 1)
 			require.Equal(t, opts[target].Transport.TCP4.Addr().String(), m.Endpoints[0].Address.String(), "view %d", i)

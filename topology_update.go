@@ -20,7 +20,9 @@ func (n *Node) ApplyTopology(ctx context.Context, t Topology) error {
 
 // Revalidate reapplies the host's current chain decisions to local credentials,
 // sessions, instance conflict claims and cached publications. Success means the
-// review completed, including withdrawals. ControlStatus, Paths and InspectIP report the outcome.
+// review completed, including withdrawals. Concurrent admissions may restart
+// the review. Cancellation or timeout before commit leaves this review unapplied.
+// ControlStatus, Paths and InspectIP report the outcome.
 func (n *Node) Revalidate(ctx context.Context) error { return n.updateView(ctx, nil) }
 
 // Evaluate application callbacks outside node locks. Admissions and credential
@@ -47,7 +49,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		if after, local := p.members[n.id]; next != nil && local {
 			before, existed := old.members[n.id]
 			if !existed || !slices.Equal(before.RoutedPrefixes, after.RoutedPrefixes) || !slices.Equal(before.Endpoints, after.Endpoints) {
-				if err := n.validateIntroduction(next, c.Object); err != nil {
+				if err := n.validateIntroduction(next, c); err != nil {
 					return err
 				}
 			}
@@ -55,7 +57,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		deadlines := make([]time.Time, len(ss))
 		for i, s := range ss {
 			d, err := s.authorizationDeadline(ctx, p)
-			if err == nil {
+			if err == nil && p.acceptsIdentity(s.remoteIdentity) {
 				deadlines[i] = d
 			}
 		}

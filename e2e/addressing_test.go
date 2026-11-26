@@ -48,7 +48,7 @@ func TestGroupDatagrams(t *testing.T) {
 			PermittedIPs: []netip.Prefix{netip.PrefixFrom(m.IPv4, 31).Masked(), netip.PrefixFrom(m.IPv6, 127).Masked()},
 		}, sha256.Sum256(csr.RawSubjectPublicKeyInfo))
 		require.NoError(t, err)
-		h.options.Auth.Certificates = issueCredentials(t, pki.Issuer{Chain: []*x509.Certificate{site, root}, Signer: key}, m, "ed25519")
+		h.options.Auth.Certificates = l.issueCredentials(h, pki.Issuer{Chain: []*x509.Certificate{site, root}, Signer: key})
 	}
 	l.start()
 	require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.RelayOnly))
@@ -59,7 +59,7 @@ func TestGroupDatagrams(t *testing.T) {
 			ip := netip.MustParseAddr(dst)
 			proto, src := ipv4.ProtocolNumber, a.ip
 			if ip.Is6() {
-				proto, src = ipv6.ProtocolNumber, a.node.ID().IPv6()
+				proto, src = ipv6.ProtocolNumber, a.node.Addresses().IPv6
 			}
 			if ip.IsMulticast() {
 				require.Nil(t, receiver.JoinGroup(proto, 1, addr(dst)))
@@ -155,7 +155,7 @@ func TestAnycastTCPPathChange(t *testing.T) {
 	l.top.Members[relay.index].Transit = true
 	vip := netip.MustParseAddr("10.13.0.200")
 	l.top.Members[instance.index].AnycastIPs = []netip.Addr{vip}
-	id := labPeer(instance.ip)
+	id := l.top.Members[instance.index].ID
 	client.nicOptions.ResolveNextHop = func(netip.Addr, []byte) (nebula.PeerID, error) { return id, nil }
 	var direct, relayed atomic.Bool
 	client.nicOptions.ObserveTransmit = func(r nebula.TransmitResult) {
@@ -165,7 +165,7 @@ func TestAnycastTCPPathChange(t *testing.T) {
 		if r.Transport == "udp" && r.Endpoint.IsValid() && len(r.Circuit) == 0 {
 			direct.Store(true)
 		}
-		if r.Transport == "relay" && slices.Equal(r.Circuit, []nebula.PeerID{labPeer(client.ip), labPeer(relay.ip), id}) {
+		if r.Transport == "relay" && slices.Equal(r.Circuit, []nebula.PeerID{l.top.Members[client.index].ID, l.top.Members[relay.index].ID, id}) {
 			relayed.Store(true)
 		}
 	}
@@ -189,7 +189,7 @@ func TestRelayTCPWithDuplicateInstance(t *testing.T) {
 	l.link(client, relay)
 	l.link(relay, server)
 	l.top.Members[relay.index].Transit = true
-	duplicate := &host{index: server.index, ip: server.ip, options: nebula.Options{Auth: nebula.AuthOptions{Roots: l.roots, ClusterCA: l.issuer.Chain[0]}}}
+	duplicate := &host{index: server.index, ip: server.ip, options: nebula.Options{Auth: nebula.AuthOptions{RootCA: l.root.Chain[0], ClusterCA: l.issuer.Chain[0]}}}
 	l.addUnderlay(duplicate, "west", "192.0.2.4", "", "udp", false)
 	l.start()
 	l.connect(client, server, "relay")

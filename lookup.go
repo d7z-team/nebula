@@ -10,6 +10,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"code.d7z.net/d7z-team/nebula/pki"
 )
 
 // IPMatch identifies the owner of a primary address or a gateway advertising Prefix.
@@ -17,6 +19,8 @@ import (
 // endpoints may be reached through an authorized circuit or an existing session.
 // ValidUntil bounds the signed discovery information.
 type IPMatch struct {
+	// Addresses are the primary addresses proved by the signed grant.
+	Addresses  pki.Addresses
 	Peer       PeerID
 	Prefix     netip.Prefix
 	Endpoints  []Endpoint
@@ -185,10 +189,13 @@ func (i introduction) match(q query, id PeerID, clusterIP bool) netip.Prefix {
 	if q.Target != nil && *q.Target != id {
 		return netip.Prefix{}
 	}
-	if q.IP == id.IPv4() || q.IP == id.IPv6() {
+	if q.Target != nil {
+		return netip.PrefixFrom(i.IPv4, 32)
+	}
+	if q.IP == i.IPv4 || q.IP == i.IPv6 {
 		return netip.PrefixFrom(q.IP, q.IP.BitLen())
 	}
-	if clusterIP || q.Target != nil {
+	if clusterIP {
 		return netip.Prefix{}
 	}
 	return longestPrefix(q.IP, i.RoutedPrefixes)
@@ -219,7 +226,8 @@ func (n *Node) cachedAnswers(q query, peers map[PeerID]bool) []lookupAnswer {
 	p := n.policy.Load()
 	primary := p.cluster.Subnet(q.IP).IsValid()
 	var local cachedIntroduction
-	localCandidate := q.IP == n.id.IPv4() || q.IP == n.id.IPv6() || !primary && len(p.members[n.id].RoutedPrefixes) > 0
+	addresses := n.Addresses()
+	localCandidate := q.Target != nil || q.IP == addresses.IPv4 || q.IP == addresses.IPv6 || !primary && len(p.members[n.id].RoutedPrefixes) > 0
 	if localCandidate && (peers == nil || peers[n.id]) {
 		local = n.localIntroduction(p)
 	}
@@ -235,16 +243,12 @@ func (n *Node) cachedAnswers(q query, peers map[PeerID]bool) []lookupAnswer {
 			return
 		}
 		if prefix := intro.match(q, id, primary); prefix.IsValid() {
-			answers = append(answers, lookupAnswer{IPMatch{id, prefix, intro.Endpoints, intro.authorizedUntil}, intro.record})
+			answers = append(answers, lookupAnswer{IPMatch{Peer: id, Prefix: prefix, Addresses: intro.Addresses, Endpoints: intro.Endpoints, ValidUntil: intro.authorizedUntil}, intro.record})
 		}
 	}
 	cred := n.cred.Load()
-	if local.cred == cred.Object.Leaf {
-		end := local.Expires
-		if cred.until.Before(end) {
-			end = cred.until
-		}
-		add(n.id, learnedIntroduction{introduction: local.introduction, record: local.record, authorizedUntil: end})
+	if local.grantLeaf == cred.cmsSigner.Leaf {
+		add(n.id, learnedIntroduction{introduction: local.introduction, record: local.record, authorizedUntil: earlierDeadline(cred.until, local.Expires)})
 	}
 	switch {
 	case q.Target != nil:
@@ -393,10 +397,10 @@ func (n *Node) queryNeighbor(ctx context.Context, s *session, q query, results c
 
 func (n *Node) handleLookup(s *session, c net.Conn, b []byte) {
 	var q query
-	if json.Unmarshal(b, &q) != nil || len(q.ID) != 32 || len(q.Visited) == 0 || len(q.Visited) >= maxCircuitNodes || q.Visited[len(q.Visited)-1] != s.peer || slices.Contains(q.Visited, n.id) || q.Budget <= 0 || !n.policy.Load().discoveryAddress(q.IP) {
+	if json.Unmarshal(b, &q) != nil || len(q.ID) != 32 || len(q.Visited) == 0 || len(q.Visited) >= maxCircuitNodes || q.Visited[len(q.Visited)-1] != s.peer || slices.Contains(q.Visited, n.id) || q.Budget <= 0 || q.Target == nil && !n.policy.Load().discoveryAddress(q.IP) {
 		return
 	}
-	if q.Target != nil && q.IP != q.Target.IPv4() {
+	if q.Target != nil && (*q.Target == (PeerID{}) || q.IP.IsValid()) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(n.ctx, min(q.Budget, n.o.DialTimeout))

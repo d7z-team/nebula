@@ -1,9 +1,9 @@
 package pki_test
 
 import (
-	"crypto/x509"
+	"crypto/tls"
 	"fmt"
-	"net/netip"
+	"slices"
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/examples/demo"
@@ -21,11 +21,9 @@ func ExampleVerifyObjectSignature() {
 	if err != nil {
 		panic(err)
 	}
-	publisher, err := pki.NewPeerID(host.IPv4, host.IPv6)
-	if err != nil {
-		panic(err)
-	}
-	report, cert := []byte("ready"), opts[0].Auth.Certificates.Client
+	publisher := host.ID
+	credentials := opts[0].Auth.Certificates
+	report, cert := []byte("ready"), tls.Certificate{PrivateKey: credentials.Node.PrivateKey, Certificate: slices.Concat(credentials.Grant, credentials.Node.Certificate)}
 	// Check the envelope against the wire budget before asking the signer to sign.
 	if err := pki.CheckObjectSize(cluster.Network(), "report", report, cert); err != nil {
 		panic(err)
@@ -40,20 +38,13 @@ func ExampleVerifyObjectSignature() {
 	}
 	// Authorize reports only from the configured publisher. Use the content
 	// after its signing chain, EKU and exact identity have been verified.
-	_, err = pki.VerifyChain(chain, opts[0].Auth.Roots, cluster, publisher, x509.ExtKeyUsageCodeSigning, time.Now())
+	id, _, _, err := pki.VerifyObjectSigner(chain, opts[0].Auth.RootCA, cluster, time.Now())
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("report from %s: %s\n", publisher, body)
-	// Output: report from 10.13.0.1@fd13::1: ready
-}
-
-func ExampleNewPeerID() {
-	id, err := pki.NewPeerID(netip.MustParseAddr("10.13.0.1"), netip.MustParseAddr("fd13::1"))
-	if err != nil {
-		fmt.Println(err)
-		return
+	if id.ID != publisher {
+		panic("unexpected publisher")
 	}
-	fmt.Println(id)
-	// Output: 10.13.0.1@fd13::1
+	fmt.Printf("verified report: %s\n", body)
+	// Output: verified report: ready
 }

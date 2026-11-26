@@ -45,11 +45,11 @@ func TestSessionReceiveLimit(t *testing.T) {
 			require.NoError(t, err)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			require.NoError(t, a.ConnectPeer(ctx, b.id.IPv4()))
+			require.NoError(t, a.ConnectPeer(ctx, b.Addresses().IPv4))
 			require.Equal(t, 1280, a.RecommendedMTU(b.id, true, 1500))
 			require.True(t, slices.ContainsFunc(a.Paths(), func(s PathStatus) bool { return s.Peer == b.id && s.Transport == kind && s.RemoteIPLimit == 1280 }))
-			small := testIPv6(a.id.IPv6(), b.id.IPv6(), 1280)
-			require.NoError(t, out.WriteIP(b.id, testIPv6(a.id.IPv6(), b.id.IPv6(), 1500)))
+			small := testIPv6(a.Addresses().IPv6, b.Addresses().IPv6, 1280)
+			require.NoError(t, out.WriteIP(b.id, testIPv6(a.Addresses().IPv6, b.Addresses().IPv6, 1500)))
 			require.NoError(t, out.WriteIP(b.id, small))
 			select {
 			case p := <-received:
@@ -110,8 +110,8 @@ func TestRelaySearchContinuesAcrossDials(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	require.ErrorIs(t, a.ConnectPeer(ctx, b.id.IPv4()), ErrPeerUnavailable)
-	require.NoError(t, a.ConnectPeer(ctx, b.id.IPv4()))
+	require.ErrorIs(t, a.ConnectPeer(ctx, b.Addresses().IPv4), ErrPeerUnavailable)
+	require.NoError(t, a.ConnectPeer(ctx, b.Addresses().IPv4))
 	want := []PeerID{a.id, r.id, f.nodes[last-1].id, b.id}
 	require.True(t, slices.ContainsFunc(a.Paths(), func(s PathStatus) bool { return s.Peer == b.id && slices.Equal(s.Circuit, want) }))
 }
@@ -157,7 +157,7 @@ func TestIntroductionLookupAndAuthorization(t *testing.T) {
 	f.start()
 	hub := f.nodes[0]
 	for _, n := range f.nodes[1:] {
-		require.NoError(t, hub.ConnectPeer(t.Context(), n.id.IPv4()))
+		require.NoError(t, hub.ConnectPeer(t.Context(), n.Addresses().IPv4))
 	}
 	for _, peer := range f.nodes[1:] {
 		require.True(t, hub.rendezvous(t.Context(), peer.id))
@@ -199,9 +199,9 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	}
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
-	renewed := f.issue(b.id, pki.Scope{AnycastIPs: []netip.Addr{vip}})
-	require.NoError(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: renewed}))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
+	renewed := f.issue(b.Addresses().IPv4, pki.Scope{AnycastIPs: []netip.Addr{vip}})
+	require.NoError(t, b.ReloadCertificates(t.Context(), renewed))
 	// A second physical listener forwards authenticated connections to the same node.
 	go func() {
 		c, err := backup.Accept()
@@ -234,7 +234,7 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	}
 	send := func(dst netip.Addr) netip.AddrPort {
 		t.Helper()
-		require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), dst, "data")))
+		require.NoError(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, dst, "data")))
 		select {
 		case r := <-sent:
 			require.NoError(t, r.Err)
@@ -245,12 +245,12 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 		}
 	}
 	setRTTs(10, 11)
-	require.Equal(t, primary.endpoint, send(b.id.IPv4()))
+	require.Equal(t, primary.endpoint, send(b.Addresses().IPv4))
 	require.Equal(t, ep.Address, send(vip))
 
 	// The backup temporarily scores best while the application checks connectivity.
 	setRTTs(100, 10)
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	status := a.Paths()
 	require.Len(t, status, 2)
 	require.True(t, status[0].Active)
@@ -260,9 +260,9 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	require.Equal(t, status[0], path)
 	require.Equal(t, 1280, a.RecommendedMTU(b.id, true, 1280))
 	setRTTs(11, 10)
-	require.Equal(t, primary.endpoint, send(b.id.IPv4()))
+	require.Equal(t, primary.endpoint, send(b.Addresses().IPv4))
 	setRTTs(100, 10)
-	require.Equal(t, ep.Address, send(b.id.IPv4()))
+	require.Equal(t, ep.Address, send(b.Addresses().IPv4))
 }
 
 func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
@@ -289,7 +289,7 @@ func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
 		live = append(live, n)
 	}
 	a := live[0]
-	require.NoError(t, a.ConnectPeer(t.Context(), live[1].id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), live[1].Addresses().IPv4))
 	for i := 1; i <= last; i++ {
 		f.link(0, i)
 	}
@@ -340,7 +340,7 @@ func TestTCPListenerRecoveryAndFailure(t *testing.T) {
 			}
 			f.start()
 			a, b := f.nodes[0], f.nodes[1]
-			require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+			require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 			stop()
 			require.Eventually(t, func() bool { return b.ControlStatus().ListenerErrors["tcp4"] == l.fatal.Error() }, time.Second, time.Millisecond)
 			require.True(t, b.ControlStatus().Ready)
@@ -357,7 +357,7 @@ func TestCloseDuringReceiveLimitExchange(t *testing.T) {
 	f.opts[1].DialTimeout = time.Minute
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	d := tls.Dialer{Config: a.tlsConfig(b.id, false)}
+	d := tls.Dialer{Config: a.tlsConfig(b.id, true, a.cred.Load())}
 	c, err := d.DialContext(t.Context(), "tcp", f.opts[1].Transport.TCP4.Addr().String())
 	require.NoError(t, err)
 	defer c.Close()
@@ -418,7 +418,7 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 	require.NoError(t, err)
 	out, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
-	packet := testIPv4(a.id.IPv4(), b.id.IPv4(), "first circuit")
+	packet := testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "first circuit")
 	require.NoError(t, out.WriteIP(b.id, packet))
 	select {
 	case data := <-received:

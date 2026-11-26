@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -89,7 +88,8 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	op := args[0]
 	fs := flag.NewFlagSet(op, flag.ContinueOnError)
 	fs.SetOutput(diagnostics)
-	var key, caFile, caKey, src, dst, alg, name, role, approved, roots, pin string
+	var key, caFile, caKey, src, dst, alg, name, role, approved, rootFile, pin string
+	var peer pki.PeerID
 	var v4, v6 netip.Addr
 	var scope pki.Scope
 	var profile pki.CAProfile
@@ -109,27 +109,28 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		fs.StringVar(&name, "name", "", "approved subject common name")
 		fs.StringVar(&approved, "approved-key", "", "approved SHA-256 SPKI in hex")
 		fs.Func("anycast-ips", "exact service addresses for a leaf", listFlag(&scope.AnycastIPs, netip.ParseAddr))
-	case "inspect":
-		fs.BoolVar(&fingerprint, "fingerprint", false, "print the SPKI SHA-256 digest")
-	case "verify":
-		fs.StringVar(&pin, "cluster-ca", "", "pinned cluster CA PEM certificate")
-		fs.StringVar(&roots, "roots", "", "trusted root PEM bundle")
-	default:
-		return fmt.Errorf("unknown command %q", op)
-	}
-	if op == "root" || op == "issue" {
 		fs.StringVar(&scope.Network, "network", "", "mesh network")
-		fs.IntVar(&days, "days", 30, "validity in days")
-		fs.IntVar(&profile.MaxPathLen, "path-len", 0, "allowed intermediate CA depth")
 		fs.BoolVar(&scope.Cluster, "cluster", false, "define the cluster address plan on this CA")
 		fs.Func("routes", "routed traffic a leaf may carry or a CA may delegate (including /0)", listFlag(&scope.RoutedPrefixes, netip.ParsePrefix))
 		fs.Func("anycast-pools", "delegated service prefixes for a CA", listFlag(&scope.AnycastPools, netip.ParsePrefix))
 		fs.Func("permit-ips", "cluster: one IPv4 and one IPv6 member prefix; subordinate issuer: delegated ranges for both families", listFlag(&profile.PermittedIPs, netip.ParsePrefix))
-	}
-	if op == "issue" || op == "verify" {
 		fs.TextVar(&v4, "ipv4", netip.Addr{}, "overlay IPv4 address")
 		fs.TextVar(&v6, "ipv6", netip.Addr{}, "overlay IPv6 address")
-		fs.StringVar(&role, "role", "node", "node, server, client, object or ca (issue only)")
+	case "inspect":
+		fs.BoolVar(&fingerprint, "fingerprint", false, "print the SPKI SHA-256 digest")
+	case "verify":
+		fs.TextVar(&peer, "peer", pki.PeerID{}, "expected SPKI fingerprint")
+		fs.StringVar(&pin, "cluster-ca", "", "pinned cluster CA PEM certificate")
+		fs.StringVar(&rootFile, "root", "", "ordinary root certificate")
+	default:
+		return fmt.Errorf("unknown command %q", op)
+	}
+	if op == "root" || op == "issue" {
+		fs.IntVar(&days, "days", 30, "validity in days")
+		fs.IntVar(&profile.MaxPathLen, "path-len", 0, "allowed intermediate CA depth")
+	}
+	if op == "issue" || op == "verify" {
+		fs.StringVar(&role, "role", "node", "node, grant or ca (issue only)")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -149,16 +150,6 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		profile.Scope = &scope
 	}
 	var err error
-	var peer pki.PeerID
-	if op == "verify" || op == "issue" && role != "ca" {
-		if len(profile.PermittedIPs) != 0 {
-			return errors.New("-permit-ips requires a CA")
-		}
-		peer, err = pki.NewPeerID(v4, v6)
-		if err != nil {
-			return err
-		}
-	}
 	switch op {
 	case "keygen":
 		if dst == "-" {
@@ -207,30 +198,18 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		if e != nil {
 			return e
 		}
-		c, err := issueCertificate(ca, b, profile, peer, approved, role)
+		c, err := issueCertificate(ca, b, profile, pki.Addresses{IPv4: v4, IPv6: v6}, approved, role)
 		if err != nil {
 			return err
 		}
 		data, label = c.Raw, "CERTIFICATE"
 	case "verify":
-		pins, e := readChain(pin)
+		cs, e := readChain(rootFile)
 		if e != nil {
 			return e
 		}
-		if len(pins) != 1 {
-			return errors.New("one cluster CA certificate required")
-		}
-		cluster, e := pki.ReadClusterCA(pins[0])
-		if e != nil {
-			return e
-		}
-		cs, e := readChain(roots)
-		if e != nil {
-			return e
-		}
-		pool := x509.NewCertPool()
-		for _, c := range cs {
-			pool.AddCert(c)
+		if len(cs) != 1 || peer == (pki.PeerID{}) {
+			return errors.New("one ordinary root and -peer required")
 		}
 		b, e := input(src, in)
 		if e != nil {
@@ -240,16 +219,41 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		if e != nil {
 			return e
 		}
-		purposes, e := usages(role)
-		if e != nil {
-			return e
-		}
-		for _, u := range purposes {
-			if _, e = pki.VerifyChain(chain, pool, cluster, peer, u, now); e != nil {
-				return e
+		switch role {
+		case "node":
+			if len(chain) != 1 {
+				return errors.New("one node leaf required")
 			}
+			for _, u := range []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth} {
+				id, err := pki.VerifyNode(chain[0], cs[0], u, now)
+				if err != nil {
+					return err
+				}
+				if id != peer {
+					return errors.New("unexpected node key")
+				}
+			}
+		case "grant":
+			pins, err := readChain(pin)
+			if err != nil {
+				return err
+			}
+			if len(pins) != 1 || pins[0].CheckSignatureFrom(cs[0]) != nil {
+				return errors.New("root-issued cluster CA required")
+			}
+			cluster, err := pki.ReadClusterCA(pins[0])
+			if err != nil {
+				return err
+			}
+			pool := x509.NewCertPool()
+			pool.AddCert(cs[0])
+			if _, err = pki.VerifyGrant(chain, pool, cluster, peer, now); err != nil {
+				return err
+			}
+		default:
+			return errors.New("unknown verification role")
 		}
-		data = fmt.Appendf(nil, "%s network=%s peer=%s\n", chain[0].Subject, cluster.Network(), peer)
+		data = fmt.Appendf(nil, "%s peer=%s role=%s\n", chain[0].Subject, peer, role)
 	case "inspect":
 		b, e := input(src, in)
 		if e != nil {
@@ -283,21 +287,7 @@ func listFlag[T any](dst *[]T, parse func(string) (T, error)) func(string) error
 	}
 }
 
-func usages(role string) ([]x509.ExtKeyUsage, error) {
-	switch role {
-	case "node":
-		return []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageCodeSigning}, nil
-	case "server":
-		return []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, nil
-	case "client":
-		return []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil
-	case "object":
-		return []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}, nil
-	}
-	return nil, errors.New("unknown certificate purpose")
-}
-
-func issueCertificate(ca pki.Issuer, request []byte, profile pki.CAProfile, peer pki.PeerID, approved, role string) (*x509.Certificate, error) {
+func issueCertificate(ca pki.Issuer, request []byte, profile pki.CAProfile, addr pki.Addresses, approved, role string) (*x509.Certificate, error) {
 	if bytes.HasPrefix(bytes.TrimSpace(request), []byte("-----BEGIN ")) {
 		block, rest := pem.Decode(request)
 		if block == nil || block.Type != "CERTIFICATE REQUEST" || len(bytes.TrimSpace(rest)) != 0 {
@@ -309,25 +299,32 @@ func issueCertificate(ca pki.Issuer, request []byte, profile pki.CAProfile, peer
 	if err != nil {
 		return nil, err
 	}
-	hash, err := hex.DecodeString(approved)
-	if err != nil || len(hash) != sha256.Size {
+	var approvedKeyHash pki.PeerID
+	if err := approvedKeyHash.UnmarshalText([]byte(approved)); err != nil {
 		return nil, errors.New("-approved-key requires a hex-encoded SHA-256 SPKI fingerprint")
 	}
-	approvedKeyHash := [sha256.Size]byte(hash)
-	if role == "ca" {
+	switch role {
+	case "ca":
 		return ca.IssueCA(csr, profile, approvedKeyHash)
+	case "node":
+		if profile.Scope != nil || len(profile.PermittedIPs) > 0 || addr.IPv4.IsValid() || addr.IPv6.IsValid() {
+			return nil, errors.New("node certificate takes no network settings")
+		}
+		return ca.IssueNode(csr, approvedKeyHash, profile.NotBefore, profile.NotAfter)
+	case "grant":
+		if len(profile.PermittedIPs) > 0 {
+			return nil, errors.New("-permit-ips requires a CA")
+		}
+		if profile.Scope == nil {
+			return nil, errors.New("-network is required for a grant")
+		}
+		return ca.IssueGrant(csr, pki.Enrollment{
+			Name: profile.Subject.CommonName, IPv4: addr.IPv4, IPv6: addr.IPv6, Scope: *profile.Scope,
+			NotBefore: profile.NotBefore, NotAfter: profile.NotAfter, PublicKeyHash: approvedKeyHash,
+		})
+	default:
+		return nil, errors.New("unknown certificate role")
 	}
-	purposes, err := usages(role)
-	if err != nil {
-		return nil, err
-	}
-	if profile.Scope == nil {
-		return nil, errors.New("-network is required for a leaf certificate")
-	}
-	return ca.IssueLeaf(csr, pki.Enrollment{
-		Name: profile.Subject.CommonName, IPv4: peer.IPv4(), IPv6: peer.IPv6(), Scope: *profile.Scope,
-		NotBefore: profile.NotBefore, NotAfter: profile.NotAfter, PublicKeyHash: approvedKeyHash, Usages: purposes,
-	})
 }
 
 func inspect(b []byte, fingerprint bool) ([]byte, error) {
@@ -358,12 +355,12 @@ func inspect(b []byte, fingerprint bool) ([]byte, error) {
 			} else {
 				detail += fmt.Sprintf(" permittedIPs=%v", c.PermittedIPRanges)
 			}
-		} else {
+		} else if len(c.IPAddresses) > 0 {
 			identity, err := pki.ReadIdentity(c)
 			if err != nil {
 				return nil, err
 			}
-			detail += fmt.Sprintf(" network=%s peer=%s routes=%v anycastIPs=%v", identity.Network, identity.ID, identity.RoutedPrefixes, identity.AnycastIPs)
+			detail += fmt.Sprintf(" network=%s peer=%s ipv4=%s ipv6=%s routes=%v anycastIPs=%v", identity.Network, identity.ID, identity.IPv4, identity.IPv6, identity.RoutedPrefixes, identity.AnycastIPs)
 		}
 	} else if r, e := x509.ParseCertificateRequest(b); e == nil {
 		spki = r.RawSubjectPublicKeyInfo

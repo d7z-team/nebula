@@ -72,7 +72,7 @@ func (n *Node) receiveAdvert(s *session, a advert) {
 	if len(a.Record) > 0 {
 		n.learnIntroduction(n.ctx, a.Record, nil)
 	}
-	if !n.o.Transport.HideEndpoints && s.q != nil && p.physicalEndpoint(Endpoint{"udp", a.Observed}) {
+	if !n.o.Transport.HideEndpoints && s.q != nil && n.mayAdvertise(p, EndpointCandidate{Endpoint{"udp", a.Observed}, EndpointFromObservation, s.peer}) {
 		n.mu.Lock()
 		if p == n.policy.Load() && n.usableLocked(s) {
 			n.observations[observer{s.peer, a.Observed.Addr().Is6()}] = observation{a.Observed, time.Now().Add(time.Minute)}
@@ -85,23 +85,32 @@ func (n *Node) receiveAdvert(s *session, a advert) {
 func (n *Node) rendezvous(ctx context.Context, target PeerID) bool {
 	ctx, cancel := context.WithTimeout(ctx, n.o.DialTimeout)
 	defer cancel()
-	if len(n.runLookup(ctx, target.IPv4(), &target)) > 0 {
+	if len(n.runLookup(ctx, netip.Addr{}, &target)) > 0 {
 		n.punch(target)
 		return true
 	}
 	return false
 }
 
-func (n *Node) punch(a PeerID) {
+// outboundUDP selects a usable socket for an active UDP rendezvous candidate.
+func (n *Node) outboundUDP(ep Endpoint) *udpTransport {
+	transport := n.transports[ep.Address.Addr().Is6()]
+	if ep.Network != "udp" || transport == nil || !n.allowOutbound(ep) || !n.endpointAllowed("udp", ep.Address, false) {
+		return nil
+	}
+	return transport
+}
+
+func (n *Node) punch(peer PeerID) {
 	n.mu.Lock()
-	mode := n.modeLocked(a)
-	eps := n.endpointsLocked(a)
+	mode := n.modeLocked(peer)
+	eps := n.endpointsLocked(peer)
 	n.mu.Unlock()
 	if !mode.allowsDirect() {
 		return
 	}
 	for _, ep := range eps {
-		if transport := n.transports[ep.Address.Addr().Is6()]; transport != nil && ep.Network == "udp" && n.endpointAllowed("udp", ep.Address, false) {
+		if transport := n.outboundUDP(ep); transport != nil {
 			transport.WriteTo([]byte{0}, net.UDPAddrFromAddrPort(ep.Address))
 		}
 	}

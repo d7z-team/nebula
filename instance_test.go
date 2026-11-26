@@ -23,10 +23,10 @@ func TestInstanceConflictRecovery(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t, "tcp", "tcp", "tcp")
-			id := labPeer(f.ips[1])
+			id := f.cfg.Members[1].ID
 			f.cfg.Members[0].BytesPerSecond = 1
 			var withdrawn atomic.Bool
-			firstCert := f.opts[1].Auth.Certificates.Client.Leaf
+			firstCert := grantLeaf(t, f.opts[1].Auth.Certificates)
 			f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 				if withdrawn.Load() && c.Chain[0].Equal(firstCert) {
 					return time.Time{}, errors.New("withdrawn")
@@ -34,7 +34,7 @@ func TestInstanceConflictRecovery(t *testing.T) {
 				return time.Time{}, nil
 			}
 			if revoke {
-				f.opts[2].Auth.Certificates.Client = f.issue(id, pki.Scope{})
+				f.opts[2].Auth.Certificates = f.issue(f.ips[1], pki.Scope{})
 			} else {
 				f.opts[2].Auth.Certificates = f.opts[1].Auth.Certificates
 			}
@@ -47,10 +47,10 @@ func TestInstanceConflictRecovery(t *testing.T) {
 			require.Eventually(t, func() bool {
 				return len(client.InstanceConflicts()) == 1
 			}, 2*time.Second, time.Millisecond)
-			port, _, received := queueShapedPackets(t, client, b, id.IPv4(), "in flight", "queued")
+			port, _, received := queueShapedPackets(t, client, b, f.ips[1], "in flight", "queued")
 			require.NoError(t, a.Close())
 			require.Eventually(t, func() bool { return port.Stats().RejectedOutbound == 2 }, 2*time.Second, time.Millisecond)
-			require.ErrorIs(t, port.WriteIP(id, testIPv4(client.id.IPv4(), id.IPv4(), "held")), ErrInstanceConflict)
+			require.ErrorIs(t, port.WriteIP(id, testIPv4(client.Addresses().IPv4, f.ips[1], "held")), ErrInstanceConflict)
 			require.Empty(t, client.Paths())
 			holds := client.InstanceConflicts()
 			require.Len(t, holds, 1)
@@ -77,7 +77,7 @@ func TestInstanceConflictRecovery(t *testing.T) {
 			require.Empty(t, client.InstanceConflicts())
 			f.cfg.Members[0].BytesPerSecond = 0
 			require.NoError(t, client.ApplyTopology(t.Context(), f.cfg))
-			fresh := testIPv4(client.id.IPv4(), id.IPv4(), "new delivery")
+			fresh := testIPv4(client.Addresses().IPv4, f.ips[1], "new delivery")
 			require.NoError(t, port.WriteIP(id, fresh))
 			select {
 			case got := <-received:
@@ -92,13 +92,13 @@ func TestInstanceConflictRecovery(t *testing.T) {
 
 func TestInstanceConflictEvidenceLimit(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	id := labPeer(f.ips[1])
+	id := f.cfg.Members[1].ID
 	f.opts[2].Auth.Certificates = f.opts[1].Auth.Certificates
 	f.start()
 	client, duplicate := f.nodes[0], f.nodes[2]
 	require.NoError(t, client.ConnectPeerID(t.Context(), id))
 	for range 16 {
-		require.NoError(t, duplicate.ReloadCertificates(t.Context(), LocalCertificates{Client: f.issue(id, pki.Scope{})}))
+		require.NoError(t, duplicate.ReloadCertificates(t.Context(), f.issue(f.ips[1], pki.Scope{})))
 		_, err := client.ConnectEndpoint(t.Context(), f.cfg.Members[2].Endpoints[0])
 		require.ErrorIs(t, err, ErrInstanceConflict)
 	}
@@ -118,7 +118,7 @@ func TestInstanceRestartAndSignedIntroductions(t *testing.T) {
 	client, a, b := f.nodes[0], f.nodes[1], f.nodes[2]
 	record := a.localIntroduction(a.policy.Load()).record
 	discovered := func() IPObservation {
-		rows := slices.DeleteFunc(client.InspectIP(a.id.IPv4()), func(o IPObservation) bool { return o.Source != "introduction" })
+		rows := slices.DeleteFunc(client.InspectIP(a.Addresses().IPv4), func(o IPObservation) bool { return o.Source != "introduction" })
 		require.Len(t, rows, 1)
 		return rows[0]
 	}
@@ -135,11 +135,11 @@ func TestInstanceRestartAndSignedIntroductions(t *testing.T) {
 	require.NoError(t, client.ConnectPeerID(t.Context(), a.id))
 	_, ok = client.learnIntroduction(t.Context(), b.localIntroduction(b.policy.Load()).record, nil)
 	require.False(t, ok)
-	require.True(t, slices.ContainsFunc(client.InspectIP(a.id.IPv4()), func(o IPObservation) bool {
+	require.True(t, slices.ContainsFunc(client.InspectIP(a.Addresses().IPv4), func(o IPObservation) bool {
 		return o.Source == "introduction" && o.Instance == b.instance && o.Decision == "instance mismatch"
 	}))
 	before := a.ControlStatus().Instance
-	require.NoError(t, a.ReloadCertificates(t.Context(), LocalCertificates{Client: f.issue(a.id, pki.Scope{})}))
+	require.NoError(t, a.ReloadCertificates(t.Context(), f.issue(a.Addresses().IPv4, pki.Scope{})))
 	require.Equal(t, before, a.ControlStatus().Instance)
 	require.NoError(t, a.Close())
 	require.Eventually(t, func() bool { _, ok := client.PreferredPath(a.id); return !ok }, time.Second, time.Millisecond)
@@ -154,9 +154,8 @@ func TestInstanceRestartAndSignedIntroductions(t *testing.T) {
 
 func TestInstanceConflictRetainsBothHandshakeRoles(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	id := labPeer(f.ips[1])
-	f.opts[2].Auth.Certificates.Client = f.issue(id, pki.Scope{})
-	incumbentCert := f.opts[1].Auth.Certificates.Client.Leaf
+	f.opts[2].Auth.Certificates = f.issue(f.ips[1], pki.Scope{})
+	incumbentCert := f.opts[1].Auth.Certificates.Node.Leaf
 	var withdrawn atomic.Int32
 	f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		if c.Chain[0].Equal(incumbentCert) && int32(c.Usage) == withdrawn.Load() {
@@ -176,7 +175,7 @@ func TestInstanceConflictRetainsBothHandshakeRoles(t *testing.T) {
 	require.ErrorIs(t, err, ErrInstanceConflict)
 	var role x509.ExtKeyUsage
 	require.Eventually(t, func() bool {
-		for _, row := range client.InspectIP(id.IPv4()) {
+		for _, row := range client.InspectIP(f.ips[1]) {
 			if row.Source == "conflict" && row.Decision == "retained" {
 				role = row.Usage
 				return true
@@ -195,10 +194,10 @@ func TestInstanceConflictRetainsBothHandshakeRoles(t *testing.T) {
 
 func TestInspectAddressClaims(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	duplicate, err := pki.NewPeerID(f.ips[1], labPeer(f.ips[2]).IPv6())
-	require.NoError(t, err)
-	f.opts[2].Auth.Certificates.Client = f.issue(duplicate, pki.Scope{})
-	f.opts[2].Topology = Topology{Network: "lab", Members: []Member{{IPv4: duplicate.IPv4(), IPv6: duplicate.IPv6()}}}
+	duplicate := f.cfg.Members[2].ID
+	addr := pki.Addresses{IPv4: f.ips[1], IPv6: f.cfg.Members[2].IPv6}
+	f.opts[2].Auth.Certificates = f.issue(f.ips[2], pki.Scope{}, addr)
+	f.opts[2].Topology = Topology{Network: "lab", Members: []Member{{ID: duplicate, IPv4: addr.IPv4, IPv6: addr.IPv6}}}
 	prefix := netip.MustParsePrefix("172.30.0.0/24")
 	vip := netip.MustParseAddr("10.13.0.200")
 	for i := range 2 {
@@ -207,14 +206,14 @@ func TestInspectAddressClaims(t *testing.T) {
 	}
 	f.start()
 	client, b := f.nodes[0], f.nodes[2]
-	_, err = client.ConnectEndpoint(t.Context(), f.cfg.Members[2].Endpoints[0])
+	_, err := client.ConnectEndpoint(t.Context(), f.cfg.Members[2].Endpoints[0])
 	require.Error(t, err)
 	_, ok := client.learnIntroduction(t.Context(), b.localIntroduction(b.policy.Load()).record, nil)
 	require.False(t, ok)
-	for _, ip := range []netip.Addr{duplicate.IPv4(), duplicate.IPv6()} {
+	for _, ip := range []netip.Addr{addr.IPv4, addr.IPv6} {
 		obs := client.InspectIP(ip)
 		require.True(t, slices.ContainsFunc(obs, func(o IPObservation) bool {
-			return o.Peer == duplicate && o.Source == "certificate" && o.Decision == "address conflict" && o.Instance == (InstanceID{}) && o.CertificateSHA256 != "" && o.Usage == x509.ExtKeyUsageServerAuth
+			return o.Peer == duplicate && o.Source == "session" && o.Decision == "address conflict" && o.Instance == b.instance && o.GrantSHA256 != "" && o.Usage == x509.ExtKeyUsageServerAuth
 		}))
 		require.True(t, slices.ContainsFunc(obs, func(o IPObservation) bool {
 			return o.Peer == duplicate && o.Source == "introduction" && o.Decision == "address conflict" && o.Instance == b.instance
@@ -235,10 +234,11 @@ func TestInspectAddressClaims(t *testing.T) {
 
 func TestConcurrentInstanceAdmission(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp", "tcp")
-	id := labPeer(f.ips[1])
+	id := f.cfg.Members[1].ID
 	for i := 2; i < len(f.opts); i++ {
-		f.opts[i].Auth.Certificates.Client = f.issue(id, pki.Scope{})
+		f.opts[i].Auth.Certificates = f.issue(f.ips[1], pki.Scope{})
 	}
+	f.opts[0].Auth.TrustedEntrypoints = []PeerID{id}
 	f.opts[0].Topology = Topology{Network: f.cfg.Network, Members: f.cfg.Members[:1]}
 	var withdrawn atomic.Pointer[x509.Certificate]
 	f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
@@ -276,7 +276,7 @@ func TestConcurrentInstanceAdmission(t *testing.T) {
 	require.Len(t, refused, 2)
 	require.Eventually(t, func() bool {
 		var held int
-		for _, row := range client.InspectIP(id.IPv4()) {
+		for _, row := range client.InspectIP(f.ips[1]) {
 			if row.Source == "conflict" && row.Decision == "held out" {
 				held++
 			}
@@ -286,12 +286,12 @@ func TestConcurrentInstanceAdmission(t *testing.T) {
 	require.NoError(t, f.nodes[winner].Close())
 	require.Eventually(t, func() bool { return len(client.Paths()) == 0 }, time.Second, time.Millisecond)
 	require.NoError(t, client.ResolveInstanceConflict(id, f.nodes[winner].instance))
-	withdrawn.Store(f.opts[winner].Auth.Certificates.Client.Leaf)
+	withdrawn.Store(grantLeaf(t, f.opts[winner].Auth.Certificates))
 	require.NoError(t, client.Revalidate(t.Context()))
 	port, err := client.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
-	require.ErrorIs(t, port.WriteIP(id, testIPv4(client.id.IPv4(), id.IPv4(), "await selection")), ErrInstanceConflict)
-	owner, ok := client.LookupPeer(id.IPv4())
+	require.ErrorIs(t, port.WriteIP(id, testIPv4(client.Addresses().IPv4, f.ips[1], "await selection")), ErrInstanceConflict)
+	owner, ok := client.LookupPeer(f.ips[1])
 	require.True(t, ok)
 	require.Equal(t, id, owner)
 	for _, i := range refused {

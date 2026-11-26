@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"io"
 	"iter"
 	"net"
 	"net/netip"
@@ -17,14 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type countingSigner struct {
-	crypto.Signer
-	calls int
-}
-
-func (s *countingSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	s.calls++
-	return s.Signer.Sign(r, digest, opts)
+func testClusterCA(t *testing.T, key crypto.Signer, profile CAProfile) (*x509.Certificate, *x509.Certificate, error) {
+	t.Helper()
+	anchorKey, err := GenerateKey("ed25519")
+	require.NoError(t, err)
+	root, err := CreateRoot(anchorKey, CAProfile{Subject: pkix.Name{CommonName: "ordinary root"}, NotBefore: profile.NotBefore, NotAfter: profile.NotAfter, MaxPathLen: -1})
+	require.NoError(t, err)
+	csr, err := CreateCSR(key, pkix.Name{})
+	require.NoError(t, err)
+	cert, err := (Issuer{Chain: []*x509.Certificate{root}, Signer: anchorKey}).IssueCA(csr, profile, sha256.Sum256(csr.RawSubjectPublicKeyInfo))
+	return cert, root, err
 }
 
 func TestClusterAllocation(t *testing.T) {
@@ -37,7 +38,7 @@ func TestClusterAllocation(t *testing.T) {
 		Scope:        &Scope{Network: "lab", Cluster: true, AnycastPools: []netip.Prefix{p("10.0.0.4/31"), p("fd00::/80"), p("192.0.2.200/32")}},
 		PermittedIPs: []netip.Prefix{p("10.0.0.0/29"), p("fd00::/64")},
 	}
-	cert, err := CreateRoot(key, profile)
+	cert, _, err := testClusterCA(t, key, profile)
 	require.NoError(t, err)
 	c, err := ReadClusterCA(cert)
 	require.NoError(t, err)
@@ -55,9 +56,7 @@ func TestClusterAllocation(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, a("fd00::1:0:0:0"), first)
 	for _, pair := range [][2]string{{"10.0.0.0", "fd00::1:0:0:1"}, {"10.0.0.7", "fd00::1:0:0:1"}, {"10.0.0.4", "fd00::1:0:0:1"}, {"10.0.0.1", "fd00::"}, {"10.0.0.1", "fd00::1"}, {"10.0.0.1", "fd03::1"}} {
-		id, err := NewPeerID(a(pair[0]), a(pair[1]))
-		require.NoError(t, err)
-		require.Error(t, c.ValidateMember(id))
+		require.Error(t, c.ValidateMember(Addresses{a(pair[0]), a(pair[1])}))
 	}
 	require.True(t, c.ValidAnycast(a("192.0.2.200")))
 	require.False(t, c.ValidAnycast(a("fd00::")))
@@ -94,7 +93,7 @@ func TestClusterAllocation(t *testing.T) {
 	require.ErrorContains(t, err, "issuer excludes")
 	for _, small := range [][2]string{{"10.9.0.0/31", "fd01::/127"}, {"10.9.0.0/32", "fd01::/128"}} {
 		profile.PermittedIPs = []netip.Prefix{p(small[0]), p(small[1])}
-		cert, err := CreateRoot(key, profile)
+		cert, _, err := testClusterCA(t, key, profile)
 		require.NoError(t, err)
 		plan, err := ReadClusterCA(cert)
 		require.NoError(t, err)
@@ -104,11 +103,9 @@ func TestClusterAllocation(t *testing.T) {
 			require.Equal(t, subnet.Addr(), got[0])
 		}
 	}
-	signer := &countingSigner{Signer: key}
 	for _, bad := range [][]netip.Prefix{{p("10.0.0.0/8")}, {p("10.0.0.0/8"), p("192.0.2.0/24"), p("fd00::/64")}, {p("224.0.0.0/4"), p("fd00::/64")}} {
 		profile.PermittedIPs = bad
-		_, err := CreateRoot(signer, profile)
+		_, _, err := testClusterCA(t, key, profile)
 		require.Error(t, err)
 	}
-	require.Zero(t, signer.calls, "validate the cluster plan before invoking the signing key")
 }

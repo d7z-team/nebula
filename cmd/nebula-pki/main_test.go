@@ -31,7 +31,7 @@ func TestOfflinePKI(t *testing.T) {
 	command("keygen", "-out", "node.key")
 	command("request", "-key", "node.key", "-name", "client", "-out", "node.csr")
 	hash := strings.TrimSpace(command("inspect", "-in", "node.csr", "-fingerprint"))
-	for _, role := range []string{"node", "ca"} {
+	for _, role := range []string{"grant", "ca"} {
 		err := run([]string{
 			"issue", "-role", role, "-in", "node.csr", "-approved-key", issuerHash,
 			"-name", "node", "-ca", "ca.pem", "-ca-key", "ca.key", "-network", "lab",
@@ -39,13 +39,15 @@ func TestOfflinePKI(t *testing.T) {
 		}, nil, io.Discard, io.Discard)
 		require.ErrorContains(t, err, "fingerprint")
 	}
-	leaf := command("issue", "-in", "node.csr", "-name", "node", "-approved-key", hash, "-ca", "issuer.pem", "-ca-key", "issuer.key",
+	command("issue", "-role", "node", "-in", "node.csr", "-approved-key", hash, "-ca", "ca.pem", "-ca-key", "ca.key", "-out", "node.pem")
+	command("verify", "-peer", hash, "-root", "ca.pem", "-in", "node.pem")
+	leaf := command("issue", "-role", "grant", "-in", "node.csr", "-name", "node", "-approved-key", hash, "-ca", "issuer.pem", "-ca-key", "issuer.key",
 		"-network", "lab", "-anycast-ips", "10.0.0.130,10.0.0.131", "-routes", "192.0.2.0/25", "-ipv4", "10.0.0.1", "-ipv6", "fd42::1")
 	require.NoError(t, os.WriteFile("chain.pem", []byte(leaf+issuer), 0o600))
 	details := command("inspect", "-in", "chain.pem")
 	require.Contains(t, details, "routes=[192.0.2.0/25]")
 	require.Contains(t, details, "anycastIPs=[10.0.0.130 10.0.0.131]")
-	require.Contains(t, command("verify", "-roots", "ca.pem", "-cluster-ca", "issuer.pem", "-ipv4", "10.0.0.1", "-ipv6", "fd42::1", "-in", "chain.pem"), "node")
+	require.Contains(t, command("verify", "-role", "grant", "-peer", hash, "-root", "ca.pem", "-cluster-ca", "issuer.pem", "-in", "chain.pem"), "node")
 }
 
 func TestHelp(t *testing.T) {

@@ -32,12 +32,13 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	rootsFile := flag.String("roots", "ca.pem", "trusted root PEM bundle")
+	rootsFile := flag.String("root", "root.pem", "ordinary root certificate")
 	pinFile := flag.String("cluster-ca", "ca.pem", "pinned cluster CA certificate in PEM")
-	certFile := flag.String("cert", "node.pem", "member PEM chain, leaf first")
-	keyFile := flag.String("key", "node.key", "member private key")
+	certFile := flag.String("cert", "node.pem", "one root-issued node certificate in PEM")
+	keyFile := flag.String("key", "node.key", "private key shared by the node certificate and cluster grant")
 	viewFile := flag.String("topology", "topology.json", "approved topology JSON")
 	message := flag.String("send", "", "send a request and wait for its receipt (default: serve requests)")
+	grantFile := flag.String("grant", "grant.pem", "PEM chain from the grant leaf through the cluster CA")
 	var listen, endpoint netip.AddrPort
 	var peer, resolve netip.Addr
 	flag.TextVar(&listen, "listen", netip.MustParseAddrPort("127.0.0.1:0"), "local UDP address and port")
@@ -64,9 +65,16 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	opts := nebula.Options{Auth: nebula.AuthOptions{Roots: x509.NewCertPool()}}
-	for _, root := range roots {
-		opts.Auth.Roots.AddCert(root)
+	if len(roots) != 1 {
+		return errors.New("one ordinary root required")
+	}
+	opts := nebula.Options{Auth: nebula.AuthOptions{RootCA: roots[0]}}
+	grant, err := readCertificates(*grantFile)
+	if err != nil {
+		return err
+	}
+	for _, c := range grant {
+		opts.Auth.Certificates.Grant = append(opts.Auth.Certificates.Grant, c.Raw)
 	}
 	pin, err := readCertificates(*pinFile)
 	if err != nil {
@@ -76,7 +84,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("%s must contain exactly one cluster CA", *pinFile)
 	}
 	opts.Auth.ClusterCA = pin[0]
-	opts.Auth.Certificates.Client, err = tls.LoadX509KeyPair(*certFile, *keyFile)
+	opts.Auth.Certificates.Node, err = tls.LoadX509KeyPair(*certFile, *keyFile)
 	if err != nil {
 		return err
 	}

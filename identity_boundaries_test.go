@@ -28,7 +28,7 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
 	roots.AddCert(root)
-	roots.AddCert(f.ca)
+	roots.AddCert(f.root.Chain[0])
 	key, err := pki.GenerateKey("ed25519")
 	require.NoError(t, err)
 	req, err := pki.CreateCSR(key, pkix.Name{CommonName: "intermediate"})
@@ -40,26 +40,31 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	profile.NotBefore = now.Add(-time.Minute)
 	profile.NotAfter = now.Add(10 * time.Minute)
 	var intermediates []*x509.Certificate
-	for _, issuer := range []pki.Issuer{{Chain: []*x509.Certificate{f.ca}, Signer: f.key}, {Chain: []*x509.Certificate{root}, Signer: rootKey}} {
-		inter, err := issuer.IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
-		require.NoError(t, err)
-		intermediates = append(intermediates, inter)
-	}
-	leafKey, err := pki.GenerateKey("ed25519")
+	issuer := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
+	inter, err := issuer.IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 	require.NoError(t, err)
+	templateCA := *inter
+	templateCA.ExtraExtensions = inter.Extensions
+	altDER, err := x509.CreateCertificate(rand.Reader, &templateCA, root, key.Public(), rootKey)
+	require.NoError(t, err)
+	alt, err := x509.ParseCertificate(altDER)
+	require.NoError(t, err)
+	intermediates = append(intermediates, inter, alt)
+	leafKey := labKey(f.ips[0])
 	req, err = pki.CreateCSR(leafKey, pkix.Name{})
 	require.NoError(t, err)
-	enroll := pki.Enrollment{Name: "host-1", Scope: pki.Scope{Network: "lab"}, IPv4: f.ips[0], IPv6: labPeer(f.ips[0]).IPv6(), Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(5 * time.Minute)}
-	leaf, err := (pki.Issuer{Chain: []*x509.Certificate{intermediates[0], f.ca}, Signer: key}).IssueLeaf(req, enroll)
+	enroll := pki.Enrollment{Name: "host-1", Scope: pki.Scope{Network: "lab"}, IPv4: f.ips[0], IPv6: f.cfg.Members[0].IPv6, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(5 * time.Minute)}
+	leaf, err := (pki.Issuer{Chain: []*x509.Certificate{intermediates[0], f.ca}, Signer: key}).IssueGrant(req, enroll)
 	require.NoError(t, err)
 	chain := append([]*x509.Certificate{leaf}, intermediates...)
-	paths, err := pki.VerifyChain(chain, roots, f.cluster, labPeer(f.ips[0]), x509.ExtKeyUsageClientAuth, now)
+	chain = append(chain, f.ca)
+	paths, err := pki.VerifyGrant(chain, roots, f.cluster, f.cfg.Members[0].ID, now)
 	require.NoError(t, err)
 	require.Len(t, paths, 1)
 	require.True(t, paths[0][2].Equal(f.ca))
 	view, err := f.cfg.compile(f.cluster)
 	require.NoError(t, err)
-	n := &Node{id: labPeer(f.ips[0]), o: Options{Auth: AuthOptions{Roots: roots}}}
+	n := &Node{id: f.cfg.Members[0].ID, roots: roots}
 	cutoff := now.Add(time.Minute)
 	accepted := root
 	n.o.Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
@@ -70,14 +75,14 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 		}
 		return cutoff, nil
 	}
-	_, err = n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	_, err = n.authorizeGrant(t.Context(), view, n.id, chain)
 	require.ErrorIs(t, err, ErrPathPolicy)
-	accepted = f.ca
-	until, err := n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	accepted = f.root.Chain[0]
+	until, err := n.authorizeGrant(t.Context(), view, n.id, chain)
 	require.NoError(t, err)
 	require.Equal(t, cutoff, until)
 	cutoff = now.Add(time.Hour)
-	until, err = n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	until, err = n.authorizeGrant(t.Context(), view, n.id, chain)
 	require.NoError(t, err)
 	require.Equal(t, leaf.NotAfter, until)
 
@@ -96,30 +101,30 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 		}
 		return time.Time{}, nil
 	}
-	_, err = n.authorizeChain(t.Context(), view, n.id, []*x509.Certificate{direct}, x509.ExtKeyUsageClientAuth)
+	_, err = n.authorizeGrant(t.Context(), view, n.id, []*x509.Certificate{direct, f.ca})
 	require.ErrorIs(t, err, withdrawn)
-	_, err = n.authorizeChain(t.Context(), view, n.id, chain, x509.ExtKeyUsageClientAuth)
+	_, err = n.authorizeGrant(t.Context(), view, n.id, chain)
 	require.NoError(t, err)
 }
 
 func TestCredentialAndFrameBudgets(t *testing.T) {
 	f := newFixture(t, "tcp")
 	set := f.opts[0].Auth.Certificates
-	leaf, err := x509.ParseCertificate(set.Client.Certificate[0])
+	leaf, err := x509.ParseCertificate(set.Grant[0])
 	require.NoError(t, err)
 	// Large noncritical extensions keep the DER length fields and Ed25519
 	// signature size constant throughout the +/- one byte cases.
 	pad := 22 << 10
 	encode := func(n int) []byte {
-		leaf.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 3}, Value: make([]byte, n)}}
+		leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 3}, Value: make([]byte, n)})
 		der, err := x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
 		require.NoError(t, err)
 		return der
 	}
-	pad += (24 << 10) - len(encode(pad)) - len(leaf.RawIssuer)
+	pad += (24 << 10) - len(encode(pad)) - len(leaf.RawIssuer) - len(set.Node.Certificate[0]) - len(set.Grant[1])
 	for _, delta := range []int{-1, 0, 1} {
-		set.Client.Certificate = [][]byte{encode(pad + delta)}
-		require.Equal(t, (24<<10)+delta, len(set.Client.Certificate[0])+len(leaf.RawIssuer))
+		set.Grant = [][]byte{encode(pad + delta), f.ca.Raw}
+		require.Equal(t, (24<<10)+delta, len(set.Grant[0])+len(leaf.RawIssuer)+len(set.Node.Certificate[0])+len(set.Grant[1]))
 		_, err := prepareCertificates(set)
 		if delta > 0 {
 			require.Error(t, err)

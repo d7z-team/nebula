@@ -20,19 +20,19 @@ import (
 
 func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
-	pair := &f.opts[0].Auth.Certificates.Client
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	pair := f.opts[0].Auth.Certificates
+	leaf, err := x509.ParseCertificate(pair.Grant[0])
 	require.NoError(t, err)
-	leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}, Value: make([]byte, (24<<10)-len(leaf.Raw)-len(leaf.RawIssuer)-128)})
-	pair.Certificate[0], err = x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
+	leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}, Value: make([]byte, (24<<10)-len(leaf.Raw)-len(leaf.RawIssuer)-len(pair.Grant[1])-len(pair.Node.Certificate[0])-128)})
+	pair.Grant[0], err = x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
 	require.NoError(t, err)
 	for i := range f.opts {
 		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	f.start()
-	// All three default roles must own their certificate data after New.
-	clear(pair.Certificate[0])
-	pair.Certificate[0] = nil
+	// The node owns the admitted grant bytes.
+	clear(pair.Grant[0])
+	pair.Grant[0] = nil
 	n, other := f.nodes[0], f.nodes[1]
 	id, err := n.Publish(t.Context(), "app/test", make([]byte, 4096))
 	require.NoError(t, err)
@@ -69,7 +69,7 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	sub, err := other.Subscribe("app/test")
 	require.NoError(t, err)
 	defer sub.Close()
-	require.NoError(t, n.ConnectPeer(t.Context(), other.id.IPv4()))
+	require.NoError(t, n.ConnectPeer(t.Context(), other.Addresses().IPv4))
 	// Pull the signed maximum-payload publication over the real control stream.
 	require.Eventually(t, func() bool { return other.preferredSession(n.id, false) != nil }, time.Second, time.Millisecond)
 	wire, err := other.preferredSession(n.id, false).request(t.Context(), 0x07, []byte(id), pki.MaxDocument)
@@ -77,7 +77,7 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	require.Equal(t, []byte(publication.record), wire)
 	body, chain, err := pki.VerifyObjectSignature(wire, n.Cluster().Network(), "publication")
 	require.NoError(t, err)
-	require.True(t, chain[0].Equal(n.cred.Load().Object.Leaf))
+	require.True(t, chain[0].Equal(n.cred.Load().cmsSigner.Leaf))
 	var envelope map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(body, &envelope))
 	require.Equal(t, id, fmt.Sprintf("%x", sha256.Sum256(envelope["value"])))
@@ -103,7 +103,7 @@ func TestPublicationRepairAndPolicyWithdrawal(t *testing.T) {
 	f.opts[0].MaintenanceInterval, f.opts[1].MaintenanceInterval = time.Hour, time.Hour
 	f.start()
 	a, mid, b := f.nodes[0], f.nodes[1], f.nodes[2]
-	require.NoError(t, a.ConnectPeer(t.Context(), mid.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), mid.Addresses().IPv4))
 	_, err := mid.ConnectEndpoint(t.Context(), f.cfg.Members[0].Endpoints[0])
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
@@ -130,7 +130,7 @@ func TestPublicationRepairAndPolicyWithdrawal(t *testing.T) {
 	_, err = b.acceptPublication(t.Context(), nil, cached, strings.Repeat("0", 64))
 	require.ErrorContains(t, err, "requested ID")
 	require.Empty(t, sub.Publications())
-	require.NoError(t, b.ConnectPeer(t.Context(), mid.id.IPv4()))
+	require.NoError(t, b.ConnectPeer(t.Context(), mid.Addresses().IPv4))
 	select {
 	case publication := <-sub.Publications():
 		require.Equal(t, id, publication.ID)

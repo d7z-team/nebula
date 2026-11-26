@@ -122,9 +122,9 @@ func TestChaosFailoverAndRenewal(t *testing.T) {
 	old := l.connect(a, b, "udp")
 	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, c, d, 0)
-	fresh := issueCredentials(t, l.issuer, l.top.Members[b.index], "ed25519")
+	fresh := l.issueCredentials(b, l.issuer)
 	require.NoError(t, b.node.ReloadCertificates(t.Context(), fresh))
-	require.Equal(t, old.Serial, waitPath(t, a, b, "udp").Serial)
+	require.Equal(t, old.GrantSerial, waitPath(t, a, b, "udp").GrantSerial)
 	// Isolate one direction after renewal. A TCP standby must authenticate
 	// with the new leaf before it can carry the original inner stream.
 	var lost atomic.Int64
@@ -137,7 +137,7 @@ func TestChaosFailoverAndRenewal(t *testing.T) {
 	})
 	receipt(t, c, d, 1)
 	path := waitPath(t, a, b, "tcp")
-	require.Equal(t, fresh.Client.Leaf.SerialNumber.String(), path.Serial)
+	require.Equal(t, fresh.Node.Leaf.SerialNumber.String(), path.NodeSerial)
 	require.Positive(t, lost.Load())
 	receipt(t, c, d, 2)
 	l.net.disturb(nil)
@@ -262,6 +262,14 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 	observer := l.host("wan", "192.0.2.50", "", "udp", true)
 	old := netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port)
 	l.top.Members[observer.index].Transit = true
+	observerID := l.top.Members[observer.index].ID
+	mobile.options.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
+		return c.Source == nebula.EndpointFromObservation && c.Observer == observerID
+	}
+	wan := netip.MustParsePrefix("192.0.2.0/24")
+	fixed.options.Transport.AllowOutboundEndpoint = func(ep nebula.Endpoint) bool {
+		return wan.Contains(ep.Address.Addr())
+	}
 	l.link(fixed, observer)
 	l.link(mobile, observer)
 	// The mobile peer answers rendezvous but leaves direct dialing to the fixed peer.
@@ -324,10 +332,10 @@ func TestChaosRelayPartition(t *testing.T) {
 	last := l.host("wan", "192.0.2.5", "", "both", true)
 	l.top.Members[last.index].Transit = true
 	l.link(last, b)
-	relays := map[netip.Addr]*host{}
+	relays := map[nebula.PeerID]*host{}
 	for _, ip := range []string{"192.0.2.3", "192.0.2.4"} {
 		r := l.host("wan", ip, "", "tcp", true)
-		relays[r.ip] = r
+		relays[l.top.Members[r.index].ID] = r
 		l.link(a, r)
 		l.link(last, r)
 		l.top.Members[r.index].Transit = true
@@ -343,10 +351,10 @@ func TestChaosRelayPartition(t *testing.T) {
 	l.connect(b, last, "udp")
 	path := l.connect(a, b, "relay")
 	require.Len(t, path.Circuit, 4)
-	require.Equal(t, labPeer(last.ip), path.Circuit[2])
+	require.Equal(t, l.top.Members[last.index].ID, path.Circuit[2])
 	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, c, d, 0)
-	primary := relays[path.Circuit[1].IPv4()]
+	primary := relays[path.Circuit[1]]
 	var alternate *host
 	for _, r := range relays {
 		if r != primary {
@@ -367,7 +375,7 @@ func TestChaosRelayPartition(t *testing.T) {
 	l.net.disturb(nil)
 	require.Eventually(t, func() bool { return a.node.ConnectPeer(t.Context(), b.ip) == nil }, 12*time.Second, 100*time.Millisecond)
 	path = waitPath(t, a, b, "relay")
-	require.Equal(t, []nebula.PeerID{labPeer(a.ip), labPeer(alternate.ip), labPeer(last.ip), labPeer(b.ip)}, path.Circuit)
+	require.Equal(t, []nebula.PeerID{l.top.Members[a.index].ID, l.top.Members[alternate.index].ID, l.top.Members[last.index].ID, l.top.Members[b.index].ID}, path.Circuit)
 	receipt(t, c, d, 1)
 	l.net.mu.Lock()
 	direct := 0
@@ -429,7 +437,7 @@ func TestChaosHiddenTransit(t *testing.T) {
 		}
 	}
 	client, server := l.business(a), l.business(b)
-	c, d := tcpPair(t, client, server, b.node.ID().IPv6().String(), ipv6.ProtocolNumber)
+	c, d := tcpPair(t, client, server, b.node.Addresses().IPv6.String(), ipv6.ProtocolNumber)
 	receipt(t, c, d, 0)
 	require.Eventually(t, submitted.Load, time.Second, time.Millisecond)
 	c4, d4 := tcpPair(t, client, server, b.ip.String(), ipv4.ProtocolNumber)
@@ -497,7 +505,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	c := l.host("wan", "192.0.2.3", "", "tcp", true)
 	var denied atomic.Bool
 	r.options.Auth.CheckChain = func(_ context.Context, check nebula.ChainCheck) (time.Time, error) {
-		if denied.Load() && check.Usage == x509.ExtKeyUsageCodeSigning && check.Member == labPeer(a.ip) {
+		if denied.Load() && check.Usage == x509.ExtKeyUsageCodeSigning && check.Member == l.top.Members[a.index].ID {
 			return time.Time{}, errors.New("publisher withdrawn")
 		}
 		return time.Time{}, nil
@@ -507,7 +515,8 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	publicationReceipt(t, a, r, "withdrawn publication")
 	denied.Store(true)
 	require.NoError(t, r.node.Revalidate(t.Context()))
-	require.Equal(t, a.options.Auth.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, r, a, "tcp").Serial)
+	_, active := r.node.PreferredPath(a.node.ID())
+	require.False(t, active)
 	id, err := r.node.Publish(t.Context(), "app/test", []byte("cached while partitioned"))
 	require.NoError(t, err)
 	sub, err := c.node.Subscribe("app/test")
@@ -517,7 +526,7 @@ func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	select {
 	case publication := <-sub.Publications():
 		require.Equal(t, id, publication.ID)
-		require.Equal(t, labPeer(r.ip), publication.Origin)
+		require.Equal(t, l.top.Members[r.index].ID, publication.Origin)
 	case <-time.After(4 * time.Second):
 		t.Fatal("late subscriber missed the authorized cached publication")
 	}
@@ -573,7 +582,7 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 	go func() { first <- a.node.ConnectPeer(waiter, c.ip) }()
 	require.Eventually(t, func() bool { return attempts.Load() > 0 }, time.Second, time.Millisecond)
 	dial := make(chan error, 1)
-	go func() { dial <- a.node.ConnectPeer(t.Context(), c.node.ID().IPv6()) }()
+	go func() { dial <- a.node.ConnectPeer(t.Context(), c.node.Addresses().IPv6) }()
 	cancel()
 	select {
 	case err := <-first:
@@ -608,6 +617,7 @@ func TestSeededChaos(t *testing.T) {
 	l.start()
 	l.connect(a, b, "udp")
 	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
+	current := b.options.Auth.Certificates
 	rng := rand.New(rand.NewSource(*chaosSeed))
 	for step := range 8 {
 		action := rng.Intn(5)
@@ -635,9 +645,18 @@ func TestSeededChaos(t *testing.T) {
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.protocol == 17} })
 			waitPath(t, a, b, "tcp")
 		case 2:
-			fresh := issueCredentials(t, l.issuer, l.top.Members[b.index], "ed25519")
-			require.NoError(t, b.node.ReloadCertificates(t.Context(), fresh))
-			require.Equal(t, fresh.Client.Leaf.SerialNumber.String(), b.node.ControlStatus().Serial)
+			fresh := l.issueCredentials(b, l.issuer)
+			if step%2 == 0 {
+				current.Node = fresh.Node
+			} else {
+				current.Grant = fresh.Grant
+			}
+			require.NoError(t, b.node.ReloadCertificates(t.Context(), current))
+			status := b.node.ControlStatus()
+			grant, err := x509.ParseCertificate(current.Grant[0])
+			require.NoError(t, err)
+			require.Equal(t, grant.SerialNumber.String(), status.GrantSerial)
+			require.Equal(t, current.Node.Leaf.SerialNumber.String(), status.NodeSerial)
 		case 3:
 			require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Blocked))
 			require.ErrorIs(t, a.node.ConnectPeer(t.Context(), b.ip), nebula.ErrPathPolicy)

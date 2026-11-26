@@ -28,21 +28,21 @@ func TestConnectPeerAfterSuccessfulPathIsWithdrawn(t *testing.T) {
 			return nil, refused
 		}
 		f.start()
-		a, peer := f.nodes[0], f.nodes[1].ID()
+		a, peer := f.nodes[0], f.cfg.Members[1]
 
 		// The registered path has been withdrawn, but its dial has yet to
 		// report completion. Both address families join that same attempt.
 		old := &peerAttempt{changed: make(chan struct{})}
 		a.mu.Lock()
-		a.attempts[peer] = old
+		a.attempts[peer.ID] = old
 		a.mu.Unlock()
 		done := make(chan error, 2)
-		for _, addr := range []netip.Addr{peer.IPv4(), peer.IPv6()} {
+		for _, addr := range []netip.Addr{peer.IPv4, peer.IPv6} {
 			go func() { done <- a.ConnectPeer(t.Context(), addr) }()
 		}
 		synctest.Wait()
 		a.mu.Lock()
-		delete(a.attempts, peer)
+		delete(a.attempts, peer.ID)
 		close(old.changed)
 		old.changed = nil
 		a.mu.Unlock()
@@ -71,7 +71,7 @@ func TestGroupSendUsesInboundPathWhileWaitingForDialSlot(t *testing.T) {
 	require.NoError(t, err)
 	out, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
-	pkt := testIPv4(a.id.IPv4(), limitedBroadcast, "inbound path")
+	pkt := testIPv4(a.Addresses().IPv4, limitedBroadcast, "inbound path")
 	require.NoError(t, out.WriteIP(PeerID{}, pkt))
 	require.Eventually(t, func() bool {
 		a.mu.Lock()
@@ -152,12 +152,77 @@ func TestConnectEndpointTrustAndRestrictions(t *testing.T) {
 			} else {
 				f.cfg.Members[1].Restricted = true
 			}
+			f.opts[0].Auth.TrustedEntrypoints = []PeerID{f.cfg.Members[1].ID}
 			f.startDiscovery()
 			_, err := f.nodes[0].ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
 			require.Error(t, err)
 			require.Empty(t, f.nodes[1].Paths())
 		})
 	}
+}
+
+func TestOutboundEndpointPolicyWithRelay(t *testing.T) {
+	f := newFixture(t, "both", "tcp", "both")
+	f.link(0, 1)
+	f.link(1, 2)
+	f.cfg.Members[1].Transit = true
+	target := f.cfg.Members[2]
+	denied := target.Endpoints[0].Address // TCP and QUIC share the port.
+	relayAddr := f.cfg.Members[1].Endpoints[0].Address
+	var allowTCP atomic.Bool
+	var deniedTCP atomic.Int32
+	f.opts[0].Transport.DialTCP = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == denied.String() && !allowTCP.Load() {
+			deniedTCP.Add(1)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	for i := range f.opts {
+		f.opts[i].MaintenanceInterval = time.Hour
+	}
+	f.opts[0].Transport.AllowOutboundEndpoint = func(e Endpoint) bool {
+		return e.Address != denied || e.Network == "tcp" && allowTCP.Load()
+	}
+	f.opts[2].Transport.AllowOutboundEndpoint = func(e Endpoint) bool { return e.Address == relayAddr }
+	f.start()
+	a, relay, b := f.nodes[0], f.nodes[1], f.nodes[2]
+	for _, ep := range target.Endpoints {
+		_, err := a.ConnectEndpoint(t.Context(), ep)
+		require.ErrorIs(t, err, ErrPathPolicy)
+	}
+	for _, n := range []*Node{a, b} {
+		require.NoError(t, n.ConnectPeerID(t.Context(), relay.ID()))
+	}
+	require.Eventually(t, func() bool {
+		_, left := relay.PreferredPath(a.ID())
+		_, right := relay.PreferredPath(b.ID())
+		return left && right
+	}, 3*time.Second, time.Millisecond)
+	matches, err := a.ResolveIP(t.Context(), b.Addresses().IPv4)
+	require.NoError(t, err)
+	require.Contains(t, matches[0].Endpoints, target.Endpoints[0])
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.ID()))
+	path, ok := a.PreferredPath(b.ID())
+	require.True(t, ok)
+	require.Equal(t, "relay", path.Transport)
+
+	// In one canary round, skip the denied UDP endpoint and dial the newly allowed TCP endpoint.
+	b.mu.Lock()
+	before := len(b.queries)
+	b.mu.Unlock()
+	allowTCP.Store(true)
+	a.mu.Lock()
+	a.peers[b.ID()].lastCanary = time.Time{}
+	a.mu.Unlock()
+	a.probeAlternatePaths(a.preferredSession(b.ID(), false), 0)
+	b.mu.Lock()
+	after := len(b.queries)
+	b.mu.Unlock()
+	require.Equal(t, before, after)
+	require.True(t, slices.ContainsFunc(a.Paths(), func(p PathStatus) bool { return p.Peer == b.ID() && p.Transport == "tcp" }))
+	require.Zero(t, deniedTCP.Load())
+	require.Zero(t, f.sockets[0].count(denied))
+	require.Zero(t, a.ControlStatus().DialFailures)
 }
 
 func TestConnectEndpointRecoveryAfterUDPBlackout(t *testing.T) {
@@ -180,7 +245,7 @@ func TestConnectEndpointRecoveryAfterUDPBlackout(t *testing.T) {
 	id, err := a.ConnectEndpoint(t.Context(), ep)
 	require.NoError(t, err)
 	require.Equal(t, b.ID(), id)
-	got, err := a.ResolveIP(t.Context(), id.IPv6())
+	got, err := a.ResolveIP(t.Context(), b.Addresses().IPv6)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, id, got[0].Peer)
@@ -190,7 +255,7 @@ func TestConnectEndpointRecoveryAfterUDPBlackout(t *testing.T) {
 	require.NoError(t, err)
 	port, err := b.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
-	require.NoError(t, port.WriteIP(a.ID(), testIPv4(id.IPv4(), a.ID().IPv4(), "after recovery")))
+	require.NoError(t, port.WriteIP(a.ID(), testIPv4(b.Addresses().IPv4, a.Addresses().IPv4, "after recovery")))
 	select {
 	case msg := <-reply:
 		require.Equal(t, "after recovery", msg)
@@ -219,6 +284,7 @@ func TestConnectEndpointSharesDial(t *testing.T) {
 					return (&net.Dialer{}).DialContext(ctx, network, address)
 				}
 			}
+			f.opts[0].Auth.TrustedEntrypoints = []PeerID{f.cfg.Members[1].ID}
 			f.startDiscovery()
 			a, b := f.nodes[0], f.nodes[1]
 			ep := f.cfg.Members[1].Endpoints[0]
@@ -296,7 +362,7 @@ func TestConnectEndpointRequiresServerAuthorization(t *testing.T) {
 	for _, transport := range []string{"udp", "tcp"} {
 		t.Run(transport, func(t *testing.T) {
 			f := newFixture(t, transport, transport)
-			bID := labPeer(f.ips[1])
+			bID := f.cfg.Members[1].ID
 			denied := errors.New("server use denied")
 			f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 				if c.Member == bID && c.Usage == x509.ExtKeyUsageServerAuth {

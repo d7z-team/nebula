@@ -251,7 +251,7 @@ func TestNATPaths(t *testing.T) {
 				require.NoError(t, a.node.SetPeerPathPolicy(b.node.ID(), nebula.Auto))
 				require.NoError(t, b.node.SetPeerPathPolicy(a.node.ID(), nebula.Auto))
 				p := l.connect(a, b, "relay")
-				require.Equal(t, []nebula.PeerID{labPeer(a.ip), labPeer(r.ip), labPeer(b.ip)}, p.Circuit)
+				require.Equal(t, []nebula.PeerID{l.top.Members[a.index].ID, l.top.Members[r.index].ID, l.top.Members[b.index].ID}, p.Circuit)
 			} else {
 				require.Eventually(t, func() bool { return a.node.ConnectPeer(t.Context(), b.ip) == nil }, 10*time.Second, 50*time.Millisecond)
 				p := waitPath(t, a, b, "udp")

@@ -35,7 +35,7 @@ func TestIssuanceAndCMS(t *testing.T) {
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("fd42::/64")},
 		MaxPathLen:   1,
 	}
-	root, err := CreateRoot(key, profile)
+	root, anchor, err := testClusterCA(t, key, profile)
 	require.NoError(t, err)
 	_, interKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ func TestIssuanceAndCMS(t *testing.T) {
 	cluster, err := ReadClusterCA(root)
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
-	roots.AddCert(root)
+	roots.AddCert(anchor)
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 	pq, err := mldsa.GenerateKey(mldsa.MLDSA44())
@@ -63,18 +63,18 @@ func TestIssuanceAndCMS(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			req, err := CreateCSR(signer, pkix.Name{CommonName: name})
 			require.NoError(t, err)
-			enrollment := Enrollment{Name: name, IPv4: netip.MustParseAddr("10.0.0.1"), IPv6: netip.MustParseAddr("fd42::1"), Scope: Scope{Network: "mesh"}, Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Minute)}
-			peer, err := NewPeerID(enrollment.IPv4, enrollment.IPv6)
+			enrollment := Enrollment{Name: name, IPv4: netip.MustParseAddr("10.0.0.1"), IPv6: netip.MustParseAddr("fd42::1"), Scope: Scope{Network: "mesh"}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Minute)}
+			peer, err := NewPeerID(req.PublicKey)
 			require.NoError(t, err)
-			leaf, err := issuer.IssueLeaf(req, enrollment)
+			leaf, err := issuer.IssueGrant(req, enrollment)
 			require.NoError(t, err)
-			crt := tls.Certificate{Certificate: [][]byte{leaf.Raw, inter.Raw}, PrivateKey: signer}
+			crt := tls.Certificate{Certificate: [][]byte{leaf.Raw, inter.Raw, root.Raw}, PrivateKey: signer}
 			wire, err := SignObject("team", "publication", []byte("original publisher"), crt)
 			require.NoError(t, err)
 			body, chain, err := VerifyObjectSignature(wire, "team", "publication")
 			require.NoError(t, err)
 			require.Equal(t, "original publisher", string(body))
-			_, err = VerifyChain(chain, roots, cluster, peer, x509.ExtKeyUsageCodeSigning, now)
+			_, err = VerifyGrant(chain, roots, cluster, peer, now)
 			require.NoError(t, err)
 			_, _, err = VerifyObjectSignature(wire, "other", "publication")
 			require.Error(t, err)
@@ -117,7 +117,7 @@ func TestIssuanceAndCMS(t *testing.T) {
 				}
 				dir := t.TempDir()
 				caPath := filepath.Join(dir, "root.pem")
-				require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw}), 0o600))
+				require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: anchor.Raw}), 0o600))
 				cmd := exec.Command(exe, "cms", "-verify", "-binary", "-inform", "DER", "-purpose", "any", "-CAfile", caPath)
 				cmd.Stdin = bytes.NewReader(wire)
 				out, err := cmd.CombinedOutput()

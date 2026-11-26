@@ -148,7 +148,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	deliver := func() {
 		t.Helper()
 		p := testIPv4(f.ips[0], f.ips[1], "mesh delivery")
-		require.NoError(t, out.WriteIP(labPeer(f.ips[1]), p))
+		require.NoError(t, out.WriteIP(f.cfg.Members[1].ID, p))
 		select {
 		case r := <-in:
 			require.Equal(t, p, r)
@@ -164,7 +164,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		get(web1, name, "HTTP/1.1")
 	}
 	get(mkH3(quic.Version2), names[0], "HTTP/3.0")
-	bad := &tls.Config{NextProtos: []string{meshwire.ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.opts[0].Auth.Roots, ServerName: f.ips[1].String()}
+	bad := &tls.Config{NextProtos: []string{meshwire.ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.nodes[0].roots, ServerName: f.ips[1].String()}
 	badCtx, stopBad := context.WithTimeout(t.Context(), 2*time.Second)
 	badConn, badErr := siteTr.Dial(badCtx, f.sockets[1].LocalAddr(), bad, &quic.Config{Versions: []quic.Version{quic.Version1}})
 	if badErr == nil {
@@ -178,7 +178,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	stopBad()
 	require.ErrorContains(t, badErr, "certificate")
 	deliver()
-	p, e := a.dialEndpoint(t.Context(), labPeer(f.ips[1]), Endpoint{"tcp", netip.MustParseAddrPort(remote)})
+	p, e := a.dialEndpoint(t.Context(), f.cfg.Members[1].ID, Endpoint{"tcp", netip.MustParseAddrPort(remote)})
 	require.NoError(t, e)
 	require.Equal(t, "tcp", p.kind)
 	require.Eventually(t, func() bool {
@@ -190,7 +190,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	attempt := func() {
 		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 		defer cancel()
-		q, err := a.transports[false].Dial(ctx, f.sockets[1].LocalAddr(), a.tlsConfig(b.id, false), a.transports[false].config)
+		q, err := a.transports[false].Dial(ctx, f.sockets[1].LocalAddr(), a.tlsConfig(b.id, true, a.cred.Load()), a.transports[false].config)
 		if q != nil {
 			q.CloseWithError(0, "test")
 		}
@@ -263,7 +263,7 @@ func TestShareCloseOther(t *testing.T) {
 			_, e = f.nodes[1].OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, p []byte) { c <- bytes.Clone(p) }})
 			require.NoError(t, e)
 			pkt := testIPv4(f.ips[0], f.ips[1], "other closed")
-			require.NoError(t, out.WriteIP(labPeer(f.ips[1]), pkt))
+			require.NoError(t, out.WriteIP(f.cfg.Members[1].ID, pkt))
 			select {
 			case got := <-c:
 				require.Equal(t, pkt, got)

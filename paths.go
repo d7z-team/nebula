@@ -3,6 +3,7 @@ package nebula
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"slices"
 	"time"
 )
@@ -246,48 +247,39 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 		return
 	}
 	paths.lastCanary = time.Now()
-	var candidate Endpoint
+	start := paths.nextEndpoint
 	var eps []Endpoint
 	direct := n.modeLocked(s.peer).allowsDirect()
 	if direct {
 		eps = n.endpointsLocked(s.peer)
-		for i := range eps {
-			index := (paths.nextEndpoint + i) % len(eps)
-			ep := eps[index]
-			if ep.Network == "udp" && n.transports[ep.Address.Addr().Is6()] == nil {
-				continue
-			}
-			matched, outgoing := n.directEndpointLocked(s.peer, ep)
-			if matched == nil && (failures > 0 || outgoing < maxDirectPerFamily) {
-				candidate = ep
-				paths.nextEndpoint = (index + 1) % len(eps)
-				break
-			}
-		}
 	}
 	n.mu.Unlock()
-	if candidate.Valid() {
-		if _, err := n.dialEndpoint(n.ctx, s.peer, candidate); err != nil && candidate.Network == "udp" && n.rendezvous(n.ctx, s.peer) {
-			n.mu.Lock()
-			var retry Endpoint
-			for _, ep := range n.endpointsLocked(s.peer) {
-				if ep.Network != "udp" || n.transports[ep.Address.Addr().Is6()] == nil || !n.endpointAllowedLocked("udp", ep.Address, false) {
-					continue
-				}
-				if !slices.Contains(eps, ep) {
-					retry = ep
-					break
-				}
-				if ep == candidate {
-					retry = ep
-				}
-			}
-			n.mu.Unlock()
-			if retry.Valid() {
-				_, _ = n.dialEndpoint(n.ctx, s.peer, retry)
-			}
+	var hadCandidate bool
+	for i := range eps {
+		index := (start + i) % len(eps)
+		ep := eps[index]
+		if ep.Network == "udp" && n.transports[ep.Address.Addr().Is6()] == nil {
+			continue
 		}
-	} else if direct && s.kind == "relay" && n.preferredSession(s.peer, true) == nil {
+		n.mu.Lock()
+		matched, outgoing := n.directEndpointLocked(s.peer, ep)
+		if matched != nil || failures == 0 && outgoing >= maxDirectPerFamily {
+			n.mu.Unlock()
+			continue
+		}
+		paths.nextEndpoint = (index + 1) % len(eps)
+		n.mu.Unlock()
+		hadCandidate = true
+		_, err := n.dialEndpoint(n.ctx, s.peer, ep)
+		if err == errOutboundEndpointDenied {
+			continue
+		}
+		if ep.Network == "udp" && err != nil && !errors.Is(err, ErrPathPolicy) {
+			n.retryUDPAfterRendezvous(s.peer, ep, eps)
+		}
+		break
+	}
+	if !hadCandidate && direct && s.kind == "relay" && n.preferredSession(s.peer, true) == nil {
 		_, _ = n.dialDirect(n.ctx, s.peer)
 	}
 	if s.kind != "relay" && failures == 0 {
@@ -305,6 +297,33 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 	n.mu.Unlock()
 	if relays < 2 {
 		_ = n.dialRelay(n.ctx, s.peer, 1)
+	}
+}
+
+// Prefer a newly learned NAT mapping. The failed endpoint may also work once
+// both peers have opened their UDP filters.
+func (n *Node) retryUDPAfterRendezvous(peer PeerID, failed Endpoint, previous []Endpoint) {
+	if !n.rendezvous(n.ctx, peer) {
+		return
+	}
+	n.mu.Lock()
+	updated := n.endpointsLocked(peer)
+	n.mu.Unlock()
+	var retry Endpoint
+	for _, ep := range updated {
+		if n.outboundUDP(ep) == nil {
+			continue
+		}
+		if !slices.Contains(previous, ep) {
+			retry = ep
+			break
+		}
+		if ep == failed {
+			retry = ep
+		}
+	}
+	if retry.Valid() {
+		_, _ = n.dialEndpoint(n.ctx, peer, retry)
 	}
 }
 

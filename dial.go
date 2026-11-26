@@ -28,6 +28,9 @@ type endpointDialKey struct {
 	endpoint Endpoint
 }
 
+// Canaries can skip this candidate without spending their network attempt.
+var errOutboundEndpointDenied = fmt.Errorf("%w: outbound endpoint denied", ErrPathPolicy)
+
 // ConnectPeer waits for an authenticated path in either direction to the member
 // owning either overlay address, subject to the current path policy.
 // A canceled context cannot start a new dial. Once started, a dial belongs
@@ -37,23 +40,19 @@ func (n *Node) ConnectPeer(ctx context.Context, address netip.Addr) error {
 	return n.connectPeer(ctx, peer, nil)
 }
 
-// ConnectPeerID waits for a path authenticated as the exact certified address
-// pair. Use it with IPMatch.Peer to keep the selected identity across topology
-// updates. It shares in-flight attempts with ConnectPeer.
+// ConnectPeerID waits for a path to the specified public-key identity.
+// Pass IPMatch.Peer to keep that identity across topology updates.
+// It shares in-flight attempts with ConnectPeer.
 func (n *Node) ConnectPeerID(ctx context.Context, peer PeerID) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := n.Cluster().ValidateMember(peer); err != nil {
-		return errors.Join(ErrPeerUnavailable, err)
-	}
 	return n.connectPeer(ctx, peer, nil)
 }
 
 // ConnectEndpoint connects to a physical TCP or UDP endpoint and returns the
-// authenticated member on the registered direct path. Concurrent calls to the
-// same endpoint share a dial. Canceling ctx ends this caller's wait. The node
-// owns the bounded dial and the resulting session. The caller chooses when to retry.
+// authenticated member on the registered direct path. The peer must be known
+// through topology, TrustedEntrypoints or an authorized introduction.
+// Concurrent callers share the node's bounded dial. Canceling ctx ends the
+// caller's wait. If AllowOutboundEndpoint denies the endpoint, the returned
+// error matches ErrPathPolicy.
 func (n *Node) ConnectEndpoint(ctx context.Context, ep Endpoint) (PeerID, error) {
 	s, err := n.dialEndpoint(ctx, PeerID{}, ep)
 	if err != nil {
@@ -63,6 +62,12 @@ func (n *Node) ConnectEndpoint(ctx context.Context, ep Endpoint) (PeerID, error)
 }
 
 func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if peer == (PeerID{}) || peer == n.id {
+		return ErrPeerUnavailable
+	}
 	var a *peerAttempt
 	var reserved chan struct{}
 	var retried bool
@@ -74,8 +79,6 @@ func (n *Node) connectPeer(ctx context.Context, peer PeerID, slots chan struct{}
 		switch {
 		case ctx.Err() != nil:
 			err = ctx.Err()
-		case peer == (PeerID{}) || peer == n.id:
-			err = ErrPeerUnavailable
 		case n.state != running:
 			err = n.state.runningError()
 		case n.modeLocked(peer) == Blocked:
@@ -291,10 +294,16 @@ func (n *Node) dialCandidates(ctx context.Context, peer PeerID, udp, tcp []Endpo
 	return nil, errors.Join(err, backupErr)
 }
 
+func (n *Node) allowOutbound(e Endpoint) bool {
+	allow := n.o.Transport.AllowOutboundEndpoint
+	return allow == nil || allow(e)
+}
+
 func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*session, error) {
 	key := endpointDialKey{peer, e}
 	byEndpoint := peer == (PeerID{})
 	for {
+		allowed := ctx.Err() == nil && e.Valid() && n.allowOutbound(e)
 		n.mu.Lock()
 		if err := ctx.Err(); err != nil {
 			n.mu.Unlock()
@@ -307,6 +316,10 @@ func (n *Node) dialEndpoint(ctx context.Context, peer PeerID, e Endpoint) (*sess
 		if byEndpoint && !n.policy.Load().physicalEndpoint(e) {
 			n.mu.Unlock()
 			return nil, errors.New("invalid physical endpoint")
+		}
+		if !allowed {
+			n.mu.Unlock()
+			return nil, errOutboundEndpointDenied
 		}
 		if (!byEndpoint && !n.modeLocked(peer).allowsDirect()) || !n.endpointAllowedLocked(e.Network, e.Address, false) {
 			n.mu.Unlock()
@@ -373,11 +386,12 @@ func (n *Node) dialTransport(ctx context.Context, peer PeerID, e Endpoint) (*ses
 		if transport == nil {
 			return nil, fmt.Errorf("%w: no UDP socket for address family of %s", ErrPeerUnavailable, e.Address.Addr())
 		}
-		q, err := transport.Dial(ctx, net.UDPAddrFromAddrPort(e.Address), n.tlsConfig(peer, false), transport.config)
+		snapshot := n.cred.Load()
+		q, err := transport.Dial(ctx, net.UDPAddrFromAddrPort(e.Address), n.tlsConfig(peer, true, snapshot), transport.config)
 		if err != nil {
 			return nil, err
 		}
-		return n.attachQUIC(ctx, q, peer, true)
+		return n.attachQUIC(ctx, q, peer, true, snapshot)
 	}
 	network := "tcp4"
 	if e.Address.Addr().Is6() {

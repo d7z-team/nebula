@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"slices"
+	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
 )
@@ -54,7 +55,11 @@ func isTunnelUnicast(addr netip.Addr) bool {
 func (n *Node) unicastNextHopLocked(via PeerID, dst netip.Addr) (PeerID, error) {
 	s := n.policy.Load()
 	if via != (PeerID{}) {
-		if n.ownerLocked(via.IPv4()) != via {
+		_, configured := s.members[via]
+		if owner := n.ownerLocked(dst); owner == via {
+			return via, nil
+		}
+		if !configured && n.peers[via] == nil && !time.Now().Before(n.discovered[via].authorizedUntil) {
 			return PeerID{}, ErrPeerUnavailable
 		}
 		if !s.allowsAddress(via, dst, nil) {
@@ -73,12 +78,12 @@ func (n *Node) unicastNextHopLocked(via PeerID, dst netip.Addr) (PeerID, error) 
 
 // allowsAddress intersects the member's topology grants with its handshake
 // certificate when supplied. Admission to the session already binds the full ID.
-func (s *topologyView) allowsAddress(peer PeerID, addr netip.Addr, cert *pki.Scope) bool {
+func (s *topologyView) allowsAddress(peer PeerID, addr netip.Addr, cert *pki.Identity) bool {
 	if owner, ok := s.owners[addr]; ok {
-		return owner == peer
+		return owner == peer && (cert == nil || addr == cert.IPv4 || addr == cert.IPv6)
 	}
-	if addr == peer.IPv4() || addr == peer.IPv6() {
-		return s.acceptsIdentity(peer)
+	if cert != nil && (addr == cert.IPv4 || addr == cert.IPv6) {
+		return s.acceptsIdentity(*cert)
 	}
 	member := s.members[peer]
 	if s.cluster.InAnycastPool(addr) {
@@ -91,7 +96,7 @@ func (s *topologyView) allowsAddress(peer PeerID, addr netip.Addr, cert *pki.Sco
 	return slices.ContainsFunc(member.RoutedPrefixes, contains) && (cert == nil || slices.ContainsFunc(cert.RoutedPrefixes, contains))
 }
 
-func (s *topologyView) allowsDestination(from, to PeerID, dst netip.Addr, cert *pki.Scope) bool {
+func (s *topologyView) allowsDestination(from, to PeerID, dst netip.Addr, cert *pki.Identity) bool {
 	if peers, group, err := s.groupRecipients(dst); group {
 		_, subscribed := slices.BinarySearchFunc(peers, to, comparePeer)
 		return err == nil && from != to && subscribed
@@ -100,11 +105,12 @@ func (s *topologyView) allowsDestination(from, to PeerID, dst netip.Addr, cert *
 }
 
 // authorizedBy checks a queued packet against the current topology.
-func (ip innerPacket) authorizedBy(cfg *topologyView, from, to PeerID) bool {
-	return cfg.allowsAddress(from, ip.source, nil) && cfg.allowsDestination(from, to, ip.destination, nil)
+func (ip innerPacket) authorizedBy(n *Node, from, to PeerID) bool {
+	cfg := n.policy.Load()
+	return cfg.allowsAddress(from, ip.source, nil) && (n.ownerLocked(ip.destination) == to || cfg.allowsDestination(from, to, ip.destination, nil))
 }
 
 // authorizedOn also checks the grants carried by the actual session credentials.
 func (ip innerPacket) authorizedOn(cfg *topologyView, from, to pki.Identity) bool {
-	return cfg.allowsAddress(from.ID, ip.source, &from.Scope) && cfg.allowsDestination(from.ID, to.ID, ip.destination, &to.Scope)
+	return cfg.allowsAddress(from.ID, ip.source, &from) && cfg.allowsDestination(from.ID, to.ID, ip.destination, &to)
 }

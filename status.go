@@ -12,16 +12,17 @@ import (
 // PathStatus describes one established path to Peer. Active marks the preferred
 // general-purpose path. QUIC counters are populated for UDP paths.
 type PathStatus struct {
-	AuthorizedUntil time.Time
-	Peer            PeerID
+	NodeSerial, LocalNodeSerial string
+	AuthorizedUntil             time.Time
+	Peer                        PeerID
 	// Instance identifies the authenticated remote run.
 	Instance InstanceID
 	// Transport is "udp" (QUIC), "tcp" (TLS), or "relay" (an end-to-end circuit).
-	Transport, ALPN     string
-	TLSGroup            tls.CurveID
-	TLSVersion          uint16
-	Serial, LocalSerial string
-	Expires             time.Time
+	Transport, ALPN               string
+	TLSGroup                      tls.CurveID
+	TLSVersion                    uint16
+	GrantSerial, LocalGrantSerial string
+	GrantExpires                  time.Time
 	// Endpoint is the physical peer address for a direct path. It is zero for a relay.
 	Endpoint netip.AddrPort
 	// Circuit lists the local endpoint, intermediate relays and peer on a relayed path.
@@ -80,11 +81,11 @@ func (n *Node) PreferredPath(peer PeerID) (PathStatus, bool) {
 
 // The caller holds Node.mu while reading the session's authorization and path.
 func (s *session) pathStatusLocked(active bool) PathStatus {
-	leaf := s.state.PeerCertificates[0]
+	leaf := s.remoteGrant[0]
 	st := PathStatus{
 		Peer: s.peer, Instance: s.instance, Transport: s.kind, Endpoint: s.remoteEndpoint(), RemoteIPLimit: s.remoteIPLimit, Circuit: slices.Clone(s.path),
 		AuthorizedUntil: s.until, ALPN: s.state.NegotiatedProtocol, TLSGroup: s.state.CurveID, TLSVersion: s.state.Version,
-		LocalSerial: s.localChain[0].SerialNumber.String(), Serial: leaf.SerialNumber.String(), Expires: leaf.NotAfter, Active: active,
+		NodeSerial: s.state.PeerCertificates[0].SerialNumber.String(), LocalNodeSerial: s.localNode.SerialNumber.String(), LocalGrantSerial: s.localGrant[0].SerialNumber.String(), GrantSerial: leaf.SerialNumber.String(), GrantExpires: leaf.NotAfter, Active: active,
 		DatagramSize: s.budget.Load(), StreamFallbacks: s.overflow.Load(),
 	}
 	s.healthMu.Lock()
@@ -104,9 +105,10 @@ func (s *session) pathStatusLocked(active bool) PathStatus {
 type ControlStatus struct {
 	Peer PeerID
 	// Instance identifies this Node for its lifetime.
-	Instance           InstanceID
-	Serial             string
-	CertificateExpires time.Time
+	Instance     InstanceID
+	NodeSerial   string
+	GrantSerial  string
+	GrantExpires time.Time
 	// AuthorizedUntil bounds local credentials across all three usages, including
 	// CA and host-imposed limits. Zero means no credential set is authorized.
 	AuthorizedUntil time.Time
@@ -128,8 +130,9 @@ func (n *Node) ControlStatus() ControlStatus {
 	defer n.mu.Unlock()
 	v := ControlStatus{Instance: n.instance, Circuits: len(n.circuits), BytesScheduled: n.bytesScheduled.Load(), DialFailures: n.dialFailures.Load(), LastError: n.lastConnectError, ListenerErrors: maps.Clone(n.listenerErrors)}
 	credentials := n.cred.Load()
-	leaf := credentials.Client.Leaf
-	v.Peer, v.Serial, v.CertificateExpires = n.id, leaf.SerialNumber.String(), leaf.NotAfter
+	leaf := credentials.cmsSigner.Leaf
+	v.NodeSerial = credentials.Node.Leaf.SerialNumber.String()
+	v.Peer, v.GrantSerial, v.GrantExpires = n.id, leaf.SerialNumber.String(), leaf.NotAfter
 	v.AuthorizedUntil = credentials.until
 	v.Started, v.Closed = n.state == running, n.state == closed
 	if p := n.policy.Load(); p != nil {

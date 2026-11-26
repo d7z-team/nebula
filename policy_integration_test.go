@@ -2,13 +2,9 @@ package nebula
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -34,7 +30,7 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	}
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	in := make(chan []byte, 3)
 	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { in <- pkt }})
 	require.NoError(t, err)
@@ -42,7 +38,7 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
 	for _, body := range []string{"shaping", "queued", "queued again"} {
-		require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), body)))
+		require.NoError(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, body)))
 	}
 	require.Eventually(t, func() bool { return port.Stats().Queued == 2 && a.limiter.Tokens() < 0 }, time.Second, time.Millisecond)
 	denied.Store(true)
@@ -57,20 +53,20 @@ func TestClearPendingByPeer(t *testing.T) {
 	f.cfg.Members[0].BytesPerSecond = 1
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	received := make(chan []byte, 3)
 	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- pkt }})
 	require.NoError(t, err)
 	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	held := testIPv4(a.id.IPv4(), b.id.IPv4(), "held")
+	held := testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "held")
 	require.NoError(t, port.WriteIP(b.id, held))
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	require.NoError(t, port.WriteIP(b.id, held))
 	require.Equal(t, 1, port.ClearPending(b.id))
 
-	fresh := testIPv4(a.id.IPv4(), b.id.IPv4(), "fresh")
+	fresh := testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "fresh")
 	require.NoError(t, port.WriteIP(b.id, fresh))
 	f.cfg.Members[0].BytesPerSecond = 0
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
@@ -89,45 +85,34 @@ func TestClearPendingByPeer(t *testing.T) {
 func TestLiveCertificateExpiry(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	o := &f.opts[1]
-	existing, err := x509.ParseCertificate(o.Auth.Certificates.Client.Certificate[0])
+	existing, err := x509.ParseCertificate(o.Auth.Certificates.Grant[0])
 	require.NoError(t, err)
 	existing.ExtraExtensions = existing.Extensions
 	existing.NotAfter = time.Now().Truncate(time.Second).Add(2 * time.Second)
 	der, err := x509.CreateCertificate(rand.Reader, existing, f.ca, existing.PublicKey, f.key)
 	require.NoError(t, err)
-	o.Auth.Certificates.Client = tls.Certificate{Certificate: [][]byte{der}, PrivateKey: o.Auth.Certificates.Client.PrivateKey}
+	o.Auth.Certificates.Grant[0] = der
 	f.start()
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
-	fresh := f.issue(labPeer(f.ips[1]), pki.Scope{})
-	require.NoError(t, f.nodes[1].ReloadCertificates(t.Context(), LocalCertificates{Client: fresh}))
+	fresh := f.issue(f.ips[1], pki.Scope{})
+	require.NoError(t, f.nodes[1].ReloadCertificates(t.Context(), fresh))
 	require.Eventually(t, func() bool { return len(f.nodes[0].Paths()) == 0 && len(f.nodes[1].Paths()) == 0 }, 4*time.Second, 20*time.Millisecond)
 	require.True(t, f.nodes[1].ControlStatus().Ready)
 	require.NoError(t, f.nodes[0].ConnectPeer(t.Context(), f.ips[1]))
-	require.Equal(t, fresh.Leaf.SerialNumber.String(), f.nodes[0].Paths()[0].Serial)
+	require.Equal(t, grantLeaf(t, fresh).SerialNumber.String(), f.nodes[0].Paths()[0].GrantSerial)
 }
 
 func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	a, b := f.ips[0], f.ips[1]
-	issue := func(usage x509.ExtKeyUsage) tls.Certificate {
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		require.NoError(t, err)
-		csr, err := pki.CreateCSR(key, pkix.Name{})
-		require.NoError(t, err)
-		ca := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
-		leaf, err := ca.IssueLeaf(csr, pki.Enrollment{Name: "enterprise", Scope: pki.Scope{Network: "lab"}, IPv4: a, IPv6: labPeer(a).IPv6(), Usages: []x509.ExtKeyUsage{usage}, PublicKeyHash: sha256.Sum256(csr.RawSubjectPublicKeyInfo), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(20 * time.Minute)})
-		require.NoError(t, err)
-		return tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: key}
-	}
-	creds := LocalCertificates{Client: issue(x509.ExtKeyUsageClientAuth), Server: issue(x509.ExtKeyUsageServerAuth), Object: issue(x509.ExtKeyUsageCodeSigning)}
-	f.opts[0].Auth.Certificates = creds
+	creds := f.opts[0].Auth.Certificates
 	var deny atomic.Bool
 	var node atomic.Pointer[Node]
 	f.opts[1].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 		if n := node.Load(); n != nil {
 			_ = n.Paths()
 		} // host callbacks may query live state
-		if deny.Load() && c.Usage == x509.ExtKeyUsageCodeSigning && c.Member == labPeer(a) {
+		if deny.Load() && c.Usage == x509.ExtKeyUsageCodeSigning && c.Member == f.cfg.Members[0].ID {
 			return time.Time{}, errors.New("publisher suspended")
 		}
 		return time.Time{}, nil
@@ -137,8 +122,8 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	node.Store(y)
 	require.NoError(t, y.ConnectPeer(t.Context(), a))
 	require.NoError(t, x.ConnectPeer(t.Context(), b))
-	s := y.preferredSession(labPeer(a), false)
-	require.Equal(t, creds.Server.Certificate[0], s.state.PeerCertificates[0].Raw)
+	s := y.preferredSession(x.ID(), false)
+	require.Equal(t, creds.Node.Certificate[0], s.state.PeerCertificates[0].Raw)
 	sub, err := y.Subscribe("app/test/control")
 	require.NoError(t, err)
 	defer sub.Close()
@@ -152,26 +137,82 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	}
 	deny.Store(true)
 	require.NoError(t, y.Revalidate(t.Context()))
-	require.Same(t, s, y.preferredSession(labPeer(a), false))
+	require.Nil(t, y.preferredSession(x.ID(), false))
 	y.mu.Lock()
 	_, cached := y.publications[id]
 	y.mu.Unlock()
 	require.False(t, cached)
-	// A peer's TLS key cannot stand in for this member's delegated object key.
 	wrong := creds
-	wrong.Object = creds.Client
+	wrong.Grant = f.opts[1].Auth.Certificates.Grant
 	require.Error(t, x.ReloadCertificates(t.Context(), wrong))
 	untrusted := newFixture(t, "tcp", "tcp")
-	f.opts[0].Auth.Roots.AddCert(untrusted.ca)
 	require.Error(t, y.ReloadCertificates(t.Context(), untrusted.opts[1].Auth.Certificates))
-	require.Error(t, x.ReloadCertificates(t.Context(), LocalCertificates{Client: creds.Server, Server: creds.Server, Object: creds.Object}))
+}
+
+func TestRevalidateConcurrentPublication(t *testing.T) {
+	for _, outcome := range []string{"commit", "cancel"} {
+		t.Run(outcome, func(t *testing.T) {
+			f := newFixture(t, "")
+			entered, release := make(chan struct{}), make(chan struct{})
+			limit := time.Now().Add(time.Minute)
+			var pause, shorten atomic.Bool
+			f.opts[0].Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+				if pause.CompareAndSwap(true, false) {
+					close(entered)
+					select {
+					case <-ctx.Done():
+						return time.Time{}, ctx.Err()
+					case <-release:
+					}
+				}
+				if shorten.Load() && c.Purpose == ClusterGrant {
+					return limit, nil
+				}
+				return time.Time{}, nil
+			}
+			f.start()
+			n := f.nodes[0]
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			pause.Store(true)
+			done := make(chan error, 1)
+			go func() { done <- n.Revalidate(ctx) }()
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			// The publication was absent from the review's initial snapshot.
+			id, err := n.Publish(ctx, "app/test", []byte("during review"))
+			require.NoError(t, err)
+			shorten.Store(true)
+			if outcome == "cancel" {
+				cancel()
+				require.ErrorIs(t, <-done, context.Canceled)
+			} else {
+				close(release)
+				require.NoError(t, <-done)
+			}
+			n.mu.Lock()
+			publication, ok := n.publications[id]
+			n.mu.Unlock()
+			require.True(t, ok)
+			if outcome == "commit" {
+				require.Equal(t, limit, publication.expires)
+				require.Equal(t, limit, n.ControlStatus().AuthorizedUntil)
+			} else {
+				require.True(t, publication.expires.After(limit))
+				require.True(t, n.ControlStatus().AuthorizedUntil.After(limit))
+			}
+		})
+	}
 }
 
 func TestConcurrentTopologyAndCredentialUpdates(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
 	f.start()
 	n, remote := f.nodes[0], f.nodes[1]
-	require.NoError(t, n.ConnectPeer(t.Context(), remote.id.IPv4()))
+	require.NoError(t, n.ConnectPeer(t.Context(), remote.Addresses().IPv4))
 	s := n.preferredSession(remote.id, false)
 	seed := f.cfg
 	seed.Members = slices.Clone(f.cfg.Members)
@@ -203,7 +244,7 @@ func TestConcurrentTopologyAndCredentialUpdates(t *testing.T) {
 
 func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	a, b, third := f.ips[0], f.ips[1], f.ips[2]
+	b, third := f.ips[1], f.ips[2]
 	// Each endpoint receives only the two members it currently needs.
 	local := f.cfg
 	local.Members = slices.Clone(f.cfg.Members)
@@ -236,7 +277,7 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 		require.False(t, status.Started)
 		if i == 0 {
 			require.Equal(t, deadline, status.AuthorizedUntil)
-			require.True(t, status.CertificateExpires.After(status.AuthorizedUntil))
+			require.True(t, status.GrantExpires.After(status.AuthorizedUntil))
 		}
 		require.NoError(t, n.Start())
 	}
@@ -246,15 +287,13 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	// Caller-owned maps and slices may be reused after ApplyTopology.
 	m := local.Members[0]
 	m.PublishTopics[0] = "app/changed"
-	require.Equal(t, "app/test", n.policy.Load().members[labPeer(a)].PublishTopics[0])
+	require.Equal(t, "app/test", n.policy.Load().members[n.ID()].PublishTopics[0])
 	// Preflight and installation report the same conflicting address. The
 	// installed view still admits the peer after the failed update.
-	conflict, err := pki.NewPeerID(b, labPeer(third).IPv6())
-	require.NoError(t, err)
-	m.IPv4 = conflict.IPv4()
-	m.IPv6 = conflict.IPv6()
+	conflict := f.cfg.Members[2].ID
+	m.ID, m.IPv4, m.IPv6 = conflict, b, f.cfg.Members[2].IPv6
 	local.Members = append(local.Members, m)
-	want := fmt.Sprintf("duplicate primary address %s: %s and %s", b, labPeer(b), conflict)
+	want := fmt.Sprintf("duplicate primary address %s: %s and %s", b, f.cfg.Members[1].ID, conflict)
 	require.EqualError(t, local.Validate(f.cluster), want)
 	require.EqualError(t, n.ApplyTopology(t.Context(), local), want)
 	require.NoError(t, n.ConnectPeer(t.Context(), b))
@@ -267,7 +306,7 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 		require.Equal(t, shortened, p.AuthorizedUntil)
 	}
 	require.Eventually(t, func() bool {
-		return n.preferredSession(labPeer(b), false) == nil && n.preferredSession(labPeer(third), false) == nil
+		return n.preferredSession(f.cfg.Members[1].ID, false) == nil && n.preferredSession(f.cfg.Members[2].ID, false) == nil
 	}, 2*time.Second, 5*time.Millisecond)
 	require.True(t, n.ControlStatus().Ready)
 }
@@ -300,13 +339,11 @@ func TestPeerNameAndTLSAdmission(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	for name, change := range map[string]func(*tls.Config){
-		"expected peer": func(c *tls.Config) { c.ServerName = f.ips[2].String() },
-		"alpn":          func(c *tls.Config) { c.NextProtos = []string{"other-app"} },
-		"group":         func(c *tls.Config) { c.CurvePreferences = []tls.CurveID{tls.X25519} },
-		"trust":         func(c *tls.Config) { c.RootCAs = x509.NewCertPool() },
+		"alpn":  func(c *tls.Config) { c.NextProtos = []string{"other-app"} },
+		"group": func(c *tls.Config) { c.CurvePreferences = []tls.CurveID{tls.X25519} },
 	} {
 		t.Run(name, func(t *testing.T) {
-			cfg := a.tlsConfig(b.id, false)
+			cfg := a.tlsConfig(b.id, true, a.cred.Load())
 			change(cfg)
 			d := tls.Dialer{Config: cfg}
 			c, err := d.DialContext(t.Context(), "tcp", b.o.Transport.TCP4.Addr().String())
@@ -321,7 +358,7 @@ func TestPeerNameAndTLSAdmission(t *testing.T) {
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	require.Error(t, a.ConnectPeer(t.Context(), f.ips[2]))
 	require.Empty(t, a.Paths())
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 }
 
 func TestAddressPairPolicyAndReassignment(t *testing.T) {
@@ -331,7 +368,7 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	done := make(chan error, 2)
-	for _, addr := range []netip.Addr{b.id.IPv4(), b.id.IPv6()} {
+	for _, addr := range []netip.Addr{b.Addresses().IPv4, b.Addresses().IPv6} {
 		go func() { done <- a.ConnectPeer(t.Context(), addr) }()
 	}
 	require.NoError(t, <-done)
@@ -339,27 +376,27 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	require.Len(t, a.Paths(), 1)
 	require.Equal(t, b.id, a.Paths()[0].Peer)
 	require.NoError(t, a.SetPeerPathPolicy(b.id, Blocked))
-	require.ErrorIs(t, a.ConnectPeer(t.Context(), b.id.IPv4()), ErrPathPolicy)
+	require.ErrorIs(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4), ErrPathPolicy)
 	require.NoError(t, a.SetPeerPathPolicy(b.id, Auto))
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv6()))
-	next, err := pki.NewPeerID(b.id.IPv4(), netip.MustParseAddr("fd42::99"))
-	require.NoError(t, err)
-	wrong := f.issue(next, pki.Scope{})
-	require.Error(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: wrong}))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv6))
+	keyAddr := netip.MustParseAddr("10.13.0.99")
+	next := labPeer(keyAddr)
 	m := f.cfg.Members[1]
-	m.IPv4, m.IPv6 = next.IPv4(), next.IPv6()
+	m.ID, m.IPv6 = next, netip.MustParseAddr("fd42::99")
+	wrong := f.issue(keyAddr, pki.Scope{}, m.addresses())
+	require.Error(t, b.ReloadCertificates(t.Context(), wrong))
 	f.cfg.Members = append(f.cfg.Members, m)
 	require.Error(t, f.cfg.Validate(f.cluster))
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
 	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	require.NoError(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), b.id.IPv4(), "held for previous owner")))
+	require.NoError(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "held for previous owner")))
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	require.Eventually(t, func() bool { return port.Stats().RejectedOutbound == 1 }, time.Second, time.Millisecond)
 	require.Empty(t, a.Paths())
-	owner, ok := a.LookupPeer(b.id.IPv4())
+	owner, ok := a.LookupPeer(b.Addresses().IPv4)
 	require.True(t, ok)
 	require.Equal(t, next, owner)
 	// Both identities share an IPv4 address. Editing the old binding must
@@ -367,26 +404,26 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	require.NoError(t, a.SetPeerPathPolicy(b.id, DirectOnly))
 	configured, effective := a.PeerPathPolicy(b.id)
 	require.Equal(t, DirectOnly, configured)
-	require.Equal(t, Blocked, effective)
+	require.Equal(t, DirectOnly, effective)
 	configured, effective = a.PeerPathPolicy(next)
 	require.Equal(t, Auto, configured)
 	require.Equal(t, Auto, effective)
 	require.NoError(t, a.SetPeerPathPolicy(b.id, Auto))
-	require.ErrorIs(t, a.ConnectPeerID(t.Context(), b.id), ErrPathPolicy)
-	require.ErrorIs(t, port.WriteIP(b.id, testIPv4(a.id.IPv4(), next.IPv4(), "stale binding")), ErrPeerUnavailable)
-	require.Error(t, a.ConnectPeer(t.Context(), next.IPv4()))
-	require.Error(t, port.WriteIP(b.id, testIPv6(a.id.IPv6(), b.id.IPv6(), 1280)))
+	require.Error(t, a.ConnectPeerID(t.Context(), b.id))
+	require.ErrorIs(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, m.IPv4, "stale binding")), ErrPeerUnavailable)
+	require.Error(t, a.ConnectPeer(t.Context(), m.IPv4))
+	require.Error(t, port.WriteIP(b.id, testIPv6(a.Addresses().IPv6, b.Addresses().IPv6, 1280)))
 }
 
 func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	aIP, bIP := f.ips[0], f.ips[1]
-	id := labPeer(bIP)
+	id := f.cfg.Members[1].ID
 	f.cfg.Members[1].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("192.0.0.0/16")}
-	f.opts[1].Auth.Certificates.Client = f.issue(id, pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
+	f.opts[1].Auth.Certificates = f.issue(bIP, pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.ConnectPeer(t.Context(), id.IPv6()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv6))
 	received := make(chan []byte, 2)
 	sink, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- pkt }})
 	require.NoError(t, err)
@@ -394,10 +431,10 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	require.NoError(t, err)
 	denied := testIPv4(aIP, netip.MustParseAddr("192.0.3.1"), "outside certificate")
 	good := testIPv4(aIP, netip.MustParseAddr("192.0.2.1"), "within certificate")
-	wide := f.issue(id, pki.Scope{RoutedPrefixes: f.cfg.Members[1].RoutedPrefixes})
-	require.NoError(t, b.ReloadCertificates(t.Context(), LocalCertificates{Client: wide}))
+	wide := f.issue(bIP, pki.Scope{RoutedPrefixes: f.cfg.Members[1].RoutedPrefixes})
+	require.NoError(t, b.ReloadCertificates(t.Context(), wide))
 	require.NoError(t, out.WriteIP(id, denied))
-	require.NoError(t, out.WriteIP(labPeer(bIP), good))
+	require.NoError(t, out.WriteIP(id, good))
 	select {
 	case pkt := <-received:
 		require.Equal(t, good, pkt)
@@ -415,8 +452,8 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	require.Eventually(t, func() bool { return sink.Stats().RejectedInbound == 1 }, time.Second, time.Millisecond)
 	require.NoError(t, a.SetPeerPathPolicy(id, Blocked))
 	require.NoError(t, a.SetPeerPathPolicy(id, Auto))
-	require.NoError(t, a.ConnectPeer(t.Context(), id.IPv6()))
-	require.NoError(t, out.WriteIP(labPeer(bIP), denied))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv6))
+	require.NoError(t, out.WriteIP(id, denied))
 	select {
 	case pkt := <-received:
 		require.Equal(t, denied, pkt)

@@ -48,7 +48,7 @@ func run() error {
 		port, err := n.OpenIPPort(nebula.IPPortOptions{Deliver: func(_ nebula.PeerID, b []byte) {
 			dst := netip.AddrFrom4([4]byte(b[16:20]))
 			select {
-			case received <- receipt{n.ID().IPv4(), dst}:
+			case received <- receipt{n.Addresses().IPv4, dst}:
 			case <-ctx.Done():
 			}
 		}})

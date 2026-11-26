@@ -59,56 +59,49 @@ func ParseChain(der [][]byte) ([]*x509.Certificate, error) {
 	return chain, nil
 }
 
-// VerifyChain builds ordinary PKIX paths and checks the expected identity, usage and mesh delegation on each path.
-func VerifyChain(chain []*x509.Certificate, roots *x509.CertPool, cluster Cluster, peer PeerID, usage x509.ExtKeyUsage, now time.Time) ([][]*x509.Certificate, error) {
+// VerifyGrant builds ordinary PKIX paths and checks the expected identity, usage and mesh delegation on each path.
+func VerifyGrant(chain []*x509.Certificate, roots *x509.CertPool, cluster Cluster, peer PeerID, now time.Time) ([][]*x509.Certificate, error) {
+	_, paths, err := verifyGrantIdentity(chain, roots, cluster, peer, now)
+	return paths, err
+}
+
+func verifyGrantIdentity(chain []*x509.Certificate, roots *x509.CertPool, cluster Cluster, peer PeerID, now time.Time) (Identity, [][]*x509.Certificate, error) {
 	if roots == nil || len(chain) == 0 || chain[0] == nil {
-		return nil, errors.New("chain and explicit roots required")
+		return Identity{}, nil, errors.New("chain and explicit roots required")
 	}
 	pool := x509.NewCertPool()
 	for _, ca := range chain[1:] {
-		if ca == nil {
-			return nil, errors.New("nil intermediate")
+		if ca == nil || !ca.IsCA {
+			return Identity{}, nil, errors.New("invalid intermediate CA")
 		}
 		pool.AddCert(ca)
 	}
-	paths, err := chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: pool, DNSName: peer.IPv4().String(), KeyUsages: []x509.ExtKeyUsage{usage}, CurrentTime: now})
+	leaf := chain[0]
+	paths, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}, CurrentTime: now})
 	if err != nil {
-		return nil, err
+		return Identity{}, nil, err
 	}
-	identity, accepted, err := VerifiedPeer(paths, cluster, usage)
-	if err != nil {
-		return nil, err
-	}
-	if identity.ID != peer {
-		return nil, errors.New("unexpected mesh address pair")
-	}
-	return accepted, nil
-}
-
-// VerifiedPeer validates the mesh profile of one PKIX-authenticated peer.
-// paths must be the verified candidate chains from the same X.509 or TLS verification.
-func VerifiedPeer(paths [][]*x509.Certificate, cluster Cluster, usage x509.ExtKeyUsage) (Identity, [][]*x509.Certificate, error) {
-	if len(paths) == 0 || len(paths[0]) == 0 {
-		return Identity{}, nil, errors.New("no verified chain")
-	}
-	leaf := paths[0][0]
 	identity, err := ReadIdentity(leaf)
 	if err != nil {
 		return Identity{}, nil, err
 	}
+	if identity.ID != peer {
+		return Identity{}, nil, errors.New("unexpected grant key")
+	}
 	if err := cluster.validateIdentity(identity); err != nil {
 		return Identity{}, nil, err
 	}
-	if !slices.Contains(leaf.ExtKeyUsage, usage) {
+	if !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageCodeSigning) {
 		return Identity{}, nil, errors.New("mesh leaf missing required extended key usage")
 	}
 	var accepted [][]*x509.Certificate
 	for _, path := range paths {
-		if len(path) == 0 || !path[0].Equal(leaf) {
+		// The pinned cluster CA must be the direct child of the ordinary root.
+		if len(path) < 3 || string(path[len(path)-2].Raw) != cluster.certificate || ValidateRoot(path[len(path)-1]) != nil {
 			continue
 		}
 		ca, err := checkDelegation(&identity.Scope, path[1:])
-		if err == nil && ca != nil && string(ca.Raw) == cluster.certificate {
+		if err == nil && ca == path[len(path)-2] {
 			accepted = append(accepted, path)
 		}
 	}
@@ -159,4 +152,54 @@ func MatchesKey(key crypto.PrivateKey, c *x509.Certificate) bool {
 	}
 	pub, ok := signer.Public().(interface{ Equal(crypto.PublicKey) bool })
 	return ok && pub.Equal(c.PublicKey)
+}
+
+const nodeCommonName = "mesh node"
+
+var nodeUsage = append(slices.Clone(meshOID), 1)
+
+// ValidateRoot checks the profile of the ordinary, self-signed identity trust anchor.
+func ValidateRoot(root *x509.Certificate) error {
+	if root == nil || !root.IsCA || root.CheckSignatureFrom(root) != nil || !bytes.Equal(root.RawSubject, root.RawIssuer) || len(root.PermittedIPRanges)+len(root.ExcludedIPRanges) != 0 {
+		return errors.New("ordinary self-signed root required")
+	}
+	if _, present, err := CertificateScope(root); err != nil || present {
+		return errors.New("ordinary root must be free of mesh scope")
+	}
+	return nil
+}
+
+// VerifyNode verifies a node leaf issued directly by the configured root.
+func VerifyNode(leaf, root *x509.Certificate, usage x509.ExtKeyUsage, now time.Time) (PeerID, error) {
+	if err := ValidateRoot(root); err != nil {
+		return PeerID{}, err
+	}
+	if leaf == nil || leaf.IsCA || leaf.KeyUsage != x509.KeyUsageDigitalSignature ||
+		leaf.Subject.CommonName != nodeCommonName || len(leaf.Subject.Names) != 1 ||
+		len(leaf.UnknownExtKeyUsage) != 1 || !leaf.UnknownExtKeyUsage[0].Equal(nodeUsage) ||
+		len(leaf.ExtKeyUsage) != 2 || !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageClientAuth) || !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) ||
+		(usage != x509.ExtKeyUsageClientAuth && usage != x509.ExtKeyUsageServerAuth) {
+		return PeerID{}, errors.New("invalid node certificate profile")
+	}
+	// Keep the wire leaf free of SANs, issuer URLs and deployment-specific extensions.
+	for _, e := range leaf.Extensions {
+		oid := e.Id
+		if len(oid) == 4 && oid[0] == 2 && oid[1] == 5 && oid[2] == 29 {
+			switch oid[3] {
+			case 14, 15, 19, 35, 37:
+				continue
+			}
+		}
+		return PeerID{}, errors.New("unexpected node certificate extension")
+	}
+	// Verify builds the direct path using this root alone and no intermediates.
+	if leaf.Equal(root) {
+		return PeerID{}, errors.New("node certificate is not root-issued")
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(root)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{usage}}); err != nil {
+		return PeerID{}, err
+	}
+	return NewPeerID(leaf.PublicKey)
 }

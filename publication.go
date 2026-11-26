@@ -118,7 +118,7 @@ func (n *Node) Publish(ctx context.Context, topic string, payload []byte) (strin
 	var nonce [16]byte
 	rand.Read(nonce[:])
 	e := Publication{n.id, topic, hex.EncodeToString(nonce[:]), payload, time.Now().Add(publicationLifetime)}
-	record, err := n.signStatement(publicationPurpose, e, n.cred.Load().Object)
+	record, err := n.signStatement(publicationPurpose, e, n.cred.Load().cmsSigner)
 	if err != nil {
 		return "", err
 	}
@@ -144,11 +144,8 @@ func (n *Node) verifyPublication(ctx context.Context, p *topologyView, record st
 	}) {
 		return DeliveredPublication{}, time.Time{}, ErrPathPolicy
 	}
-	if e.Expires.Before(until) {
-		until = e.Expires
-	}
 	sum := sha256.Sum256(body)
-	return DeliveredPublication{hex.EncodeToString(sum[:]), e}, until, nil
+	return DeliveredPublication{hex.EncodeToString(sum[:]), e}, earlierDeadline(e.Expires, until), nil
 }
 
 func (n *Node) acceptPublication(ctx context.Context, from *session, record statement, requestedID string) (string, error) {

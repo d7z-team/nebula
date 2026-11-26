@@ -118,7 +118,7 @@ func (n *Node) outboundSession(peer PeerID, q *ipQueue, submitting bool) (*sessi
 	}
 	packet := &q.current
 	if preferred == nil {
-		if !packet.authorizedBy(cfg, n.id, peer) {
+		if !packet.authorizedBy(n, n.id, peer) {
 			return nil, ErrAddressUnauthorized
 		}
 		return nil, errNoOutboundPath
@@ -154,7 +154,7 @@ func (s *session) checkIPSubmission(ctx context.Context, packet *outboundPacket)
 		if len(s.path) == 0 && !n.modeLocked(s.peer).allowsDirect() || len(s.path) > 0 && !n.circuitAllowedLocked(s.path) {
 			return ErrPathPolicy
 		}
-		if !packet.authorizedBy(n.policy.Load(), n.id, s.peer) {
+		if !packet.authorizedBy(n, n.id, s.peer) {
 			return ErrAddressUnauthorized
 		}
 		return errNoOutboundPath
@@ -215,7 +215,6 @@ func (p *IPPort) revalidateQueues(expiredPeers map[PeerID]bool) {
 	n := p.node
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	cfg := n.policy.Load()
 	for peer, q := range p.queues {
 		p.reconcileQueueLocked(peer)
 		if p.queues[peer] == nil {
@@ -227,7 +226,7 @@ func (p *IPPort) revalidateQueues(expiredPeers map[PeerID]bool) {
 			continue
 		}
 		unauthorized := func(packet *outboundPacket) bool {
-			return !packet.authorizedBy(cfg, n.id, peer)
+			return !packet.authorizedBy(n, n.id, peer)
 		}
 		if current := &q.current; current.stop != nil {
 			switch {

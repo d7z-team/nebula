@@ -13,7 +13,7 @@ body:
     id: reproducer
     attributes:
       label: 复现方法
-      description: 提供相关选项、传输行为和最小 Go 示例。节点、CA 或对象签名私钥请用占位符代替。
+      description: 提供相关选项、传输行为和最小 Go 示例。节点私钥和 CA 私钥请用占位符代替。
     validations:
       required: true
   - type: textarea

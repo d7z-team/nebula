@@ -77,13 +77,12 @@ func TestWireStreams(t *testing.T) {
 		require.EqualValues(t, 2, port.Stats().ReceivedPackets)
 	})
 	t.Run("circuit acknowledgement", func(t *testing.T) {
-		const pathJSON = `{"path":["10.13.0.1@fd42::1","10.13.0.2@fd42::2","10.13.0.3@fd42::3"]}`
-		b, err := json.Marshal(circuitRequest{[]PeerID{client.ID(), relay.ID(), f.nodes[2].ID()}})
+		pathJSON, err := json.Marshal(map[string][]string{"path": {client.ID().String(), relay.ID().String(), f.nodes[2].ID().String()}})
 		require.NoError(t, err)
-		require.JSONEq(t, pathJSON, string(b))
 		c := open(t)
-		_, err = io.WriteString(c, "\x04\x00\x00\x00\x46"+pathJSON)
+		_, err = c.Write([]byte{opCircuit})
 		require.NoError(t, err)
+		require.NoError(t, writeFrame(c, pathJSON))
 		var ack [1]byte
 		_, err = io.ReadFull(c, ack[:])
 		require.NoError(t, err)
@@ -92,12 +91,13 @@ func TestWireStreams(t *testing.T) {
 }
 
 func TestWireJSON(t *testing.T) {
-	id := labPeer(netip.MustParseAddr("10.13.0.1"))
+	addresses := labAddresses(netip.MustParseAddr("10.13.0.1"))
+	id := labPeer(addresses.IPv4)
 	expiry := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC)
 	ep := Endpoint{"udp", netip.MustParseAddrPort("[2001:db8::1]:4242")}
 	token := "0123456789abcdef0123456789abcdef"
-	intro := introduction{Instance: InstanceID{1}, Endpoints: []Endpoint{ep}, RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("172.16.1.0/24")}, Expires: expiry}
-	q := query{ID: token, IP: id.IPv4(), Origin: statement{0xfb, 0xff}, Visited: []PeerID{id}, Budget: 1234 * time.Millisecond}
+	intro := introduction{Addresses: addresses, Instance: InstanceID{1}, Endpoints: []Endpoint{ep}, RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("172.16.1.0/24")}, Expires: expiry}
+	q := query{ID: token, IP: addresses.IPv4, Origin: statement{0xfb, 0xff}, Visited: []PeerID{id}, Budget: 1234 * time.Millisecond}
 	pub := Publication{id, "app/test", token, []byte{0xfb, 0xff}, expiry}
 
 	// Compare JSON values without rounding integers or depending on object key order.
@@ -120,10 +120,10 @@ func TestWireJSON(t *testing.T) {
 			`{"seen":1700000000000000001,"inventory":null,"observed":"[2001:db8::1]:4242","record":"+/8="}`,
 		},
 		{"empty hello", advert{}, `{"observed":"","record":null,"inventory":null}`},
-		{"introduction", intro, `{"instance":"01000000000000000000000000000000","endpoints":[{"network":"udp","address":"[2001:db8::1]:4242"}],"routedPrefixes":["172.16.1.0/24"],"expires":"2026-01-02T03:04:05.123456789Z"}`},
-		{"member introduction", introduction{Instance: InstanceID{1}, Expires: expiry}, `{"instance":"01000000000000000000000000000000","endpoints":null,"expires":"2026-01-02T03:04:05.123456789Z"}`},
-		{"lookup", q, `{"id":"0123456789abcdef0123456789abcdef","ip":"10.13.0.1","origin":"+/8=","visited":["10.13.0.1@fd42::1"],"budget":1234000000}`},
-		{"publication", publishedStatement[Publication]{id, pub}, `{"publisher":"10.13.0.1@fd42::1","value":{"origin":"10.13.0.1@fd42::1","topic":"app/test","nonce":"0123456789abcdef0123456789abcdef","payload":"+/8=","expires":"2026-01-02T03:04:05.123456789Z"}}`},
+		{"introduction", intro, `{"ipv4":"10.13.0.1","ipv6":"fd42::1","instance":"01000000000000000000000000000000","endpoints":[{"network":"udp","address":"[2001:db8::1]:4242"}],"routedPrefixes":["172.16.1.0/24"],"expires":"2026-01-02T03:04:05.123456789Z"}`},
+		{"member introduction", introduction{Addresses: addresses, Instance: InstanceID{1}, Expires: expiry}, `{"ipv4":"10.13.0.1","ipv6":"fd42::1","instance":"01000000000000000000000000000000","endpoints":null,"expires":"2026-01-02T03:04:05.123456789Z"}`},
+		{"lookup", q, `{"id":"0123456789abcdef0123456789abcdef","ip":"10.13.0.1","origin":"+/8=","visited":["` + id.String() + `"],"budget":1234000000}`},
+		{"publication", publishedStatement[Publication]{id, pub}, `{"publisher":"` + id.String() + `","value":{"origin":"` + id.String() + `","topic":"app/test","nonce":"0123456789abcdef0123456789abcdef","payload":"+/8=","expires":"2026-01-02T03:04:05.123456789Z"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := json.Marshal(tc.value)
@@ -136,22 +136,5 @@ func TestWireJSON(t *testing.T) {
 	require.NoError(t, err)
 	var fields map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(got, &fields))
-	require.Equal(t, `"10.13.0.1@fd42::1"`, string(fields["target"]))
-}
-
-func TestWireSessionParameters(t *testing.T) {
-	local, remote := InstanceID{1}, InstanceID{2}
-	wire := append([]byte{0x05, 0x00}, remote[:]...)
-	for _, outgoing := range []bool{false, true} {
-		s := session{n: &Node{o: Options{MaxIPSize: 65535}, instance: local}, outgoing: outgoing}
-		rw := bytes.NewBuffer(bytes.Clone(wire))
-		require.NoError(t, s.exchangeParameters(rw))
-		require.Equal(t, remote, s.instance)
-		require.Equal(t, 1280, s.remoteIPLimit)
-		require.Equal(t, append([]byte{0xff, 0xff}, local[:]...), rw.Bytes())
-	}
-	for _, invalid := range [][]byte{wire[:17], append([]byte{0xff, 0xff}, make([]byte, 16)...), append([]byte{0, 1}, remote[:]...)} {
-		s := session{n: &Node{o: Options{MaxIPSize: 1280}, instance: local}}
-		require.Error(t, s.exchangeParameters(bytes.NewBuffer(invalid)))
-	}
+	require.Equal(t, `"`+id.String()+`"`, string(fields["target"]))
 }

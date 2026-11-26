@@ -110,8 +110,11 @@ func (c Cluster) ValidAnycast(a netip.Addr) bool {
 
 // ValidateMember checks both primary addresses against the CA's allocation rules.
 // The issuer or configuration store is responsible for reserving unique addresses.
-func (c Cluster) ValidateMember(id PeerID) error {
-	for _, a := range []netip.Addr{id.IPv4(), id.IPv6()} {
+func (c Cluster) ValidateMember(pair Addresses) error {
+	if !pair.IPv4.Is4() || !pair.IPv6.Is6() || pair.IPv6.Is4In6() || pair.IPv6.Zone() != "" {
+		return errors.New("one native address per family required")
+	}
+	for _, a := range []netip.Addr{pair.IPv4, pair.IPv6} {
 		p := c.Subnet(a)
 		if !p.IsValid() || !a.IsGlobalUnicast() || a.Is4In6() || reservedSubnetAddress(p, a) || c.InAnycastPool(a) || contains(c.excluded, a) {
 			return fmt.Errorf("invalid primary address %s in cluster %q", a, c.network)
@@ -120,7 +123,7 @@ func (c Cluster) ValidateMember(id PeerID) error {
 	return nil
 }
 
-// ReadClusterCA reads the signed address plan. VerifyChain establishes trust in the CA.
+// ReadClusterCA reads the signed address plan. VerifyGrant establishes trust in the CA.
 func ReadClusterCA(cert *x509.Certificate) (Cluster, error) {
 	if cert == nil {
 		return Cluster{}, errors.New("cluster CA required")
@@ -242,7 +245,7 @@ func (c Cluster) validateIdentity(i Identity) error {
 	if i.Network != c.network || i.Cluster || len(i.AnycastPools) > 0 {
 		return errors.New("unexpected leaf scope")
 	}
-	if err := c.ValidateMember(i.ID); err != nil {
+	if err := c.ValidateMember(i.Addresses); err != nil {
 		return err
 	}
 	for _, a := range i.AnycastIPs {

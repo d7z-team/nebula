@@ -28,7 +28,17 @@ func run() error {
 		return err
 	}
 	for i := range options {
+		options[i].Auth.TrustedEntrypoints = []nebula.PeerID{neighbor.ID}
 		options[i].Topology.Members = []nebula.Member{options[i].Topology.Members[i]}
+		// Publish the configured topology endpoint and accept NAT reports from our neighbor.
+		options[i].Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
+			return c.Source == nebula.EndpointFromTopology ||
+				c.Source == nebula.EndpointFromObservation && c.Observer == neighbor.ID
+		}
+		// All three demo nodes use loopback for physical connections.
+		options[i].Transport.AllowOutboundEndpoint = func(ep nebula.Endpoint) bool {
+			return ep.Address.Addr().IsLoopback()
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -78,8 +88,9 @@ func run() error {
 		return err
 	}
 	fmt.Printf("IPv6 reply from %s\n", target.Peer)
-	for _, row := range nodes[1].InspectIP(target.Peer.IPv4()) {
-		fmt.Printf("%s %s: peer=%s instance=%s certificate=%s\n", row.Source, row.Decision, row.Peer, row.Instance, row.CertificateSHA256)
+	for _, row := range nodes[1].InspectIP(target.Addresses.IPv4) {
+		fmt.Printf("%s %s: peer=%s instance=%s node-sha256=%s grant-sha256=%s\n",
+			row.Source, row.Decision, row.Peer, row.Instance, row.NodeSHA256, row.GrantSHA256)
 	}
 	return nil
 }

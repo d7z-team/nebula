@@ -1,15 +1,20 @@
 package nebula
 
 import (
+	"bytes"
 	"context"
 	"crypto"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
 	"io"
+	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,19 +32,21 @@ func TestIntroductionAfterSignerReload(t *testing.T) {
 	to := &session{peer: receiver.id}
 	_, ok := receiver.learnIntroduction(t.Context(), sender.advert(to).Record, nil)
 	require.True(t, ok)
-	to.acknowledgedIntro.Store(receiver.advert(&session{peer: sender.id}).Seen)
-	require.Empty(t, sender.advert(to).Record)
-
 	set := f.opts[0].Auth.Certificates
-	set.Object = f.issue(sender.id, pki.Scope{})
-	require.NoError(t, sender.ReloadCertificates(t.Context(), set))
-	record := sender.advert(to).Record
-	_, chain, err := pki.VerifyObjectSignature(record, sender.Cluster().Network(), "introduction")
-	require.NoError(t, err)
-	require.True(t, set.Object.Leaf.Equal(chain[0]))
-	peer, ok := receiver.learnIntroduction(t.Context(), record, nil)
-	require.True(t, ok)
-	require.Equal(t, sender.id, peer)
+	renewed := f.issue(sender.Addresses().IPv4, pki.Scope{})
+	for _, next := range []LocalCertificates{{Node: renewed.Node, Grant: set.Grant}, renewed} {
+		to.acknowledgedIntro.Store(receiver.advert(&session{peer: sender.id}).Seen)
+		require.Empty(t, sender.advert(to).Record)
+		require.NoError(t, sender.ReloadCertificates(t.Context(), next))
+		record := sender.advert(to).Record
+		_, chain, err := pki.VerifyObjectSignature(record, sender.Cluster().Network(), "introduction")
+		require.NoError(t, err)
+		require.True(t, grantLeaf(t, next).Equal(chain[0]))
+		require.True(t, slices.ContainsFunc(chain[1:], next.Node.Leaf.Equal))
+		peer, ok := receiver.learnIntroduction(t.Context(), record, nil)
+		require.True(t, ok)
+		require.Equal(t, sender.id, peer)
+	}
 }
 
 // pausingSigner lets a real TLS handshake select its certificate before renewal.
@@ -71,8 +78,8 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			}
 			last := len(f.opts) - 1
 			addr := f.ips[last]
-			id := labPeer(addr)
-			cert := f.opts[last].Auth.Certificates.Client
+			id := f.cfg.Members[last].ID
+			cert := f.opts[last].Auth.Certificates.Node
 			old, err := x509.ParseCertificate(cert.Certificate[0])
 			require.NoError(t, err)
 			var denied atomic.Bool
@@ -93,7 +100,7 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			// the paused signature belongs to the end-to-end TLS handshake.
 			if kind != "relay" {
 				cert.PrivateKey = signer
-				f.opts[last].Auth.Certificates.Server = cert
+				f.opts[last].Auth.Certificates.Node = cert
 			}
 			f.start()
 			a, b := f.nodes[0], f.nodes[last]
@@ -104,7 +111,7 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 				require.NoError(t, a.SetPeerPathPolicy(id, RelayOnly))
 				cert.PrivateKey = signer
 				creds := f.opts[last].Auth.Certificates
-				creds.Server = cert
+				creds.Node = cert
 				require.NoError(t, b.ReloadCertificates(t.Context(), creds))
 			}
 			dial := make(chan error, 1)
@@ -114,33 +121,16 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			case <-time.After(4 * time.Second):
 				t.Fatal("TLS signer was not selected")
 			}
-			interKey, err := pki.GenerateKey("p256")
-			require.NoError(t, err)
-			req, err := pki.CreateCSR(interKey, pkix.Name{CommonName: "renewal CA"})
-			require.NoError(t, err)
-			root := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
-			now := time.Now().Truncate(time.Second)
-			inter, err := root.IssueCA(req, pki.CAProfile{Subject: req.Subject, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour / 2), PermittedIPs: []netip.Prefix{netip.PrefixFrom(id.IPv4(), 32), netip.PrefixFrom(id.IPv6(), 128)}}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
-			require.NoError(t, err)
-			key, err := pki.GenerateKey("ed25519")
-			require.NoError(t, err)
-			req, err = pki.CreateCSR(key, pkix.Name{CommonName: id.String()})
-			require.NoError(t, err)
-			issuer := pki.Issuer{Chain: []*x509.Certificate{inter, f.ca}, Signer: interKey}
-			leaf, err := issuer.IssueLeaf(req, pki.Enrollment{Scope: pki.Scope{Network: "lab"}, IPv4: addr, IPv6: id.IPv6(), Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageCodeSigning}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(15 * time.Minute)})
-			require.NoError(t, err)
-			replacement := LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: key}}
-			require.Error(t, b.ReloadCertificates(t.Context(), replacement))
-			replacement.Client.Certificate = append(replacement.Client.Certificate, inter.Raw)
+			replacement := f.issue(addr, pki.Scope{})
+			replacement.Grant = f.opts[last].Auth.Certificates.Grant
 			wrong := replacement
-			wrong.Client.PrivateKey = f.key
+			wrong.Node.PrivateKey = f.key
 			require.Error(t, b.ReloadCertificates(t.Context(), wrong))
-			require.Equal(t, old.SerialNumber.String(), b.ControlStatus().Serial)
 			require.NoError(t, b.ReloadCertificates(t.Context(), replacement))
 			release()
 			require.NoError(t, <-dial)
 			require.Eventually(t, func() bool { return b.preferredSession(a.id, false) != nil }, time.Second, 5*time.Millisecond)
-			s := a.preferredSession(labPeer(addr), false)
+			s := a.preferredSession(id, false)
 			require.NotNil(t, s)
 			require.Equal(t, kind, s.kind)
 			require.True(t, s.state.PeerCertificates[0].Equal(old))
@@ -150,9 +140,9 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			denied.Store(true)
 			require.NoError(t, b.Revalidate(t.Context()))
 			require.True(t, b.ControlStatus().Ready)
-			require.Eventually(t, func() bool { return a.preferredSession(labPeer(addr), false) == nil }, 2*time.Second, 5*time.Millisecond)
+			require.Eventually(t, func() bool { return a.preferredSession(id, false) == nil }, 2*time.Second, 5*time.Millisecond)
 			require.NoError(t, a.ConnectPeer(t.Context(), addr))
-			require.True(t, a.preferredSession(labPeer(addr), false).state.PeerCertificates[0].Equal(leaf))
+			require.True(t, a.preferredSession(id, false).state.PeerCertificates[0].Equal(replacement.Node.Leaf))
 		})
 	}
 }
@@ -181,12 +171,126 @@ func TestReloadRejectsExpiredHostDecision(t *testing.T) {
 	f.start()
 	n := f.nodes[0]
 	before := n.ControlStatus()
-	cert := f.issue(n.id, pki.Scope{})
+	cert := f.issue(n.Addresses().IPv4, pki.Scope{})
 	renew.Store(true)
-	err := n.ReloadCertificates(t.Context(), LocalCertificates{Client: cert})
+	err := n.ReloadCertificates(t.Context(), cert)
 	require.ErrorIs(t, err, ErrPathPolicy)
-	require.Equal(t, before.Serial, n.ControlStatus().Serial)
+	require.Equal(t, before.GrantSerial, n.ControlStatus().GrantSerial)
 	require.True(t, n.ControlStatus().Ready)
 	require.NoError(t, n.Revalidate(t.Context()))
 	require.False(t, n.ControlStatus().Ready)
+}
+
+// Retain the decrypted writes on the reserved stream so disclosure is checked
+// at the wire boundary, including when the remote side aborts admission.
+func TestGrantDisclosure(t *testing.T) {
+	for _, transport := range []string{"tcp", "udp"} {
+		t.Run(transport, func(t *testing.T) {
+			f := newFixture(t, transport, transport)
+			f.start()
+			a, b := f.nodes[0], f.nodes[1]
+			require.NoError(t, a.ConnectPeerID(t.Context(), b.ID()))
+			require.Eventually(t, func() bool { return b.preferredSession(a.ID(), false) != nil }, time.Second, time.Millisecond)
+			clientState := a.preferredSession(b.ID(), false).state
+			serverState := b.preferredSession(a.ID(), false).state
+			for _, st := range []tls.ConnectionState{clientState, serverState} {
+				require.Len(t, st.PeerCertificates, 1)
+				leaf := st.PeerCertificates[0]
+				require.Empty(t, leaf.IPAddresses)
+				_, scoped, err := pki.CertificateScope(leaf)
+				require.NoError(t, err)
+				require.False(t, scoped)
+			}
+
+			// Give a second cluster the same ordinary root and node key. Only
+			// its grant and pinned issuing CA differ from the original server.
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, err)
+			req, err := pki.CreateCSR(key, pkix.Name{})
+			require.NoError(t, err)
+			scope, _, err := pki.CertificateScope(f.ca)
+			require.NoError(t, err)
+			v4, v6 := f.cluster.MemberPrefixes()
+			otherCA, err := f.root.IssueCA(req, pki.CAProfile{
+				Subject: f.ca.Subject, NotBefore: f.ca.NotBefore, NotAfter: f.ca.NotAfter,
+				Scope: &scope, PermittedIPs: []netip.Prefix{v4, v6},
+			}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
+			require.NoError(t, err)
+			second := *f
+			second.ca, second.key = otherCA, key
+			opts := f.opts[1]
+			opts.Auth.ClusterCA = otherCA
+			addresses := pki.Addresses{IPv4: netip.MustParseAddr("10.13.0.89"), IPv6: netip.MustParseAddr("fd42::89")}
+			opts.Auth.Certificates.Grant = second.issue(b.Addresses().IPv4, pki.Scope{}, addresses).Grant
+			opts.Transport = TransportOptions{}
+			opts.Topology = Topology{Network: "lab", Members: []Member{{ID: b.ID(), IPv4: addresses.IPv4, IPv6: addresses.IPv6}}}
+			other, err := New(t.Context(), opts)
+			require.NoError(t, err)
+			defer other.Close()
+			require.NoError(t, other.Start())
+
+			for _, tc := range []struct {
+				name                   string
+				server                 *Node
+				trust                  bool
+				clientGrant            [][]byte
+				wantClient, wantServer bool
+			}{
+				{"known member", b, true, nil, true, true},
+				{"same key at other cluster", other, true, nil, false, false},
+				{"unknown entry", b, false, nil, false, false},
+				{"another member's grant", b, true, b.cred.Load().Grant, true, false},
+				{"same key with foreign grant", b, true, second.issue(a.Addresses().IPv4, pki.Scope{}).Grant, true, false},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					view := f.cfg
+					if !tc.trust {
+						view.Members = view.Members[:1]
+					}
+					// A detached test node has no previously learned introductions.
+					o := f.opts[0]
+					o.Topology = view
+					o.Transport = TransportOptions{}
+					local, err := New(t.Context(), o)
+					require.NoError(t, err)
+					defer local.Close()
+					require.NoError(t, local.Start())
+					left, right := net.Pipe()
+					defer left.Close()
+					defer right.Close()
+					deadline := time.Now().Add(2 * time.Second)
+					left.SetDeadline(deadline)
+					right.SetDeadline(deadline)
+					var sent, replied bytes.Buffer
+					type stream struct {
+						io.Reader
+						io.Writer
+					}
+					out := &session{n: local, state: clientState, outgoing: true}
+					in := &session{n: tc.server, state: serverState}
+					done := make(chan error, 1)
+					go func() {
+						defer right.Close()
+						done <- in.exchangeGrants(t.Context(), stream{right, io.MultiWriter(&replied, right)}, tc.server.cred.Load())
+					}()
+					creds := *local.cred.Load()
+					if tc.clientGrant != nil {
+						creds.Grant = tc.clientGrant
+					}
+					clientErr := out.exchangeGrants(t.Context(), stream{left, io.MultiWriter(&sent, left)}, &creds)
+					left.Close()
+					serverErr := <-done
+					require.Equal(t, tc.wantClient, bytes.Contains(sent.Bytes(), creds.Grant[0]))
+					require.Equal(t, tc.wantServer, bytes.Contains(replied.Bytes(), tc.server.cred.Load().Grant[0]))
+					if tc.wantServer {
+						require.NoError(t, clientErr)
+						require.NoError(t, serverErr)
+					} else {
+						require.Error(t, clientErr)
+						require.Error(t, serverErr)
+					}
+				})
+			}
+		})
+	}
 }

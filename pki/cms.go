@@ -15,6 +15,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"math/big"
+	"time"
 
 	_ "crypto/sha512"
 )
@@ -160,8 +161,17 @@ func (a cmsAlgorithm) attributes(payload []byte) ([]byte, asn1.RawValue) {
 }
 
 type signedContent struct {
-	Network, Kind     string `asn1:"utf8"`
-	Fingerprint, Body []byte
+	Network, Kind                       string `asn1:"utf8"`
+	Fingerprint, CertificatesHash, Body []byte
+}
+
+// The DER SET OF encoding puts the certificate bag in canonical order.
+func certificateSetHash(certs []asn1.RawValue) ([sha256.Size]byte, error) {
+	set, err := asn1.MarshalWithParams(certs, "set")
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return sha256.Sum256(set), nil
 }
 
 // SignObject creates an encapsulated CMS signature bound to its publisher, network and purpose.
@@ -195,7 +205,15 @@ func encodeObject(network, kind string, body []byte, cert tls.Certificate, sign 
 		return nil, err
 	}
 	hash := sha256.Sum256(leaf.Raw)
-	payload, err := asn1.Marshal(signedContent{network, kind, hash[:], body})
+	var certs []asn1.RawValue
+	for _, der := range cert.Certificate {
+		certs = append(certs, raw(der))
+	}
+	evidence, err := certificateSetHash(certs)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := asn1.Marshal(signedContent{network, kind, hash[:], evidence[:], body})
 	if err != nil {
 		return nil, err
 	}
@@ -226,15 +244,12 @@ func encodeObject(network, kind string, body []byte, cert tls.Certificate, sign 
 		sigAlg.Parameters = asn1.NullRawValue
 	}
 	si := signerInfo{1, issuerSerial{raw(leaf.RawIssuer), leaf.SerialNumber}, a.digestID(), tag, sigAlg, sig}
-	sd := signedData{Version: 1, Digests: []algorithm{a.digestID()}, Content: contentInfo{oidData, explicit(octets)}, Signers: []signerInfo{si}}
-	for _, der := range cert.Certificate {
-		sd.Certificates = append(sd.Certificates, raw(der))
-	}
+	sd := signedData{Version: 1, Digests: []algorithm{a.digestID()}, Content: contentInfo{oidData, explicit(octets)}, Certificates: certs, Signers: []signerInfo{si}}
 	return wrapCMS(sd)
 }
 
-// VerifyObjectSignature checks the signature and domain. Call VerifyChain with the
-// returned leaf and intermediates to establish publisher trust.
+// VerifyObjectSignature checks the CMS signature, domain and certificate set.
+// VerifyObjectSigner establishes node identity and cluster membership for mesh objects.
 func VerifyObjectSignature(der []byte, network, kind string) ([]byte, []*x509.Certificate, error) {
 	s, err := parseCMS(der)
 	if err != nil {
@@ -247,6 +262,13 @@ func VerifyObjectSignature(der []byte, network, kind string) ([]byte, []*x509.Ce
 	}
 	if s.Content.Value.Class != 2 || s.Content.Value.Tag != 0 || !s.Content.Value.IsCompound || readDER(s.Content.Value.Bytes, &payload) != nil || readDER(payload, &v) != nil || v.Network != network || v.Kind != kind {
 		return nil, nil, errors.New("invalid CMS content or domain")
+	}
+	evidence, err := certificateSetHash(s.Certificates)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !bytes.Equal(evidence[:], v.CertificatesHash) {
+		return nil, nil, errors.New("CMS certificate evidence mismatch")
 	}
 	si := s.Signers[0]
 	var leaf *x509.Certificate
@@ -291,4 +313,38 @@ func VerifyObjectSignature(der []byte, network, kind string) ([]byte, []*x509.Ce
 		return nil, nil, err
 	}
 	return v.Body, append([]*x509.Certificate{leaf}, extra...), nil
+}
+
+// VerifyObjectSigner verifies the node identity and grant attached to a signed mesh object.
+// Pass certificates returned by VerifyObjectSignature. Apply host policy to both paths
+// and check the returned identity against the publisher authorized for the operation.
+func VerifyObjectSigner(certs []*x509.Certificate, root *x509.Certificate, cluster Cluster, now time.Time) (Identity, []*x509.Certificate, [][]*x509.Certificate, error) {
+	if len(certs) < 2 {
+		return Identity{}, nil, nil, errors.New("missing signed membership evidence")
+	}
+	var node *x509.Certificate
+	grant := []*x509.Certificate{certs[0]}
+	for _, c := range certs[1:] {
+		switch {
+		case c == nil:
+			return Identity{}, nil, nil, errors.New("nil signer evidence")
+		case c.IsCA:
+			grant = append(grant, c)
+		case node == nil:
+			node = c
+		default:
+			return Identity{}, nil, nil, errors.New("ambiguous node identity")
+		}
+	}
+	peer, err := VerifyNode(node, root, x509.ExtKeyUsageClientAuth, now)
+	if err != nil {
+		return Identity{}, nil, nil, err
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	id, paths, err := verifyGrantIdentity(grant, roots, cluster, peer, now)
+	if err != nil {
+		return Identity{}, nil, nil, err
+	}
+	return id, []*x509.Certificate{node, root}, paths, nil
 }

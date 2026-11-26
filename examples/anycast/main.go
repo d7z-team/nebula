@@ -81,7 +81,7 @@ func run() error {
 			return fmt.Errorf("create NIC: %s", e)
 		}
 		defer s.RemoveNIC(1)
-		addr := n.ID().IPv4()
+		addr := n.Addresses().IPv4
 		primary := tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(addr.AsSlice()), PrefixLen: n.Cluster().Subnet(addr).Bits()}
 		if e := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: primary}, stack.AddressProperties{}); e != nil {
 			return fmt.Errorf("assign primary: %s", e)

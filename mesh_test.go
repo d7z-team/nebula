@@ -28,6 +28,7 @@ import (
 
 type fixture struct {
 	t       testing.TB
+	root    pki.Issuer
 	ca      *x509.Certificate
 	key     ed25519.PrivateKey
 	cluster pki.Cluster
@@ -63,12 +64,29 @@ func (s *meteredSocket) count(a netip.AddrPort) int {
 	return s.sent[a]
 }
 
+func labAddresses(ipv4 netip.Addr) pki.Addresses {
+	return pki.Addresses{IPv4: ipv4, IPv6: netip.MustParseAddr(fmt.Sprintf("fd42::%x", ipv4.As4()[3]))}
+}
+
+// Fixed lab keys keep independent fixtures and wire-format tests reproducible.
+func labKey(ip netip.Addr) ed25519.PrivateKey {
+	seed := sha256.Sum256([]byte("fixture:" + ip.String()))
+	return ed25519.NewKeyFromSeed(seed[:])
+}
+
 func labPeer(ip netip.Addr) PeerID {
-	id, err := pki.NewPeerID(ip, netip.MustParseAddr(fmt.Sprintf("fd42::%x", ip.As4()[3])))
+	id, err := pki.NewPeerID(labKey(ip).Public())
 	if err != nil {
 		panic(err)
 	}
 	return id
+}
+
+func grantLeaf(t testing.TB, set LocalCertificates) *x509.Certificate {
+	t.Helper()
+	c, err := x509.ParseCertificate(set.Grant[0])
+	require.NoError(t, err)
+	return c
 }
 
 func newFixture(t testing.TB, transports ...string) *fixture {
@@ -76,8 +94,15 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 	_, key, e := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, e)
 	now := time.Now()
-	ca, e := pki.CreateRoot(key, pki.CAProfile{
-		Subject: pkix.Name{CommonName: "lab-root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+	_, rootKey, e := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, e)
+	anchor, e := pki.CreateRoot(rootKey, pki.CAProfile{Subject: pkix.Name{CommonName: "test root"}, NotBefore: now.Add(-2 * time.Hour), NotAfter: now.Add(2 * time.Hour), MaxPathLen: -1})
+	require.NoError(t, e)
+	root := pki.Issuer{Chain: []*x509.Certificate{anchor}, Signer: rootKey}
+	req, e := pki.CreateCSR(key, pkix.Name{})
+	require.NoError(t, e)
+	ca, e := root.IssueCA(req, pki.CAProfile{
+		Subject: pkix.Name{CommonName: "lab cluster"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
 		Scope: &pki.Scope{
 			Network: "lab", Cluster: true,
 			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
@@ -85,24 +110,21 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 		},
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd42::/64")},
 		MaxPathLen:   -1,
-	})
+	}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 	require.NoError(t, e)
-	f := &fixture{t: t, ca: ca, key: key, cfg: Topology{Network: "lab"}}
+	f := &fixture{t: t, root: root, ca: ca, key: key, cfg: Topology{Network: "lab"}}
 	f.cluster, e = pki.ReadClusterCA(ca)
 	require.NoError(t, e)
-	roots := x509.NewCertPool()
-	roots.AddCert(ca)
 	for i, kind := range transports {
 		a := netip.MustParseAddr(fmt.Sprintf("10.13.0.%d", i+1))
-
 		id := labPeer(a)
-		cert := f.issue(id, pki.Scope{})
+		cert := f.issue(a, pki.Scope{})
 		o := Options{
-			Auth:                AuthOptions{Roots: roots, ClusterCA: ca, Certificates: LocalCertificates{Client: cert}},
+			Auth:                AuthOptions{RootCA: anchor, ClusterCA: ca, Certificates: cert},
 			MaintenanceInterval: 120 * time.Millisecond,
 			DialTimeout:         700 * time.Millisecond,
 		}
-		m := Member{IPv4: a, IPv6: id.IPv6(), PublishTopics: []string{"app/test"}}
+		m := Member{ID: id, IPv4: a, IPv6: labAddresses(a).IPv6, PublishTopics: []string{"app/test"}}
 		const loopback = "127.0.0.1:0"
 		var sock *meteredSocket
 		if kind == "udp" || kind == "both" {
@@ -144,17 +166,23 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 	return f
 }
 
-func (f *fixture) issue(id PeerID, scope pki.Scope) tls.Certificate {
+func (f *fixture) issue(keyAddr netip.Addr, scope pki.Scope, override ...pki.Addresses) LocalCertificates {
 	f.t.Helper()
-	_, priv, e := ed25519.GenerateKey(rand.Reader)
-	require.NoError(f.t, e)
+	priv := labKey(keyAddr)
+	addresses := labAddresses(keyAddr)
+	if len(override) > 0 {
+		addresses = override[0]
+	}
 	csr, e := pki.CreateCSR(priv, pkix.Name{})
 	require.NoError(f.t, e)
 	issuer := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
 	scope.Network = "lab"
-	leaf, e := issuer.IssueLeaf(csr, pki.Enrollment{Scope: scope, IPv4: id.IPv4(), IPv6: id.IPv6(), Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageCodeSigning}, PublicKeyHash: sha256.Sum256(csr.RawSubjectPublicKeyInfo), NotBefore: time.Now().Add(-time.Minute).Truncate(time.Second), NotAfter: time.Now().Add(40 * time.Minute)})
+	approved := sha256.Sum256(csr.RawSubjectPublicKeyInfo)
+	leaf, e := issuer.IssueGrant(csr, pki.Enrollment{Scope: scope, IPv4: addresses.IPv4, IPv6: addresses.IPv6, PublicKeyHash: approved, NotBefore: time.Now().Add(-time.Minute).Truncate(time.Second), NotAfter: time.Now().Add(40 * time.Minute)})
 	require.NoError(f.t, e)
-	return tls.Certificate{Certificate: [][]byte{leaf.Raw}, PrivateKey: priv, Leaf: leaf}
+	node, e := f.root.IssueNode(csr, approved, leaf.NotBefore, leaf.NotAfter)
+	require.NoError(f.t, e)
+	return LocalCertificates{Node: tls.Certificate{Certificate: [][]byte{node.Raw}, PrivateKey: priv, Leaf: node}, Grant: [][]byte{leaf.Raw, f.ca.Raw}}
 }
 
 func (f *fixture) start() {
@@ -178,6 +206,9 @@ func (f *fixture) start() {
 func (f *fixture) startDiscovery(neighbors ...int) {
 	f.t.Helper()
 	for i := range f.opts {
+		if i < len(neighbors) && neighbors[i] >= 0 {
+			f.opts[i].Auth.TrustedEntrypoints = append(f.opts[i].Auth.TrustedEntrypoints, f.cfg.Members[neighbors[i]].ID)
+		}
 		f.opts[i].Topology = Topology{Network: f.cfg.Network, Members: []Member{f.cfg.Members[i]}}
 	}
 	f.start()
@@ -197,10 +228,9 @@ func (f *fixture) startDiscovery(neighbors ...int) {
 }
 
 func (f *fixture) link(i, j int) {
-	a, b := f.ips[i], f.ips[j]
 	x, y := &f.cfg.Members[i], &f.cfg.Members[j]
-	x.Links = append(x.Links, labPeer(b))
-	y.Links = append(y.Links, labPeer(a))
+	x.Links = append(x.Links, y.ID)
+	y.Links = append(y.Links, x.ID)
 }
 
 func testIPv4(src, dst netip.Addr, payload string) []byte {
@@ -227,7 +257,7 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	a, b := f.ips[0], f.ips[1]
 	f.link(0, 1)
 	f.cfg.Members[1].RoutedPrefixes = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
-	f.opts[1].Auth.Certificates.Client = f.issue(labPeer(b), pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
+	f.opts[1].Auth.Certificates = f.issue(b, pki.Scope{RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}})
 	f.start()
 	x, y := f.nodes[0], f.nodes[1]
 	require.NoError(t, x.ConnectPeer(t.Context(), b))
@@ -236,13 +266,13 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	// The gateway's default route covers external destinations. An unassigned
 	// overlay address still requires its own member.
 	unassigned := netip.MustParseAddr("10.13.0.99")
-	require.ErrorIs(t, out.WriteIP(labPeer(b), testIPv4(a, unassigned, "gw")), ErrAddressUnauthorized)
+	require.ErrorIs(t, out.WriteIP(y.ID(), testIPv4(a, unassigned, "gw")), ErrAddressUnauthorized)
 	in := make(chan []byte, 8)
 	_, e = y.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, b []byte) { in <- b }})
 	require.NoError(t, e)
-	packets := [][]byte{testIPv4(a, b, "hello"), testIPv6(labPeer(a).IPv6(), labPeer(b).IPv6(), 1280), testIPv4(a, netip.MustParseAddr("192.0.2.10"), "gw")}
+	packets := [][]byte{testIPv4(a, b, "hello"), testIPv6(x.Addresses().IPv6, y.Addresses().IPv6, 1280), testIPv4(a, netip.MustParseAddr("192.0.2.10"), "gw")}
 	for _, pkt := range packets {
-		require.NoError(t, out.WriteIP(labPeer(b), pkt))
+		require.NoError(t, out.WriteIP(y.ID(), pkt))
 		select {
 		case got := <-in:
 			require.Equal(t, pkt, got)
@@ -250,10 +280,10 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 			t.Fatalf("IP delivery stalled: %+v %+v", out.Stats(), x.Paths())
 		}
 	}
-	require.Greater(t, x.RecommendedMTU(labPeer(b), false, 1500), 1000)
-	require.Less(t, x.RecommendedMTU(labPeer(b), false, 1500), 1280)
-	require.Equal(t, 1280, x.RecommendedMTU(labPeer(b), true, 1500))
-	require.ErrorIs(t, out.WriteIP(labPeer(b), testIPv4(b, a, "spoof")), ErrAddressUnauthorized)
+	require.Greater(t, x.RecommendedMTU(y.ID(), false, 1500), 1000)
+	require.Less(t, x.RecommendedMTU(y.ID(), false, 1500), 1280)
+	require.Equal(t, 1280, x.RecommendedMTU(y.ID(), true, 1500))
+	require.ErrorIs(t, out.WriteIP(y.ID(), testIPv4(b, a, "spoof")), ErrAddressUnauthorized)
 	paths := x.Paths()
 	require.NotEmpty(t, paths)
 	require.Equal(t, tls.X25519MLKEM768, paths[0].TLSGroup)
@@ -262,8 +292,8 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
 	f.cfg.Members[0].Links = nil
 	require.NoError(t, x.ApplyTopology(t.Context(), f.cfg))
-	require.ErrorIs(t, out.WriteIP(labPeer(b), packets[2]), ErrAddressUnauthorized)
-	require.NoError(t, x.SetPeerPathPolicy(labPeer(b), Blocked))
+	require.ErrorIs(t, out.WriteIP(y.ID(), packets[2]), ErrAddressUnauthorized)
+	require.NoError(t, x.SetPeerPathPolicy(y.ID(), Blocked))
 	require.Empty(t, x.Paths())
 	require.NoError(t, y.ApplyTopology(t.Context(), f.cfg))
 	require.False(t, y.ControlStatus().Ready)
@@ -313,7 +343,7 @@ func TestTCPFallbackOnInitialDial(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	go func() { secondWaiter <- a.ConnectPeer(ctx, labPeer(b).IPv6()) }()
+	go func() { secondWaiter <- a.ConnectPeer(ctx, f.cfg.Members[1].IPv6) }()
 	abandon()
 	require.ErrorIs(t, <-first, context.Canceled)
 	close(release)
@@ -330,7 +360,7 @@ func TestConnectPeerAcceptsInboundDuringDial(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	vip := netip.MustParseAddr("10.13.0.200")
 	f.cfg.Members[1].AnycastIPs = []netip.Addr{vip}
-	f.opts[1].Auth.Certificates.Client = f.issue(labPeer(f.ips[1]), pki.Scope{AnycastIPs: []netip.Addr{vip}})
+	f.opts[1].Auth.Certificates = f.issue(f.ips[1], pki.Scope{AnycastIPs: []netip.Addr{vip}})
 	started, release := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int32
 	f.opts[0].DialTimeout = 10 * time.Second
@@ -361,7 +391,7 @@ func TestConnectPeerAcceptsInboundDuringDial(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	done := make(chan error, 1)
-	go func() { done <- a.ConnectPeer(ctx, b.id.IPv4()) }()
+	go func() { done <- a.ConnectPeer(ctx, b.Addresses().IPv4) }()
 	port.ClearPending(b.id)
 	select {
 	case r := <-sent:
@@ -372,8 +402,8 @@ func TestConnectPeerAcceptsInboundDuringDial(t *testing.T) {
 	require.NoError(t, port.WriteIP(b.id, packet))
 	waiter, stop := context.WithCancel(ctx)
 	stop()
-	require.ErrorIs(t, a.ConnectPeer(waiter, b.id.IPv6()), context.Canceled)
-	require.NoError(t, b.ConnectPeer(ctx, a.id.IPv4()))
+	require.ErrorIs(t, a.ConnectPeer(waiter, b.Addresses().IPv6), context.Canceled)
+	require.NoError(t, b.ConnectPeer(ctx, a.Addresses().IPv4))
 	require.NoError(t, <-done)
 	select {
 	case r := <-sent:
@@ -408,22 +438,22 @@ func TestMixedRelayOnlyAndTopologyWithdrawal(t *testing.T) {
 	local.Members[1].PublishTopics = []string{"app/relay"}
 	require.NoError(t, f.nodes[1].ApplyTopology(ctx, local))
 	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
-	err := a.ConnectPeer(ctx, b.id.IPv4())
+	err := a.ConnectPeer(ctx, b.Addresses().IPv4)
 	if err != nil {
 		for _, n := range f.nodes {
-			t.Log(n.id.IPv4(), n.Paths(), n.ControlStatus())
+			t.Log(n.Addresses().IPv4, n.Paths(), n.ControlStatus())
 		}
 	}
 	require.NoError(t, err)
 	require.True(t, slices.ContainsFunc(a.Paths(), func(p PathStatus) bool {
-		return p.Peer == b.id && p.Transport == "relay" && slices.Equal(p.Circuit, []PeerID{a.id, labPeer(f.ips[1]), labPeer(f.ips[2]), b.id})
+		return p.Peer == b.id && p.Transport == "relay" && slices.Equal(p.Circuit, []PeerID{a.id, f.cfg.Members[1].ID, f.cfg.Members[2].ID, b.id})
 	}))
 	received := make(chan []byte, 1)
 	_, e := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, v []byte) { received <- v }})
 	require.NoError(t, e)
 	port, e := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, e)
-	pkt := testIPv4(a.id.IPv4(), b.id.IPv4(), string(bytes.Repeat([]byte("x"), 4096)))
+	pkt := testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, string(bytes.Repeat([]byte("x"), 4096)))
 	require.NoError(t, port.WriteIP(b.id, pkt))
 	select {
 	case got := <-received:
@@ -444,10 +474,10 @@ func TestRelayOnlyEnforcesUnderlayPolicy(t *testing.T) {
 		return nil, errors.New("unexpected dial")
 	}
 	f.start()
-	a, b := f.nodes[0], f.ips[1]
-	require.NoError(t, a.SetPeerPathPolicy(labPeer(b), RelayOnly))
-	require.Error(t, a.ConnectPeer(t.Context(), b))
-	a.punch(labPeer(b))
+	a, b := f.nodes[0], f.nodes[1]
+	require.NoError(t, a.SetPeerPathPolicy(b.ID(), RelayOnly))
+	require.Error(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
+	a.punch(b.ID())
 	require.Zero(t, tcpDials.Load())
 	require.Zero(t, f.sockets[0].count(f.cfg.Members[1].Endpoints[0].Address))
 }
@@ -456,7 +486,7 @@ func TestHealthSwitchesTransportAndRecovers(t *testing.T) {
 	f := newFixture(t, "both", "both")
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	active := func() string {
 		for _, p := range a.Paths() {
 			if p.Peer == b.id && p.Active {
@@ -485,13 +515,13 @@ func TestParallelCircuitFailover(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[3]
 	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	s := a.preferredSession(b.id, false)
 	require.NotNil(t, s)
 	path := slices.Clone(s.path)
 	require.ErrorIs(t, a.startCircuit(t.Context(), path), ErrPathPolicy)
 	require.NoError(t, a.SetPeerPathPolicy(path[1], Blocked))
-	require.NoError(t, a.ConnectPeer(t.Context(), b.id.IPv4()))
+	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	next := a.preferredSession(b.id, false)
 	require.NotNil(t, next)
 	require.NotEqual(t, path[1], next.path[1])
@@ -516,13 +546,13 @@ func BenchmarkMeshIP(b *testing.B) {
 			}
 			f.start()
 			client, server := f.nodes[0], f.nodes[1]
-			require.NoError(b, client.ConnectPeer(b.Context(), server.id.IPv4()))
+			require.NoError(b, client.ConnectPeer(b.Context(), server.Addresses().IPv4))
 			recv := make(chan struct{}, 1)
 			port, err := client.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 			require.NoError(b, err)
 			_, err = server.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) { recv <- struct{}{} }})
 			require.NoError(b, err)
-			pkt := testIPv4(client.id.IPv4(), server.id.IPv4(), string(make([]byte, 1004)))
+			pkt := testIPv4(client.Addresses().IPv4, server.Addresses().IPv4, string(make([]byte, 1004)))
 			durations := make([]time.Duration, 0)
 			b.SetBytes(int64(len(pkt)))
 			for b.Loop() {
@@ -599,37 +629,38 @@ func TestNodeLifecycle(t *testing.T) {
 	n, err := New(t.Context(), o)
 	require.NoError(t, err)
 	t.Cleanup(func() { n.Close() })
-	peer := f.ips[1]
+	peer := f.cfg.Members[1]
 	port, err := n.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
 	sub, err := n.Subscribe("app/test")
 	require.NoError(t, err)
-	require.NoError(t, n.SetPeerPathPolicy(labPeer(peer), DirectOnly))
-	offline := labPeer(netip.MustParseAddr("10.13.0.42"))
-	_, known := n.LookupPeer(offline.IPv4())
+	require.NoError(t, n.SetPeerPathPolicy(peer.ID, DirectOnly))
+	offlineIP := netip.MustParseAddr("10.13.0.42")
+	offline := labPeer(offlineIP)
+	_, known := n.LookupPeer(offlineIP)
 	require.False(t, known)
 	require.NoError(t, n.SetPeerPathPolicy(offline, RelayOnly))
 	configured, effective := n.PeerPathPolicy(offline)
 	require.Equal(t, RelayOnly, configured)
 	require.Equal(t, RelayOnly, effective)
-	ip := testIPv4(f.ips[0], peer, "data")
+	ip := testIPv4(f.ips[0], peer.IPv4, "data")
 	checkOperations := func(want error) {
 		t.Helper()
-		require.ErrorIs(t, n.ConnectPeer(t.Context(), peer), want)
-		require.ErrorIs(t, n.ConnectPeerID(t.Context(), labPeer(peer)), want)
-		_, err := n.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+		require.ErrorIs(t, n.ConnectPeer(t.Context(), peer.IPv4), want)
+		require.ErrorIs(t, n.ConnectPeerID(t.Context(), peer.ID), want)
+		_, err := n.ConnectEndpoint(t.Context(), peer.Endpoints[0])
 		require.ErrorIs(t, err, want)
-		_, err = n.ResolveIP(t.Context(), peer)
+		_, err = n.ResolveIP(t.Context(), peer.IPv4)
 		require.ErrorIs(t, err, want)
 		_, err = n.Publish(t.Context(), "app/test", nil)
 		require.ErrorIs(t, err, want)
-		require.ErrorIs(t, port.WriteIP(labPeer(peer), ip), want)
+		require.ErrorIs(t, port.WriteIP(peer.ID, ip), want)
 	}
 	checkOperations(ErrNodeNotStarted)
 	require.NoError(t, n.Start())
 	require.ErrorIs(t, n.Start(), ErrNodeAlreadyStarted)
 	port.Close()
-	require.ErrorIs(t, port.WriteIP(labPeer(peer), ip), ErrPortClosed)
+	require.ErrorIs(t, port.WriteIP(peer.ID, ip), ErrPortClosed)
 	require.NoError(t, n.Close())
 	require.ErrorIs(t, n.Start(), ErrNodeClosed)
 	checkOperations(ErrNodeClosed)

@@ -69,7 +69,7 @@ socket.ConfigureMeshQUIC(transport, config)
 | 单字节 UDP 数据报 `00` | 保留给 mesh 单向 NAT 打洞。入站时消费，发送仍从同一物理套接字出站。 |
 | 其他 UDP 流量 | 交给 `Other()`，包括普通数据报、HTTP/3 的 QUIC v2 和宿主自己连接的后续数据报。零长度数据报也保留边界和源地址。 |
 
-分流只决定由谁读取，节点仍执行原有的双向 TLS、成员和逐包路径校验。即使网站与 mesh 客户端使用完全相同的 UDP 源和目标端口，切换 `RelayOnly`、`Blocked` 或拓扑邻接限制也只约束 mesh 流量。宿主可以给网站配置独立的 TLS、QUIC 版本和客户端认证。[同源策略与三站点测试](../portshare_test.go) · [TLS ALPN](https://www.rfc-editor.org/rfc/rfc7301) · [QUIC Initial 保护](https://www.rfc-editor.org/rfc/rfc9001#section-5.2)
+分流器选择接收分支后，mesh 节点执行双向 TLS、集群授权及逐包校验。即使网站与 mesh 客户端使用完全相同的 UDP 源和目标端口，切换 `RelayOnly`、`Blocked` 或拓扑邻接限制也只约束 mesh 流量。宿主可以给网站配置独立的 TLS、QUIC 版本和客户端认证。[同源策略与三站点测试](../portshare_test.go) · [TLS ALPN](https://www.rfc-editor.org/rfc/rfc7301) · [QUIC Initial 保护](https://www.rfc-editor.org/rfc/rfc9001#section-5.2)
 
 ## 容量和部署边界
 

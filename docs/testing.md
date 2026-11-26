@@ -6,6 +6,7 @@
 
 ```sh
 go test -count=1 ./...
+go vet ./...
 go test -race -count=1 ./...
 go test -race -count=1 -timeout=5m ./e2e -args -extended
 go test -race -count=1 -timeout=5m ./e2e -args -extended -portshare
@@ -17,17 +18,16 @@ quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理�
 
 ## 按问题选择测试
 
-| 现象 | 重放入口与判断依据 |
+| 现象 | 从哪里开始 |
 | --- | --- |
-| 有端点但连不上 | `TestTCPFallbackOnInitialDial` 模拟 UDP 黑洞，检查 TCP 回退。`TestConnectEndpointRecoveryAfterUDPBlackout` 检查通信恢复后的显式重拨。[传输回退](../mesh_test.go) · [端点重拨](../dial_test.go) |
-| 限速后切路或建邻失败 | `TestChaosPathLossWhileShaping` 和 `TestChaosRelayOnlyWhileShaping` 核对在途包的错误、后续包的顺序及实际路径。`TestNeighborDialWhilePublicationsArePaced` 在发布持续等待带宽时新增邻居。[发送队列](../addressing_test.go) · [邻居维护](../interconnect_test.go) |
-| 中继首次建链失败 | `TestColdCircuitAcrossSlowHops` 延迟下游两跳，在第一条电路上验收实际 IP 包。`TestRelaySearchContinuesAcrossDials` 检查后续拨号能否继续搜索候选。[中继测试](../interconnect_test.go) |
-| NAT、移动换址或双栈切换 | `TestNATPaths` 检查打洞报文和最终认证路径，`TestGatewayLayouts` 覆盖多层 NAT 及回环。`TestChaosMobileHandover` 连续四次更换公网 IPv4 和端口。`TestDualUnderlayFamilyFailover` 切断外层 IPv4，两者都在原有业务连接上核对回执。[NAT 场景](../e2e/nat_test.go) · [移动换址](../e2e/chaos_test.go) · [双栈切换](../e2e/mesh_test.go) |
-| 查询结果缺少预期端点或前缀 | `TestRefreshIPWithCachedDefault` 核对站点网关加入和本轮缺席时，刷新结果与有效缓存各自包含的成员。`TestAdvertRetainsUsableNATMapping` 核对邻居再次上报后返回的有效端点。`TestGatewayIntroductionBudget` 签发接近尺寸上限的网关介绍，核对路由和可容纳的观测。`TestHiddenIntroduction` 检查会合应答和离线缓存。[发现测试](../lookup_test.go) |
-| 主地址重复或同一地址对出现多个实例 | `TestChainDeadlineAndTopologyAdmission` 检查重复地址报错和原拓扑。`TestInspectAddressClaims` 核对运行中观察到的竞争声明。`TestRelayTCPWithDuplicateInstance` 检查长连接，`TestInstanceConflictRecovery` 验证选定实例后恢复交付。[拓扑校验](../policy_integration_test.go) · [实例诊断](../instance_test.go) · [中继长连接](../e2e/addressing_test.go) |
-| 地址授权或网关转发异常 | 任播示例检查排空期间新旧连接的去向。双栈默认出口测试以两个 /0 签发网关凭据，检查下游源地址、IPv4 TTL 和 IPv6 Hop Limit。`TestChaosDefaultExitWithdrawal` 在排队和整形同时发生时撤回一台客户端的默认出口，验证站点路径和另一客户端的默认出口。CI 的 `gateway` 作业另外验证应用 gVisor 转发补丁后的构建。[任播示例](../examples/anycast/main.go) · [组播与任播](../e2e/addressing_test.go) · [网关测试](../e2e/forwarding_test.go) · [网关构建](integration.md#gvisor-的-ipv4-网关构建) |
-| 握手、换证或签名失败 | 签发测试覆盖双栈 SAN、委派和有效期。CMS 测试比较不同签名算法的尺寸预检与实际签名。握手测试记录换证前后各会话使用的证书；`TestAuthorizedPKIXPaths` 验证宿主可按签发者区分序列号相同的两张可信证书。[授权链测试](../identity_boundaries_test.go) · [证书边界](../pki/boundaries_test.go) · [CMS](../pki/pki_test.go) · [握手](../authentication_test.go) |
-| 协议互通、端口复用或消息补发异常 | 线协议测试检查帧字节、字段及纳秒精度。共享端口测试验证同一端口的 mesh 和多站点 HTTPS、HTTP/3。主题消息测试核对推送和缓存补取。[线协议](../wire_test.go) · [共享端口](../portshare_test.go) · [主题消息](../publication_test.go) |
+| 有端点但连不上 | 用 `TestTCPFallbackOnInitialDial` 检查 UDP 黑洞后的 TCP 回退，用 `TestOutboundEndpointPolicyWithRelay` 核对出站策略和中继路径。[传输回退](../mesh_test.go) · [端点拨号](../dial_test.go) |
+| 换址或切换地址族后断流 | `TestNATPaths` 和 `TestGatewayLayouts` 覆盖不同的映射、过滤及多层 NAT。`TestChaosMobileHandover` 和 `TestDualUnderlayFamilyFailover` 在既有业务连接上检查回执。[NAT](../e2e/nat_test.go) · [移动换址](../e2e/chaos_test.go) · [双栈切换](../e2e/mesh_test.go) |
+| 整形期间切路或建邻失败 | `TestChaosRelayOnlyWhileShaping` 检查在途包和后续包的路径；`TestColdCircuitAcrossSlowHops` 在延迟中继上交付首包。[发送队列](../addressing_test.go) · [中继与邻接](../interconnect_test.go) |
+| 查询缺少端点或网关前缀 | `TestAdvertRetainsUsableNATMapping` 检查 NAT 观测的筛选和保留；`TestRefreshIPWithCachedDefault` 比较本轮应答和有效缓存。[地址发现](../lookup_test.go) |
+| 握手、换证或撤权异常 | `TestGrantDisclosure` 检查何时发送授权帧，`TestNodeAndGrantProof` 验证同钥续证，`TestRevalidateConcurrentPublication` 覆盖宿主复查与消息准入并发。[握手](../authentication_test.go) · [证书](../pki/boundaries_test.go) · [宿主策略](../policy_integration_test.go) |
+| 主地址重复或同一密钥出现多个实例 | `TestInspectAddressClaims` 检查竞争声明，`TestRelayTCPWithDuplicateInstance` 检查既有 TCP 连接，`TestInstanceConflictRecovery` 验证选定实例后的交付。[实例诊断](../instance_test.go) · [中继长连接](../e2e/addressing_test.go) |
+| VIP 或下游地址交付失败 | 任播示例验证排空期间的新旧连接，网关测试核对双栈回包、IPv4 TTL 和 IPv6 Hop Limit。[任播](../examples/anycast/main.go) · [网关](../e2e/forwarding_test.go) · [gVisor 构建](integration.md#gvisor-的-ipv4-网关构建) |
+| 协议互通或消息补发异常 | 查看帧的预期字节、共享端口的 mesh 与网站分流，以及消息推送与缓存补取。[线协议](../wire_test.go) · [端口复用](../portshare_test.go) · [主题消息](../publication_test.go) |
 
 ## 重放故障
 
@@ -39,7 +39,7 @@ go test -race -count=5 -run '^(TestColdCircuitAcrossSlowHops|TestChaosRelayOnlyW
 go test -v -count=1 -run '^TestNATPaths$/^(port|destination-specific)$' ./e2e
 ```
 
-用 `-extended` 启用较长的故障场景。`TestSeededChaos` 用 `-seed` 生成八步故障序列，`-v` 显示操作和业务回执。记录提交号、种子和首次失败步骤，可在同一版本重放操作顺序。定时和手动 CI 会重放种子 1 至 10。[混沌场景](../e2e/chaos_test.go)
+用 `-extended` 启用较长的故障场景。`TestSeededChaos` 用 `-seed` 生成八步故障序列，续签动作按步号单独更新节点证书或集群授权，`-v` 显示操作和业务回执。记录提交号、种子和首次失败步骤，可在同一版本重放操作顺序。定时和手动 CI 会重放种子 1 至 10。[混沌场景](../e2e/chaos_test.go)
 
 ```sh
 go test -race -v -count=1 -run '^TestChaosMobileHandover$' ./e2e -args -extended
@@ -60,4 +60,4 @@ go test -run '^$' -bench '^BenchmarkPathStatus$' -benchmem .
 
 `BenchmarkMeshIP` 分别经独占 UDP、两端共享 UDP 和 TCP 逐包发送 1 KiB 的内层 IPv4 包，每次等对端收到后再发下一个。可比较每包分配次数、字节数以及交付延迟的 p95、p99。`BenchmarkPathStatus` 分别在连接 16 和 128 个 TCP 对端后读取完整路径状态。[基准代码](../mesh_test.go)
 
-`BenchmarkPacketAuthorization` 测量一次已认证会话对内层包的地址授权，分别覆盖成员主地址、VIP、下游地址，以及在 128 名订阅者中查找最后一名成员。比较查询实现时使用相同拓扑和目的成员，再用 `BenchmarkMeshIP` 测量完整收发路径。[地址授权基准](../addressing_test.go)
+`BenchmarkPacketAuthorization` 使用收发双方的公钥 ID、双栈主地址和业务授权，测量内层包的地址检查，分别覆盖成员主地址、VIP、下游地址，以及在 128 名组播订阅者中查找目的成员。比较查询实现时使用相同拓扑和目的成员，再用 `BenchmarkMeshIP` 测量完整收发路径。[地址授权基准](../addressing_test.go)

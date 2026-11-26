@@ -47,6 +47,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	options[0].Auth.TrustedEntrypoints = []nebula.PeerID{site.ID, exit.ID}
 	for i := range options {
 		options[i].Topology.Members = []nebula.Member{options[i].Topology.Members[i]}
 	}
@@ -77,7 +78,7 @@ func run() error {
 				return err
 			}
 			if !slices.ContainsFunc(matches, func(m nebula.IPMatch) bool {
-				return m.Peer.IPv4() == gw.IPv4 && m.Peer.IPv6() == gw.IPv6 && slices.Contains(gw.RoutedPrefixes, m.Prefix)
+				return m.Peer == gw.ID && slices.Contains(gw.RoutedPrefixes, m.Prefix)
 			}) {
 				return fmt.Errorf("missing approved gateway for %s", lan)
 			}

@@ -1,8 +1,7 @@
-// Command pki issues and verifies a dual-stack member certificate in memory.
+// Command pki issues and verifies a node identity and a dual-stack cluster grant in memory.
 package main
 
 import (
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
@@ -21,11 +20,11 @@ func main() {
 }
 
 func run() error {
-	issuer, err := demo.NewIssuer()
+	authority, issuer, err := demo.NewIssuers()
 	if err != nil {
 		return fmt.Errorf("create CA: %w", err)
 	}
-	root := issuer.Chain[0]
+	clusterCA := issuer.Chain[0]
 	siteKey, err := pki.GenerateKey("ed25519")
 	if err != nil {
 		return err
@@ -34,29 +33,25 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	approved, err := x509.MarshalPKIXPublicKey(siteKey.Public())
+	siteID, err := pki.NewPeerID(siteKey.Public())
 	if err != nil {
 		return err
 	}
 	site, err := issuer.IssueCA(siteCSR, pki.CAProfile{
-		Subject: siteCSR.Subject, NotBefore: root.NotBefore, NotAfter: root.NotAfter,
+		Subject: siteCSR.Subject, NotBefore: clusterCA.NotBefore, NotAfter: clusterCA.NotAfter,
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/27"), netip.MustParsePrefix("fd13::/120")},
 		Scope:        &pki.Scope{Network: "demo"},
-	}, sha256.Sum256(approved))
+	}, siteID)
 	if err != nil {
 		return err
 	}
-	siteIssuer := pki.Issuer{Chain: []*x509.Certificate{site, root}, Signer: siteKey}
+	siteIssuer := pki.Issuer{Chain: []*x509.Certificate{site, clusterCA}, Signer: siteKey}
 	key, err := pki.GenerateKey("ed25519")
 	if err != nil {
 		return err
 	}
-	id, err := pki.NewPeerID(netip.MustParseAddr("10.13.0.1"), netip.MustParseAddr("fd13::1"))
-	if err != nil {
-		return err
-	}
 	// The issuer approves the known public key independently of the submitted CSR.
-	enrollment, err := demo.Enrollment(key.Public(), id.IPv4(), id.IPv6(), nil)
+	enrollment, err := demo.Enrollment(key.Public(), netip.MustParseAddr("10.13.0.1"), netip.MustParseAddr("fd13::1"), nil)
 	if err != nil {
 		return err
 	}
@@ -64,22 +59,30 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	node, err := authority.IssueNode(csr, enrollment.PublicKeyHash, enrollment.NotBefore, enrollment.NotAfter)
+	if err != nil {
+		return err
+	}
+	id, err := pki.VerifyNode(node, authority.Chain[0], x509.ExtKeyUsageServerAuth, time.Now())
+	if err != nil {
+		return err
+	}
 	enrollment.Name = "alice"
-	leaf, err := siteIssuer.IssueLeaf(csr, enrollment)
+	leaf, err := siteIssuer.IssueGrant(csr, enrollment)
 	if err != nil {
 		return fmt.Errorf("issue leaf: %w", err)
 	}
 
 	roots := x509.NewCertPool()
-	roots.AddCert(root)
-	cluster, err := pki.ReadClusterCA(root)
+	roots.AddCert(authority.Chain[0])
+	cluster, err := pki.ReadClusterCA(clusterCA)
 	if err != nil {
 		return err
 	}
-	_, err = pki.VerifyChain([]*x509.Certificate{leaf, site}, roots, cluster, id, x509.ExtKeyUsageServerAuth, time.Now())
+	_, err = pki.VerifyGrant([]*x509.Certificate{leaf, site, clusterCA}, roots, cluster, id, time.Now())
 	if err != nil {
-		return fmt.Errorf("verify server identity: %w", err)
+		return fmt.Errorf("verify cluster grant: %w", err)
 	}
-	fmt.Printf("verified %s on demo for serverAuth\n", id)
+	fmt.Printf("verified %s on demo with its cluster grant\n", id)
 	return nil
 }

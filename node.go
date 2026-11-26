@@ -4,6 +4,7 @@ package nebula
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -60,9 +61,11 @@ type Options struct {
 
 // AuthOptions sets the node's trust anchors, local credentials and chain policy.
 type AuthOptions struct {
-	// Roots is the explicit trust store. New takes a private copy.
-	Roots *x509.CertPool
-	// ClusterCA pins the certificate defining this mesh within Roots.
+	// TrustedEntrypoints identifies approved first contacts in this cluster by public key.
+	TrustedEntrypoints []PeerID
+	// RootCA is the ordinary, self-signed authority for node identities.
+	RootCA *x509.Certificate
+	// ClusterCA pins the certificate defining this mesh under RootCA.
 	ClusterCA *x509.Certificate
 	// Certificates supplies the initial credentials for this identity.
 	// Use Node.ReloadCertificates to replace them.
@@ -71,6 +74,24 @@ type AuthOptions struct {
 	// accepts the chain until expiry. Calls may run concurrently. Call Node.Revalidate
 	// after changing the host policy to recheck existing authorizations.
 	CheckChain func(context.Context, ChainCheck) (time.Time, error)
+}
+
+// EndpointSource identifies how the node obtained a local address for publication.
+type EndpointSource uint8
+
+const (
+	EndpointFromConfig      EndpointSource = iota // TransportOptions.AdvertiseEndpoints.
+	EndpointFromTopology                          // The local Member.Endpoints.
+	EndpointFromListener                          // A local UDP socket or TCP listener.
+	EndpointFromObservation                       // A report from an authenticated QUIC neighbor.
+)
+
+// EndpointCandidate describes a physical address considered for the local signed introduction.
+type EndpointCandidate struct {
+	Endpoint Endpoint
+	Source   EndpointSource
+	// Observer is the reporting peer for EndpointFromObservation and zero otherwise.
+	Observer PeerID
 }
 
 // TransportOptions specifies physical listeners, outbound TCP dialing and
@@ -86,6 +107,15 @@ type TransportOptions struct {
 	// AdvertiseEndpoints adds reachable physical addresses outside the certified
 	// member subnets and anycast pools to signed introductions.
 	AdvertiseEndpoints []Endpoint
+	// AllowAdvertiseEndpoint selects candidates for the local, forwardable signed
+	// introduction. Observations are also checked before replacing a prior report.
+	// Nil accepts all valid candidates. HideEndpoints takes precedence.
+	AllowAdvertiseEndpoint func(EndpointCandidate) bool
+	// AllowOutboundEndpoint permits active physical contact for ConnectEndpoint,
+	// automatic TCP and QUIC dials, path probes and UDP hole punches. Nil permits
+	// all destinations allowed by path policy. Existing sessions keep their paths.
+	// Both endpoint callbacks may run concurrently and should return promptly.
+	AllowOutboundEndpoint func(Endpoint) bool
 	// HideEndpoints omits all physical endpoints from this node's signed introductions,
 	// including AdvertiseEndpoints, local topology entries, listeners and NAT mappings.
 	// Incoming rendezvous requests receive the signed record without a UDP punch.
@@ -96,6 +126,8 @@ type TransportOptions struct {
 
 // Node manages the transports and peer sessions for one mesh identity.
 type Node struct {
+	clusterFingerprint     [sha256.Size]byte
+	roots                  *x509.CertPool
 	o                      Options
 	id                     PeerID
 	instance               InstanceID
@@ -173,14 +205,27 @@ func New(parent context.Context, o Options) (*Node, error) {
 	if parent == nil {
 		return nil, errors.New("parent context required")
 	}
-	if o.Auth.Roots == nil {
-		return nil, errors.New("explicit trust roots required")
+	if o.Auth.RootCA == nil || o.Auth.ClusterCA == nil {
+		return nil, errors.New("root CA and cluster CA required")
 	}
-	o.Auth.Roots = o.Auth.Roots.Clone()
+	root, err := x509.ParseCertificate(slices.Clone(o.Auth.RootCA.Raw))
+	if err != nil {
+		return nil, err
+	}
+	o.Auth.RootCA = root
+	if err := pki.ValidateRoot(root); err != nil {
+		return nil, err
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
 	cluster, err := pki.ReadClusterCA(o.Auth.ClusterCA)
 	if err != nil {
 		return nil, err
 	}
+	if o.Auth.ClusterCA.CheckSignatureFrom(root) != nil {
+		return nil, errors.New("cluster CA must be issued directly by root")
+	}
+	fingerprint := sha256.Sum256(o.Auth.ClusterCA.Raw)
 	o.Auth.ClusterCA = nil
 	view, err := o.Topology.compile(cluster)
 	if err != nil {
@@ -191,10 +236,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	identity, err := pki.ReadIdentity(c.Client.Leaf)
-	if err != nil {
-		return nil, err
-	}
+	o.Auth.TrustedEntrypoints = slices.Clone(o.Auth.TrustedEntrypoints)
 	o.Auth.Certificates = LocalCertificates{}
 	if o.MaintenanceInterval < 0 {
 		return nil, errors.New("negative MaintenanceInterval")
@@ -231,8 +273,9 @@ func New(parent context.Context, o Options) (*Node, error) {
 	o.Transport.AdvertiseEndpoints = slices.Clone(o.Transport.AdvertiseEndpoints)
 	ctx, cancel := context.WithCancel(parent)
 	n := &Node{
+		roots: roots, clusterFingerprint: fingerprint,
 		o:                      o,
-		id:                     identity.ID,
+		id:                     c.identity.ID,
 		ctx:                    ctx,
 		cancel:                 cancel,
 		done:                   make(chan struct{}),
@@ -266,7 +309,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 		cancel()
 		return nil, err
 	}
-	if err := n.validateIntroduction(view, c.Object); err != nil {
+	if err := n.validateIntroduction(view, c); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -332,7 +375,7 @@ func (n *Node) Start() error {
 		}
 		transport := n.newUDPTransport(udp)
 		n.transports[family == "udp6"] = transport
-		listener, err := transport.Listen(n.tlsConfig(PeerID{}, true), transport.config)
+		listener, err := transport.Listen(n.tlsConfig(PeerID{}, false, nil), transport.config)
 		if err != nil {
 			n.mu.Unlock()
 			n.Close()
@@ -348,7 +391,9 @@ func (n *Node) Start() error {
 					n.recordListenerError(family, err)
 					return
 				}
-				if !n.tryTask(n.handshakeSlots, func() { n.attachQUIC(n.ctx, q, PeerID{}, false) }) {
+				if !n.tryTask(n.handshakeSlots, func() {
+					n.attachQUIC(n.ctx, q, PeerID{}, false, q.Context().Value(credentialContextKey{}).(*credentials))
+				}) {
 					q.CloseWithError(0, "closing")
 				}
 			}
@@ -478,10 +523,24 @@ func (n *Node) newUDPTransport(udp net.PacketConn) *udpTransport {
 	if shared, ok := udp.(meshwire.SharedSocket); ok {
 		shared.ConfigureMeshQUIC(t.Transport, t.config)
 	}
+	previous := t.ConnContext
+	t.ConnContext = func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
+		if previous != nil {
+			var err error
+			ctx, err = previous(ctx, info)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return context.WithValue(ctx, credentialContextKey{}, n.cred.Load()), nil
+	}
 	return t
 }
 
-// ID returns the certified overlay address pair.
+// Addresses returns the primary addresses in the current local grant.
+func (n *Node) Addresses() pki.Addresses { return n.cred.Load().identity.Addresses }
+
+// ID returns the stable node public-key fingerprint.
 func (n *Node) ID() PeerID { return n.id }
 
 // MaxIPSize returns the configured inner packet limit in bytes.

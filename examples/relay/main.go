@@ -10,7 +10,6 @@ import (
 
 	"code.d7z.net/d7z-team/nebula"
 	"code.d7z.net/d7z-team/nebula/examples/demo"
-	"code.d7z.net/d7z-team/nebula/pki"
 )
 
 func main() {
@@ -21,14 +20,7 @@ func main() {
 
 func run() error {
 	a, r, b := demo.NewHost(1), demo.NewHost(2), demo.NewHost(3)
-	var circuit []nebula.PeerID
-	for _, member := range []demo.Host{a, r, b} {
-		id, err := pki.NewPeerID(member.IPv4, member.IPv6)
-		if err != nil {
-			return err
-		}
-		circuit = append(circuit, id)
-	}
+	circuit := []nebula.PeerID{a.ID, r.ID, b.ID}
 	r.Restricted = true
 	r.Transit = true
 	a.Links = []nebula.PeerID{circuit[1]}
@@ -65,6 +57,20 @@ func run() error {
 			return err
 		}
 	}
+	// The hidden relay has no dialable endpoint. Wait for its incoming
+	// connections to be registered at both ends before opening the circuit.
+	for _, edge := range []*nebula.Node{nodes[0], nodes[2]} {
+		for {
+			if _, ok := edge.PreferredPath(r.ID); ok {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
 	if err := nodes[0].ConnectPeer(ctx, b.IPv6); err != nil {
 		return fmt.Errorf("connect A to B through R: %w", err)
 	}
@@ -73,7 +79,7 @@ func run() error {
 		return fmt.Errorf("unexpected path to B: %v", path)
 	}
 	next := path.Circuit[1]
-	matches, err := nodes[0].ResolveIP(ctx, next.IPv4())
+	matches, err := nodes[0].ResolveIP(ctx, r.IPv4)
 	if err != nil {
 		return err
 	}

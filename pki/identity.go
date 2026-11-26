@@ -2,48 +2,47 @@ package pki
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
-	"strings"
 )
 
-// PeerID is the network-order IPv4 address followed by the IPv6 address.
-type PeerID [20]byte
+// PeerID identifies a node public key by its canonical SPKI SHA-256 digest.
+type PeerID [sha256.Size]byte
 
-// NewPeerID binds one unicast IPv4 address and one native unicast IPv6 address.
-func NewPeerID(v4, v6 netip.Addr) (PeerID, error) {
-	var id PeerID
-	if !v4.Is4() || !v6.Is6() || v6.Is4In6() || v6.Zone() != "" || !v4.IsGlobalUnicast() || !v6.IsGlobalUnicast() {
-		return id, errors.New("one unicast IPv4 and one native IPv6 address required")
+// NewPeerID hashes the DER SubjectPublicKeyInfo of key.
+func NewPeerID(key crypto.PublicKey) (PeerID, error) {
+	der, err := x509.MarshalPKIXPublicKey(key)
+	if err != nil {
+		return PeerID{}, err
 	}
-	copy(id[:4], v4.AsSlice())
-	copy(id[4:], v6.AsSlice())
-	return id, nil
+	return sha256.Sum256(der), nil
 }
-func (id PeerID) IPv4() netip.Addr             { return netip.AddrFrom4([4]byte(id[:4])) }
-func (id PeerID) IPv6() netip.Addr             { return netip.AddrFrom16([16]byte(id[4:])) }
-func (id PeerID) String() string               { return id.IPv4().String() + "@" + id.IPv6().String() }
+func (id PeerID) String() string               { return hex.EncodeToString(id[:]) }
 func (id PeerID) MarshalText() ([]byte, error) { return []byte(id.String()), nil }
 func (id *PeerID) UnmarshalText(b []byte) error {
-	a, c, _ := strings.Cut(string(b), "@")
-	v4, err := netip.ParseAddr(a)
-	if err != nil {
+	if len(b) != hex.EncodedLen(len(id)) {
+		return errors.New("invalid peer ID length")
+	}
+	var next PeerID
+	if _, err := hex.Decode(next[:], b); err != nil {
 		return err
 	}
-	v6, err := netip.ParseAddr(c)
-	if err != nil {
-		return err
-	}
-	v, err := NewPeerID(v4, v6)
-	if err == nil {
-		*id = v
-	}
-	return err
+	*id = next
+	return nil
+}
+
+// Addresses holds the two exclusive primary addresses in a cluster grant.
+type Addresses struct {
+	IPv4 netip.Addr `json:"ipv4"`
+	IPv6 netip.Addr `json:"ipv6"`
 }
 
 // OID generated from GUID 6823cd53-e1ed-409b-96d5-90ce56aa0c3b using Microsoft's GUID OID arc.
@@ -149,10 +148,11 @@ func decodePrefixes(encoded []prefixDER) []netip.Prefix {
 
 type Identity struct {
 	ID PeerID
+	Addresses
 	Scope
 }
 
-// ReadIdentity extracts the address pair and mesh scope; VerifyChain establishes trust.
+// ReadIdentity extracts the address pair and mesh scope; VerifyGrant establishes trust.
 func ReadIdentity(c *x509.Certificate) (Identity, error) {
 	if c == nil || c.IsCA || c.Version != 3 || len(c.IPAddresses) != 2 || c.KeyUsage != 0 && c.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
 		return Identity{}, errors.New("invalid mesh signing leaf")
@@ -162,7 +162,7 @@ func ReadIdentity(c *x509.Certificate) (Identity, error) {
 	if b.Is4() {
 		a, b = b, a
 	}
-	id, err := NewPeerID(a, b)
+	id, err := NewPeerID(c.PublicKey)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -173,7 +173,10 @@ func ReadIdentity(c *x509.Certificate) (Identity, error) {
 	if !ok {
 		return Identity{}, errors.New("missing mesh extension")
 	}
-	return Identity{id, s}, nil
+	if !a.Is4() || !b.Is6() || b.Is4In6() {
+		return Identity{}, errors.New("dual-stack grant required")
+	}
+	return Identity{id, Addresses{a, b}, s}, nil
 }
 
 // checkDelegation checks every mesh issuer on the path and returns its cluster CA, if present.

@@ -2,8 +2,9 @@ package demo
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
 	"io"
@@ -18,12 +19,22 @@ import (
 // Host holds the topology member and the route authority granted by the demo CA.
 type Host struct {
 	nebula.Member
+	key               ed25519.PrivateKey
 	CertificateRoutes []netip.Prefix
 }
 
 // NewHost assigns the numbered IPv4 and IPv6 addresses in the demo network.
 func NewHost(number byte) Host {
-	return Host{Member: nebula.Member{
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	id, err := pki.NewPeerID(pub)
+	if err != nil {
+		panic(err)
+	}
+	return Host{key: key, Member: nebula.Member{
+		ID:   id,
 		IPv4: netip.AddrFrom4([4]byte{10, 13, 0, number}),
 		IPv6: netip.MustParseAddr(fmt.Sprintf("fd13::%x", number)),
 	}}
@@ -32,18 +43,13 @@ func NewHost(number byte) Host {
 // NodeOptions issues short-lived credentials and gives each host its own copy
 // of the demo topology.
 func NodeOptions(hosts ...Host) ([]nebula.Options, error) {
-	issuer, err := NewIssuer()
+	root, issuer, err := NewIssuers()
 	if err != nil {
 		return nil, fmt.Errorf("create demo CA: %w", err)
 	}
-	roots := x509.NewCertPool()
-	roots.AddCert(issuer.Chain[0])
 	options := make([]nebula.Options, len(hosts))
 	for i, host := range hosts {
-		key, err := pki.GenerateKey("ed25519")
-		if err != nil {
-			return nil, err
-		}
+		key := host.key
 		enrollment, err := Enrollment(key.Public(), host.IPv4, host.IPv6, host.CertificateRoutes)
 		if err != nil {
 			return nil, err
@@ -53,14 +59,18 @@ func NodeOptions(hosts ...Host) ([]nebula.Options, error) {
 		if err != nil {
 			return nil, err
 		}
-		cert, err := issuer.IssueLeaf(csr, enrollment)
+		cert, err := issuer.IssueGrant(csr, enrollment)
 		if err != nil {
 			return nil, fmt.Errorf("issue certificate for %s: %w", host.IPv4, err)
 		}
+		node, err := root.IssueNode(csr, enrollment.PublicKeyHash, enrollment.NotBefore, enrollment.NotAfter)
+		if err != nil {
+			return nil, err
+		}
 		o := &options[i]
 		o.Auth = nebula.AuthOptions{
-			Roots: roots, ClusterCA: issuer.Chain[0],
-			Certificates: nebula.LocalCertificates{Client: tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: key}},
+			RootCA: root.Chain[0], ClusterCA: issuer.Chain[0],
+			Certificates: nebula.LocalCertificates{Node: tls.Certificate{Certificate: [][]byte{node.Raw}, PrivateKey: key}, Grant: [][]byte{cert.Raw, issuer.Chain[0].Raw}},
 		}
 		o.Topology = nebula.Topology{Network: "demo", Members: make([]nebula.Member, len(hosts))}
 		for j, h := range hosts {
@@ -95,7 +105,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 	endpoints := make(map[nebula.PeerID]nebula.Endpoint, len(options))
 	for i := range prepared {
 		o := &prepared[i]
-		chain, err := pki.ParseChain(o.Auth.Certificates.Client.Certificate)
+		chain, err := pki.ParseChain(o.Auth.Certificates.Grant)
 		if err != nil {
 			return nil, err
 		}
@@ -139,11 +149,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 		o.Topology.Members = slices.Clone(o.Topology.Members)
 		for j := range o.Topology.Members {
 			m := &o.Topology.Members[j]
-			id, err := pki.NewPeerID(m.IPv4, m.IPv6)
-			if err != nil {
-				return nil, err
-			}
-			if ep := endpoints[id]; ep.Valid() && !slices.Contains(m.Endpoints, ep) {
+			if ep := endpoints[m.ID]; ep.Valid() && !slices.Contains(m.Endpoints, ep) {
 				m.Endpoints = append([]nebula.Endpoint{ep}, m.Endpoints...)
 			}
 		}

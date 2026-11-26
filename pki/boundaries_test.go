@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math"
@@ -25,7 +26,7 @@ func TestIssuanceBoundaries(t *testing.T) {
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("fd42::/64")},
 		MaxPathLen:   1,
 	}
-	root, err := CreateRoot(key, profile)
+	root, anchor, err := testClusterCA(t, key, profile)
 	require.NoError(t, err)
 	issuer := Issuer{Chain: []*x509.Certificate{root}, Signer: key}
 	interKey, err := GenerateKey("ed25519")
@@ -54,14 +55,14 @@ func TestIssuanceBoundaries(t *testing.T) {
 	require.NoError(t, err)
 	req, err := x509.ParseCertificateRequest(der)
 	require.NoError(t, err)
-	enroll := Enrollment{Name: "publisher", IPv4: netip.MustParseAddr("10.0.0.1"), IPv6: netip.MustParseAddr("fd42::1"), Scope: Scope{Network: "mesh"}, Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Minute)}
-	peer, err := NewPeerID(enroll.IPv4, enroll.IPv6)
+	enroll := Enrollment{Name: "publisher", IPv4: netip.MustParseAddr("10.0.0.1"), IPv6: netip.MustParseAddr("fd42::1"), Scope: Scope{Network: "mesh"}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Minute)}
+	peer, err := NewPeerID(req.PublicKey)
 	require.NoError(t, err)
-	leaf, err := interIssuer.IssueLeaf(req, enroll)
+	leaf, err := interIssuer.IssueGrant(req, enroll)
 	require.NoError(t, err)
 	require.Empty(t, leaf.DNSNames)
 	require.Equal(t, enroll.Name, leaf.Subject.CommonName)
-	require.Equal(t, enroll.Usages, leaf.ExtKeyUsage)
+	require.Equal(t, []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}, leaf.ExtKeyUsage)
 	require.False(t, leaf.IsCA)
 	t.Run("issuer usages", func(t *testing.T) {
 		template := *inter
@@ -71,12 +72,15 @@ func TestIssuanceBoundaries(t *testing.T) {
 		limited, err := x509.ParseCertificate(der)
 		require.NoError(t, err)
 		issuing := Issuer{Chain: []*x509.Certificate{limited, root}, Signer: interKey}
-		_, err = issuing.IssueLeaf(req, enroll)
+		_, err = issuing.IssueGrant(req, enroll)
 		require.NoError(t, err)
-		both := enroll
-		both.Usages = []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning, x509.ExtKeyUsageClientAuth}
-		_, err = issuing.IssueLeaf(req, both)
-		require.ErrorContains(t, err, "clientAuth")
+		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+		der, err = x509.CreateCertificate(rand.Reader, &template, root, interKey.Public(), key)
+		require.NoError(t, err)
+		issuing.Chain[0], err = x509.ParseCertificate(der)
+		require.NoError(t, err)
+		_, err = issuing.IssueGrant(req, enroll)
+		require.Error(t, err)
 	})
 	for _, tc := range []struct {
 		name   string
@@ -86,13 +90,12 @@ func TestIssuanceBoundaries(t *testing.T) {
 		{"after-parent", func(e *Enrollment) { e.NotAfter = inter.NotAfter.Add(time.Second) }},
 		{"same-DER-second", func(e *Enrollment) { e.NotBefore = now; e.NotAfter = now.Add(time.Millisecond) }},
 		{"zoned-address", func(e *Enrollment) { e.IPv6 = netip.MustParseAddr("fe80::1%eth0") }},
-		{"missing-usage", func(e *Enrollment) { e.Usages = nil }},
 		{"other-approved-key", func(e *Enrollment) { e.PublicKeyHash = approvedHash }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := enroll
 			tc.change(&e)
-			_, err := interIssuer.IssueLeaf(req, e)
+			_, err := interIssuer.IssueGrant(req, e)
 			require.Error(t, err)
 		})
 	}
@@ -103,7 +106,7 @@ func TestIssuanceBoundaries(t *testing.T) {
 		{"wrong-key", Issuer{[]*x509.Certificate{inter, root}, key}},
 		{"non-CA", Issuer{[]*x509.Certificate{leaf}, leafKey}},
 	} {
-		t.Run(tc.name, func(t *testing.T) { _, err := tc.ca.IssueLeaf(req, enroll); require.Error(t, err) })
+		t.Run(tc.name, func(t *testing.T) { _, err := tc.ca.IssueGrant(req, enroll); require.Error(t, err) })
 	}
 	noCertSign := *inter
 	noCertSign.KeyUsage = x509.KeyUsageCRLSign
@@ -111,19 +114,19 @@ func TestIssuanceBoundaries(t *testing.T) {
 	require.NoError(t, err)
 	bad, err := x509.ParseCertificate(der)
 	require.NoError(t, err)
-	_, err = (Issuer{[]*x509.Certificate{bad, root}, interKey}).IssueLeaf(req, enroll)
+	_, err = (Issuer{[]*x509.Certificate{bad, root}, interKey}).IssueGrant(req, enroll)
 	require.Error(t, err)
 	broken := *req
 	broken.Signature = bytes.Clone(req.Signature)
 	broken.Signature[0] ^= 1
-	_, err = interIssuer.IssueLeaf(&broken, enroll)
+	_, err = interIssuer.IssueGrant(&broken, enroll)
 	require.Error(t, err)
 
 	cluster, err := ReadClusterCA(root)
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
-	roots.AddCert(root)
-	chain := []*x509.Certificate{leaf, inter}
+	roots.AddCert(anchor)
+	chain := []*x509.Certificate{leaf, inter, root}
 	// The leaf fits the parent and is signed by the intermediate's key in
 	// every case. Check the delegation itself on externally issued paths.
 	for name, ranges := range map[string][]netip.Prefix{
@@ -142,9 +145,9 @@ func TestIssuanceBoundaries(t *testing.T) {
 			external, err := x509.ParseCertificate(der)
 			require.NoError(t, err)
 			externalIssuer := Issuer{Chain: []*x509.Certificate{external, root}, Signer: interKey}
-			_, err = externalIssuer.IssueLeaf(req, enroll)
+			_, err = externalIssuer.IssueGrant(req, enroll)
 			require.Error(t, err)
-			_, err = VerifyChain([]*x509.Certificate{leaf, external}, roots, cluster, peer, x509.ExtKeyUsageCodeSigning, now)
+			_, err = VerifyGrant([]*x509.Certificate{leaf, external, root}, roots, cluster, peer, now)
 			require.Error(t, err)
 		})
 	}
@@ -156,7 +159,7 @@ func TestIssuanceBoundaries(t *testing.T) {
 		{"before", leaf.NotBefore.Add(-time.Nanosecond), false}, {"not-before", leaf.NotBefore, true}, {"not-after", leaf.NotAfter, true}, {"after", leaf.NotAfter.Add(time.Nanosecond), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := VerifyChain(chain, roots, cluster, peer, x509.ExtKeyUsageCodeSigning, tc.at)
+			_, err := VerifyGrant(chain, roots, cluster, peer, tc.at)
 			if tc.ok {
 				require.NoError(t, err)
 			} else {
@@ -168,12 +171,11 @@ func TestIssuanceBoundaries(t *testing.T) {
 		name  string
 		chain []*x509.Certificate
 		roots *x509.CertPool
-		usage x509.ExtKeyUsage
 	}{
-		{"missing-intermediate", chain[:1], roots, x509.ExtKeyUsageCodeSigning}, {"untrusted", chain, x509.NewCertPool(), x509.ExtKeyUsageCodeSigning}, {"other-usage", chain, roots, x509.ExtKeyUsageServerAuth},
+		{"missing-intermediate", chain[:1], roots}, {"untrusted", chain, x509.NewCertPool()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := VerifyChain(tc.chain, tc.roots, cluster, peer, tc.usage, now)
+			_, err := VerifyGrant(tc.chain, tc.roots, cluster, peer, now)
 			require.Error(t, err)
 		})
 	}
@@ -194,7 +196,7 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	}
 	rootKey, err := GenerateKey("ed25519")
 	require.NoError(t, err)
-	root, err := CreateRoot(rootKey, profile)
+	root, anchor, err := testClusterCA(t, rootKey, profile)
 	require.NoError(t, err)
 	issuer := Issuer{Chain: []*x509.Certificate{root}, Signer: rootKey}
 	regionKey, err := GenerateKey("ed25519")
@@ -233,14 +235,14 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	// .31 is a primary address on the cluster subnet. The issuer's /27 limits its SANs.
 	enrollment := Enrollment{
 		IPv4: addr("10.1.2.31"), IPv6: addr("fd42::7"),
-		Scope:  Scope{Network: restricted.Network, RoutedPrefixes: restricted.RoutedPrefixes, AnycastIPs: []netip.Addr{addr("192.0.2.200")}},
-		Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo),
-		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Minute),
+		Scope:         Scope{Network: restricted.Network, RoutedPrefixes: restricted.RoutedPrefixes, AnycastIPs: []netip.Addr{addr("192.0.2.200")}},
+		PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo),
+		NotBefore:     now.Add(-time.Minute), NotAfter: now.Add(time.Minute),
 	}
-	id, err := NewPeerID(enrollment.IPv4, enrollment.IPv6)
+	id, err := NewPeerID(req.PublicKey)
 	require.NoError(t, err)
-	require.Equal(t, append(enrollment.IPv4.AsSlice(), enrollment.IPv6.AsSlice()...), id[:])
-	cert, err := delegated.IssueLeaf(req, enrollment)
+	require.Equal(t, enrollment.PublicKeyHash[:], id[:])
+	cert, err := delegated.IssueGrant(req, enrollment)
 	require.NoError(t, err)
 	identity, err := ReadIdentity(cert)
 	require.NoError(t, err)
@@ -248,15 +250,15 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	cluster, err := ReadClusterCA(root)
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
-	roots.AddCert(root)
-	chain := []*x509.Certificate{cert, inter, region}
-	_, err = VerifyChain(chain, roots, cluster, id, x509.ExtKeyUsageServerAuth, now)
+	roots.AddCert(anchor)
+	chain := []*x509.Certificate{cert, inter, region, root}
+	_, err = VerifyGrant(chain, roots, cluster, id, now)
 	require.NoError(t, err)
-	_, err = VerifyChain(chain, roots, Cluster{}, id, x509.ExtKeyUsageServerAuth, now)
+	_, err = VerifyGrant(chain, roots, Cluster{}, id, now)
 	require.Error(t, err)
 	other := id
 	other[19]++
-	_, err = VerifyChain(chain, roots, cluster, other, x509.ExtKeyUsageServerAuth, now)
+	_, err = VerifyGrant(chain, roots, cluster, other, now)
 	require.Error(t, err)
 	template := *cert
 	// Rebuild the SAN in reverse order through the standard X.509 encoder.
@@ -268,7 +270,7 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 	require.NoError(t, err)
 	chain[0], err = x509.ParseCertificate(der)
 	require.NoError(t, err)
-	_, err = VerifyChain(chain, roots, cluster, id, x509.ExtKeyUsageServerAuth, now)
+	_, err = VerifyGrant(chain, roots, cluster, id, now)
 	require.NoError(t, err)
 	for name, ips := range map[string][]net.IP{
 		"missing-v6": {enrollment.IPv4.AsSlice()}, "missing-v4": {enrollment.IPv6.AsSlice()},
@@ -293,7 +295,7 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := enrollment
 			modify(&e)
-			_, err := delegated.IssueLeaf(req, e)
+			_, err := delegated.IssueGrant(req, e)
 			require.Error(t, err)
 			// An external issuer can sign such a leaf. A relying party must reject its path.
 			ext, err := e.extension()
@@ -305,10 +307,70 @@ func TestDualStackScopeAndDelegation(t *testing.T) {
 			require.NoError(t, err)
 			external, err := x509.ParseCertificate(der)
 			require.NoError(t, err)
-			peer, err := NewPeerID(e.IPv4, e.IPv6)
+			peer, err := NewPeerID(req.PublicKey)
 			require.NoError(t, err)
-			_, err = VerifyChain([]*x509.Certificate{external, inter, region}, roots, cluster, peer, x509.ExtKeyUsageServerAuth, now)
+			_, err = VerifyGrant([]*x509.Certificate{external, inter, region, root}, roots, cluster, peer, now)
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestNodeAndGrantProof(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	key, err := GenerateKey("ed25519")
+	require.NoError(t, err)
+	root, err := CreateRoot(key, CAProfile{Subject: pkix.Name{CommonName: "Identity Root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), MaxPathLen: 1})
+	require.NoError(t, err)
+	authority := Issuer{Chain: []*x509.Certificate{root}, Signer: key}
+	siteKey, err := GenerateKey("p256")
+	require.NoError(t, err)
+	csr, err := CreateCSR(siteKey, pkix.Name{})
+	require.NoError(t, err)
+	ca, err := authority.IssueCA(csr, CAProfile{Subject: pkix.Name{CommonName: "Cluster"}, Scope: &Scope{Network: "private", Cluster: true}, PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24"), netip.MustParsePrefix("fd00::/64")}, NotBefore: root.NotBefore, NotAfter: root.NotAfter}, sha256.Sum256(csr.RawSubjectPublicKeyInfo))
+	require.NoError(t, err)
+	cluster, err := ReadClusterCA(ca)
+	require.NoError(t, err)
+	issuer := Issuer{Chain: []*x509.Certificate{ca, root}, Signer: siteKey}
+	nodeKey, err := GenerateKey("ed25519")
+	require.NoError(t, err)
+	csr, err = CreateCSR(nodeKey, pkix.Name{CommonName: "private-host"})
+	require.NoError(t, err)
+	hash := sha256.Sum256(csr.RawSubjectPublicKeyInfo)
+	node, err := authority.IssueNode(csr, hash, now, root.NotAfter)
+	require.NoError(t, err)
+	grant, err := issuer.IssueGrant(csr, Enrollment{Scope: Scope{Network: "private"}, IPv4: netip.MustParseAddr("10.0.0.1"), IPv6: netip.MustParseAddr("fd00::1"), PublicKeyHash: hash, NotBefore: now, NotAfter: root.NotAfter})
+	require.NoError(t, err)
+	other, err := authority.IssueNode(csr, hash, now, root.NotAfter)
+	require.NoError(t, err)
+	for _, identity := range []*x509.Certificate{node, other} {
+		id, _, paths, err := VerifyObjectSigner([]*x509.Certificate{grant, ca, identity}, root, cluster, now)
+		require.NoError(t, err)
+		require.Equal(t, PeerID(hash), id.ID)
+		require.Equal(t, grant.Raw, paths[0][0].Raw)
+	}
+	_, err = issuer.IssueNode(csr, hash, now, root.NotAfter)
+	require.Error(t, err)
+	template := *node
+	template.SignatureAlgorithm = x509.UnknownSignatureAlgorithm
+	forged, err := x509.CreateCertificate(rand.Reader, &template, ca, nodeKey.Public(), siteKey)
+	require.NoError(t, err)
+	leaf, err := x509.ParseCertificate(forged)
+	require.NoError(t, err)
+	_, err = VerifyNode(leaf, root, x509.ExtKeyUsageServerAuth, now)
+	require.Error(t, err)
+	wire, err := SignObject("private", "publication", []byte("ready"), tls.Certificate{Certificate: [][]byte{grant.Raw, ca.Raw, node.Raw}, PrivateKey: nodeKey})
+	require.NoError(t, err)
+	// A relay can re-encode the unsigned CMS certificate bag. Even a valid
+	// renewal for the same key must not replace the identity used at signing.
+	cms, err := parseCMS(wire)
+	require.NoError(t, err)
+	for i, c := range cms.Certificates {
+		if bytes.Equal(c.FullBytes, node.Raw) {
+			cms.Certificates[i] = raw(other.Raw)
+		}
+	}
+	tampered, err := wrapCMS(cms)
+	require.NoError(t, err)
+	_, _, err = VerifyObjectSignature(tampered, "private", "publication")
+	require.Error(t, err)
 }

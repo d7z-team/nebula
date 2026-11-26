@@ -52,7 +52,8 @@ func (s qStream) Close() error { s.CancelRead(0); return s.Stream.Close() }
 type session struct {
 	acknowledgedIntro             atomic.Int64
 	inventoryOffset               atomic.Uint64
-	localChain                    []*x509.Certificate
+	localGrant, remoteGrant       []*x509.Certificate
+	localNode                     *x509.Certificate
 	until                         time.Time // protected by n.mu
 	probing                       bool      // protected by n.mu
 	n                             *Node
@@ -90,31 +91,6 @@ func (s *session) remoteEndpoint() netip.AddrPort {
 	return s.endpoint
 }
 
-// The first QUIC stream, or TLS before yamux, carries both session parameters.
-func (s *session) exchangeParameters(c io.ReadWriter) error {
-	var out, in [18]byte
-	binary.BigEndian.PutUint16(out[:2], uint16(s.n.o.MaxIPSize))
-	copy(out[2:], s.n.instance[:])
-	if s.outgoing {
-		if _, err := c.Write(out[:]); err != nil {
-			return err
-		}
-	}
-	if _, err := io.ReadFull(c, in[:]); err != nil {
-		return err
-	}
-	s.remoteIPLimit = int(binary.BigEndian.Uint16(in[:2]))
-	copy(s.instance[:], in[2:])
-	if s.remoteIPLimit < 1280 || s.instance == (InstanceID{}) {
-		return errors.New("invalid peer session parameters")
-	}
-	if !s.outgoing {
-		_, err := c.Write(out[:])
-		return err
-	}
-	return nil
-}
-
 func (s *session) open(ctx context.Context) (net.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -143,7 +119,7 @@ func (s *session) close() {
 	}
 }
 
-func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, outgoing bool) (*session, error) {
+func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, outgoing bool, snapshot *credentials) (*session, error) {
 	st := q.ConnectionState()
 	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
 		q.CloseWithError(1, "datagrams required")
@@ -163,7 +139,7 @@ func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, out
 		deadline, _ := ctx.Deadline()
 		stream.SetDeadline(deadline)
 		stop := context.AfterFunc(ctx, func() { stream.CancelRead(0); stream.CancelWrite(0) })
-		err = s.exchangeParameters(stream)
+		err = s.exchangeGrants(ctx, stream, snapshot)
 		stop()
 		// Release any unread bytes on the reserved stream.
 		qStream{stream, q}.Close()
@@ -189,7 +165,8 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	raw.SetDeadline(n.exchangeDeadline(ctx))
 	stop := context.AfterFunc(ctx, func() { raw.Close() })
 	defer stop()
-	cfg := n.tlsConfig(peer, !out)
+	snapshot := n.cred.Load()
+	cfg := n.tlsConfig(peer, out, snapshot)
 	var t *tls.Conn
 	if out {
 		t = tls.Client(raw, cfg)
@@ -202,7 +179,7 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	}
 	s := &session{n: n, kind: "tcp", state: t.ConnectionState(), endpoint: addrPort(raw.RemoteAddr()), path: path, peer: peer, outgoing: out, lease: lease}
 	s.localEndpoint = addrPort(raw.LocalAddr())
-	err := s.exchangeParameters(t)
+	err := s.exchangeGrants(ctx, t, snapshot)
 	if err != nil {
 		raw.Close()
 		return nil, err
@@ -235,41 +212,11 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	return n.register(s)
 }
 
-// authorizationDeadline uses only the two certificate chains presented during this handshake.
-func (s *session) authorizationDeadline(ctx context.Context, p *topologyView) (time.Time, error) {
-	n := s.n
-	local, remote := handshakeUsages(s.outgoing)
-	end, err := n.authorizeChain(ctx, p, n.id, s.localChain, local)
-	if err != nil {
-		return time.Time{}, err
-	}
-	other, err := n.authorizeChain(ctx, p, s.peer, s.state.PeerCertificates, remote)
-	if other.Before(end) {
-		end = other
-	}
-	return end, err
-}
-
 func (n *Node) register(s *session) (*session, error) {
-	var err error
-	s.localChain, err = pki.ParseChain(s.state.LocalCertificate)
-	if err != nil {
-		s.close()
-		return nil, err
-	}
-	s.localIdentity, err = pki.ReadIdentity(s.localChain[0])
-	if err != nil {
-		s.close()
-		return nil, err
-	}
-	s.remoteIdentity, err = pki.ReadIdentity(s.state.PeerCertificates[0])
-	a := s.remoteIdentity.ID
-	if err != nil || a == n.id || s.peer != (PeerID{}) && a != s.peer || len(s.path) > 0 && (s.path[0] != n.id || s.path[len(s.path)-1] != a) {
+	if len(s.path) > 0 && (s.path[0] != n.id || s.path[len(s.path)-1] != s.peer) {
 		s.close()
 		return nil, ErrPathPolicy
 	}
-	s.peer = a
-
 	s.refreshBudget()
 	ctx, cancel := context.WithTimeout(n.ctx, n.o.DialTimeout)
 	defer cancel()

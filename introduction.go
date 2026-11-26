@@ -25,6 +25,7 @@ const (
 )
 
 type introduction struct {
+	pki.Addresses
 	Instance       InstanceID     `json:"instance"`
 	Endpoints      []Endpoint     `json:"endpoints"`
 	RoutedPrefixes []netip.Prefix `json:"routedPrefixes,omitempty"`
@@ -35,16 +36,21 @@ type learnedIntroduction struct {
 	introduction
 	record              statement
 	authorizedUntil     time.Time
-	fingerprint         [sha256.Size]byte
+	grantHash, nodeHash [sha256.Size]byte
 	firstSeen, lastSeen time.Time
 }
 
 type cachedIntroduction struct {
 	introduction
 	record     statement
-	cred       *x509.Certificate
+	grantLeaf  *x509.Certificate // Each reload parses a fresh grant leaf, including node-only renewals.
 	policy     *topologyView
 	candidates []Endpoint // Includes observations omitted from the signed record for size.
+}
+
+func (n *Node) mayAdvertise(p *topologyView, c EndpointCandidate) bool {
+	allow := n.o.Transport.AllowAdvertiseEndpoint
+	return p.physicalEndpoint(c.Endpoint) && (allow == nil || allow(c))
 }
 
 // Keep configured endpoints ahead of listener addresses and optional observations.
@@ -53,57 +59,54 @@ func (n *Node) introductionEndpoints(p *topologyView, includeObserved bool) ([]E
 		return nil, 0
 	}
 	var endpoints []Endpoint
-	add := func(candidates ...Endpoint) {
-		for _, ep := range candidates {
-			if len(endpoints) == maxIntroductionEndpoints {
-				return
-			}
-			if p.physicalEndpoint(ep) && !slices.Contains(endpoints, ep) {
-				endpoints = append(endpoints, ep)
-			}
+	add := func(c EndpointCandidate) {
+		if len(endpoints) < maxIntroductionEndpoints && n.mayAdvertise(p, c) && !slices.Contains(endpoints, c.Endpoint) {
+			endpoints = append(endpoints, c.Endpoint)
 		}
 	}
-	add(n.o.Transport.AdvertiseEndpoints...)
-	add(p.members[n.id].Endpoints...)
+	for _, ep := range n.o.Transport.AdvertiseEndpoints {
+		add(EndpointCandidate{Endpoint: ep, Source: EndpointFromConfig})
+	}
+	for _, ep := range p.members[n.id].Endpoints {
+		add(EndpointCandidate{Endpoint: ep, Source: EndpointFromTopology})
+	}
 	for _, pc := range []net.PacketConn{n.o.Transport.UDP4, n.o.Transport.UDP6} {
 		if pc != nil {
-			add(Endpoint{"udp", addrPort(pc.LocalAddr())})
+			add(EndpointCandidate{Endpoint: Endpoint{"udp", addrPort(pc.LocalAddr())}, Source: EndpointFromListener})
 		}
 	}
 	for _, l := range []net.Listener{n.o.Transport.TCP4, n.o.Transport.TCP6} {
 		if l != nil {
-			add(Endpoint{"tcp", addrPort(l.Addr())})
+			add(EndpointCandidate{Endpoint: Endpoint{"tcp", addrPort(l.Addr())}, Source: EndpointFromListener})
 		}
 	}
 	fixed := len(endpoints)
 	if !includeObserved {
 		return endpoints, fixed
 	}
-	var observed []Endpoint
+	var observed []EndpointCandidate
 	now := time.Now()
 	n.mu.Lock()
 	for source, entry := range n.observations {
 		if !now.Before(entry.expires) {
 			delete(n.observations, source)
 		} else if fixed < maxIntroductionEndpoints {
-			observed = append(observed, Endpoint{"udp", entry.endpoint})
+			observed = append(observed, EndpointCandidate{Endpoint{"udp", entry.endpoint}, EndpointFromObservation, source.peer})
 		}
 	}
 	n.mu.Unlock()
-	slices.SortFunc(observed, func(a, b Endpoint) int { return a.Address.Compare(b.Address) })
-	add(observed...)
+	slices.SortFunc(observed, func(a, b EndpointCandidate) int { return a.Endpoint.Address.Compare(b.Endpoint.Address) })
+	for _, c := range observed {
+		add(c)
+	}
 	return endpoints, fixed
 }
 
-func (n *Node) buildIntroduction(p *topologyView, signer tls.Certificate, endpoints []Endpoint, expires time.Time) (introduction, error) {
-	intro := introduction{Instance: n.instance, Endpoints: endpoints, Expires: expires.UTC()}
-	scope, _, err := pki.CertificateScope(signer.Leaf)
-	if err != nil {
-		return introduction{}, err
-	}
+func (n *Node) buildIntroduction(p *topologyView, id pki.Identity, endpoints []Endpoint, expires time.Time) introduction {
+	intro := introduction{Addresses: id.Addresses, Instance: n.instance, Endpoints: endpoints, Expires: expires.UTC()}
 	seen := make(map[netip.Prefix]bool)
 	for _, active := range p.members[n.id].RoutedPrefixes {
-		for _, grant := range scope.RoutedPrefixes {
+		for _, grant := range id.RoutedPrefixes {
 			if !active.Overlaps(grant) {
 				continue
 			}
@@ -117,18 +120,15 @@ func (n *Node) buildIntroduction(p *topologyView, signer tls.Certificate, endpoi
 			}
 		}
 	}
-	return intro, nil
+	return intro
 }
 
-func (n *Node) validateIntroduction(p *topologyView, signer tls.Certificate) error {
+func (n *Node) validateIntroduction(p *topologyView, cred *credentials) error {
 	endpoints, _ := n.introductionEndpoints(p, false)
 	// A future refresh can use all nine fractional digits of RFC 3339.
 	expires := time.Unix(time.Now().Unix(), 999999999)
-	intro, err := n.buildIntroduction(p, signer, endpoints, expires)
-	if err != nil {
-		return err
-	}
-	if err := n.checkIntroductionSize(p, signer, intro); err != nil {
+	intro := n.buildIntroduction(p, cred.identity, endpoints, expires)
+	if err := n.checkIntroductionSize(p, cred.cmsSigner, intro); err != nil {
 		return fmt.Errorf("local introduction (CMS limit %d bytes): %w", pki.MaxDocument, err)
 	}
 	return nil
@@ -151,14 +151,12 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 	n.introMu.Lock()
 	defer n.introMu.Unlock()
 	cache := &n.introCache
-	signer := n.cred.Load().Object
-	if cache.policy == p && cache.cred == signer.Leaf && now.Add(introductionRefreshLead).Before(cache.Expires) && slices.Equal(endpoints, cache.candidates) {
+	cred := n.cred.Load()
+	signer := cred.cmsSigner
+	if cache.policy == p && cache.grantLeaf == signer.Leaf && now.Add(introductionRefreshLead).Before(cache.Expires) && slices.Equal(endpoints, cache.candidates) {
 		return *cache
 	}
-	intro, err := n.buildIntroduction(p, signer, endpoints, now.Add(introductionLifetime))
-	if err != nil {
-		return cachedIntroduction{}
-	}
+	intro := n.buildIntroduction(p, cred.identity, endpoints, now.Add(introductionLifetime))
 	record, err := n.signStatement("introduction", intro, signer)
 	if errors.Is(err, pki.ErrDocumentTooLarge) && len(endpoints) > fixed {
 		// The fixed prefix fits and the full list overflowed. Find how many
@@ -173,7 +171,7 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 	if err != nil {
 		return cachedIntroduction{}
 	}
-	*cache = cachedIntroduction{introduction: intro, record: record, cred: signer.Leaf, policy: p, candidates: endpoints}
+	*cache = cachedIntroduction{introduction: intro, record: record, grantLeaf: signer.Leaf, policy: p, candidates: endpoints}
 	return *cache
 }
 
@@ -189,6 +187,9 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 	if json.Unmarshal(body, &v) != nil || v.Instance == (InstanceID{}) || !now.Before(v.Expires) || v.Expires.After(now.Add(introductionLifetime+introductionClockSkew)) || len(v.Endpoints) > maxIntroductionEndpoints {
 		return a, false
 	}
+	if v.Addresses != identity.Addresses {
+		return a, false
+	}
 	if reply != nil && !v.match(*reply, a, p.cluster.Subnet(reply.IP).IsValid()).IsValid() {
 		return a, false
 	}
@@ -202,12 +203,10 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 			return a, false
 		}
 	}
-	if v.Expires.Before(end) {
-		end = v.Expires
-	}
+	end = earlierDeadline(v.Expires, end)
 	intro := learnedIntroduction{
 		introduction: v, record: record, authorizedUntil: end,
-		fingerprint: sha256.Sum256(identity.leaf.Raw), firstSeen: now, lastSeen: now,
+		grantHash: sha256.Sum256(identity.leaf.Raw), nodeHash: sha256.Sum256(identity.node.Raw), firstSeen: now, lastSeen: now,
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -218,7 +217,7 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 	if a == n.id {
 		bound = n.instance
 	}
-	addressConflict := n.conflictingOwnerLocked(a)
+	addressConflict := n.addressConflictLocked(identity.Identity)
 	if addressConflict || bound != (InstanceID{}) && bound != v.Instance {
 		decision := "instance mismatch"
 		if addressConflict {
@@ -238,7 +237,7 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 		}
 		return a, true
 	}
-	if old.Instance == v.Instance && old.fingerprint == intro.fingerprint {
+	if old.Instance == v.Instance && old.grantHash == intro.grantHash && old.nodeHash == intro.nodeHash {
 		intro.firstSeen = old.firstSeen
 		if slices.Equal(old.record, record) {
 			intro.lastSeen = old.lastSeen
@@ -254,15 +253,15 @@ func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *q
 		n.introduced[e][a] = end
 	}
 	n.discovered[a] = intro
-	n.discoveredOwners[a.IPv4()] = a
-	n.discoveredOwners[a.IPv6()] = a
+	n.discoveredOwners[v.IPv4] = a
+	n.discoveredOwners[v.IPv6] = a
 	return a, true
 }
 
 // Remove the derived indexes together when replacing or expiring a signed introduction.
 func (n *Node) forgetIntroductionLocked(peer PeerID, old learnedIntroduction) {
 	delete(n.discovered, peer)
-	for _, addr := range []netip.Addr{peer.IPv4(), peer.IPv6()} {
+	for _, addr := range []netip.Addr{old.IPv4, old.IPv6} {
 		if n.discoveredOwners[addr] == peer {
 			delete(n.discoveredOwners, addr)
 		}

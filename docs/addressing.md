@@ -1,6 +1,6 @@
 # 集群地址与 IP 交付
 
-集群 CA 声明成员子网、下游路由上限和服务地址池。每个成员以叶证书中的一对主地址认证。节点可通过已有邻居发现其他成员的主地址，宿主在本机拓扑中另行批准网关前缀、服务 VIP 和组投递。下面的示例用三个节点验证广播、组播和任播交付。[示例源码](../examples/addressing/main.go)
+集群 CA 声明成员子网、下游路由上限和服务地址池。每个成员通过节点公钥认证，集群授权叶证书指定其一对主地址。节点可通过已有邻居发现其他成员的主地址，宿主在本机拓扑中另行批准网关前缀、服务 VIP 和组投递。下面的示例用三个节点验证广播、组播和任播交付。[示例源码](../examples/addressing/main.go)
 
 ```sh
 go run ./examples/addressing
@@ -10,10 +10,22 @@ go run ./examples/addressing
 
 1. 在集群 CA 的 `CAProfile.PermittedIPs` 设置一个 IPv4 和一个 IPv6 成员网段，例如 `10.13.0.0/24` 和 `fd13::/64`。这些 CIDR 写入标准 X.509 IP Name Constraints，共同定义一条逻辑链路。站点 CA 在上级委派的双栈范围内签发地址。
 2. 在 `Scope.RoutedPrefixes` 设置可下放的业务路由，在 `Scope.AnycastPools` 预留服务池。服务池可在成员网段内，也可独立分配。站点 CA 省略 mesh 扩展时继承上述授权上限。
-3. 每个节点的两个独占主地址共同构成 `PeerID`。叶证书用 `Scope.AnycastIPs` 授权精确 VIP，用 `Scope.RoutedPrefixes` 授权下游前缀。客户端、服务端使用不同凭据时，各方向要分别授权。
-4. 将信任根和固定的集群 CA 填入 `Options.Auth.Roots` 和 `Options.Auth.ClusterCA`。启动前可用 `pki.ReadClusterCA(cert)` 和 `topology.Validate(cluster)` 预检地址规划，运行中用 `node.Cluster()` 读取同一规划。[CA 签发参数与证书字段](pki.md#证书配置)
+3. 在拓扑条目中分别填入公钥指纹 `Member.ID` 和授权中的两个独占主地址。叶证书用 `Scope.AnycastIPs` 授权精确 VIP，用 `Scope.RoutedPrefixes` 授权下游前缀。
+4. 将信任根和固定的集群 CA 填入 `Options.Auth.RootCA` 和 `Options.Auth.ClusterCA`。启动前可用 `pki.ReadClusterCA(cert)` 和 `topology.Validate(cluster)` 预检地址规划，运行中用 `node.Cluster()` 读取同一规划。[CA 签发参数与证书字段](pki.md#证书配置)
 
-`v4, v6 := cluster.MemberPrefixes()` 返回集群前缀，`cluster.AnycastPools()` 返回服务池副本。分配器可用 `cluster.MemberAddresses(within)` 枚举集群内任意规范子范围，按集群前缀判断网络边界，用 `cluster.ValidateMember(id)` 检查一对指定地址。宿主在自己的持久化分配表中分别为 IPv4 和 IPv6 建唯一约束，在同一事务中预留这对地址，再签发证书。IPv4 普通子网保留网络地址和定向广播地址，/31 和 /32 可使用所有地址。IPv6 普通子网保留全零接口标识，/127 和 /128 可使用所有地址。成员分配会跳过 VIP 池和排除范围。下级 CA 进一步收窄的 SAN 范围只影响签发权限，逻辑链路边界始终取集群 CA 的子网。[分配 API](../pki/cluster.go) · [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021) · [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164)
+`cluster.MemberPrefixes()` 返回两个 `netip.Prefix`。在其中一个前缀或其规范子范围内，用 `cluster.MemberAddresses(within)` 枚举可分配地址。为节点选定 IPv4 和 IPv6 后，按地址检查，再由宿主在同一事务中预留两个唯一地址。
+
+```go
+pair := pki.Addresses{
+    IPv4: netip.MustParseAddr("10.13.0.2"),
+    IPv6: netip.MustParseAddr("fd13::2"),
+}
+if err := cluster.ValidateMember(pair); err != nil {
+    return err
+}
+```
+
+分配器跳过 VIP 池和 CA 排除的范围。IPv4 保留集群网段的网络地址和定向广播地址，/31 和 /32 没有这两项保留。IPv6 保留集群网段的全零接口标识，/127 和 /128 除外。站点 CA 的 SAN 范围进一步限制可签发的主地址，逻辑链路边界仍取集群前缀。[分配 API](../pki/cluster.go) · [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021) · [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164)
 
 多个成员可以共同承载同一 VIP 或下游前缀。核对运行中观察到的主地址、VIP 或网关声明时，在相关节点调用 `InspectIP(ip)`。[排查与恢复](integration.md#排查重复地址与实例)
 
@@ -43,7 +55,7 @@ go run ./examples/addressing
 
 VIP 或下游地址使用零 ID 时，端口在入队前调用一次可选的 `ResolveNextHop(dst, packet)`。回调收到只读包，可以查询节点或应用的流绑定表。回调结束后，端口用最新拓扑重新检查所选成员；回调返回的错误直接交给写入方。显式下一跳、已归属的主地址和组流量均跳过回调。调用方未配置解析器或解析器返回零 ID 时，写入返回 `ErrNextHopRequired`。目的为本机尚未知的普通主地址时，先显式调用 `ResolveIP(ctx, dst)`，选中结果后可调用 `ConnectPeerID(ctx, match.Peer)`，向该身份写包。
 
-查询下游地址得到多个候选时，应用可按流选定网关。宿主核准网关及其下游前缀后，用 `ApplyTopology` 安装本机视图。实际收发时还会校验会话证书中的地址授权。[地址查询与缓存](integration.md#按地址发现成员和下游网关) · [IP 端口](../ip_port.go)
+查询下游地址得到多个候选时，应用可按流选定网关。宿主核准网关及其下游前缀后，用 `ApplyTopology` 安装本机视图。实际收发时会核对该会话出示的集群授权。[地址查询与缓存](integration.md#按地址发现成员和下游网关) · [IP 端口](../ip_port.go)
 
 网关的 `RoutedPrefixes` 同时批准发往该范围的目的地址以及网关代表的源地址，支持下游主动发起的连接。已有默认出口时，调用 `RefreshIP(ctx, dst)` 可查询新加入的站点网关。给两个网关分别批准 `0.0.0.0/0` 与站点 `/24` 后，宿主可优先经站点网关发包；入站时两者都可以代表该站点。宿主可用 `InboundPolicy` 收窄入站来源。双栈默认出口另外需要批准 `::/0`。成员网段中的未分配地址和已保留的服务池始终按各自规则交付。[双出口示例](../examples/gateway/main.go)
 
@@ -56,7 +68,7 @@ VIP 或下游地址使用零 ID 时，端口在入队前调用一次可选的 `R
 
 ## 任播服务
 
-例如成员 `10.13.0.2` 和 `10.13.0.3` 均提供 `10.13.0.200`。给两张叶证书各授权这个精确 VIP，在这两个 `Member.AnycastIPs` 中分别启用它。两台机器仍使用各自唯一的双栈主地址建立 TLS 会话。实例返回的业务包可以用该 VIP 作源，接收端对回包执行同样的拓扑和证书检查。网关拥有的默认路由也须遵守成员地址和 VIP 的专属授权。
+例如成员 `10.13.0.2` 和 `10.13.0.3` 均提供 `10.13.0.200`。在两个节点的集群授权叶证书中分别列出这个 VIP，并在各自的 `Member.AnycastIPs` 中启用。两台机器以各自的节点公钥完成 TLS 认证，随后出示同钥授权，证明各自的双栈主地址及共享 VIP。实例返回的业务包可以用该 VIP 作源，接收端对回包执行同样的拓扑和证书检查。网关拥有的默认路由也须遵守成员地址和 VIP 的专属授权。
 
 **有状态服务的排空。** 宿主在建立 TCP 连接时绑定实例的完整 `PeerID`。定向探测向这个实例的 VIP 和业务端口发起请求，检查应用响应。计划摘流时，将新连接交给其他实例，保留旧绑定和 VIP 授权直至连接结束。紧急撤权时，从本机拓扑撤回该成员的 VIP，端口会清理失权的等待包。已选实例拨号失败或失权时，宿主决定后续连接的去向。[可运行的 TCP 排空示例](../examples/anycast/main.go)
 

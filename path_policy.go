@@ -33,12 +33,12 @@ func (n *Node) usableLocked(s *session) bool {
 }
 
 func (n *Node) sessionAllowedLocked(s *session) bool {
-	p := n.policy.Load()
-	if !time.Now().Before(s.until) || !n.memberOf(p) {
-		return false
-	}
+	return time.Now().Before(s.until) && n.pathAllowedLocked(s)
+}
+
+func (n *Node) pathAllowedLocked(s *session) bool {
 	if len(s.path) > 0 {
-		return s.lease.allowedLocked()
+		return s.lease != nil && s.lease.allowedLocked()
 	}
 	return n.modeLocked(s.peer).allowsDirect()
 }
@@ -53,7 +53,7 @@ func (n *Node) modeLocked(a PeerID) PathMode {
 		return Blocked
 	}
 	m := p.members[n.id]
-	if !p.acceptsIdentity(a) {
+	if a == (PeerID{}) {
 		return Blocked
 	}
 	if (m.Restricted || p.members[a].Restricted) && !slices.Contains(m.Links, a) {
@@ -65,11 +65,11 @@ func (n *Node) modeLocked(a PeerID) PathMode {
 	return mode
 }
 
-// SetPeerPathPolicy applies a local policy to an exact address pair and prunes
+// SetPeerPathPolicy applies a local policy to a node public-key identity and prunes
 // disallowed paths. A valid remote identity may be configured before discovery
 // or Start. Auto clears its override.
 func (n *Node) SetPeerPathPolicy(peer PeerID, mode PathMode) error {
-	if peer == n.id || mode > Blocked || n.Cluster().ValidateMember(peer) != nil {
+	if peer == n.id || mode > Blocked || peer == (PeerID{}) {
 		return ErrPathPolicy
 	}
 	n.mu.Lock()
@@ -93,7 +93,7 @@ func (n *Node) SetPeerPathPolicy(peer PeerID, mode PathMode) error {
 func (n *Node) PeerPathPolicy(peer PeerID) (configured, effective PathMode) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if peer == n.id || n.state == closed || n.Cluster().ValidateMember(peer) != nil {
+	if peer == n.id || n.state == closed || peer == (PeerID{}) {
 		return n.modes[peer], Blocked
 	}
 	return n.modes[peer], n.modeLocked(peer)

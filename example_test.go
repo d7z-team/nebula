@@ -67,12 +67,9 @@ func ExampleTopology_Validate() {
 	// A host can preflight its approved topology before binding any sockets.
 	topology := nebula.Topology{
 		Network: "demo",
-		Members: []nebula.Member{{
-			IPv4: netip.MustParseAddr("10.13.0.1"),
-			IPv6: netip.MustParseAddr("fd13::1"),
-		}},
+		Members: []nebula.Member{demo.NewHost(1).Member},
 	}
-	issuer, err := demo.NewIssuer()
+	_, issuer, err := demo.NewIssuers()
 	if err != nil {
 		panic(err)
 	}
@@ -98,6 +95,7 @@ func ExampleNode_ResolveIP() {
 	if err != nil {
 		panic(err)
 	}
+	opts[0].Auth.TrustedEntrypoints = []nebula.PeerID{gateway.ID}
 	opts[0].Topology.Members = []nebula.Member{client.Member}
 	nodes, err := demo.Listen(ctx, "tcp", opts)
 	if err != nil {
@@ -120,7 +118,7 @@ func ExampleNode_ResolveIP() {
 		panic(err)
 	}
 	for _, m := range matches {
-		fmt.Println(m.Peer, m.Prefix)
+		fmt.Println(m.Peer == gateway.ID, m.Prefix)
 	}
-	// Output: 10.13.0.2@fd13::2 172.30.0.0/24
+	// Output: true 172.30.0.0/24
 }

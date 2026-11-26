@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -37,11 +38,12 @@ type lab struct {
 	net    *network
 	top    nebula.Topology
 	issuer pki.Issuer
-	roots  *x509.CertPool
+	root   pki.Issuer
 	hosts  []*host
 }
 
 type host struct {
+	key        crypto.Signer
 	index      int
 	ip         netip.Addr
 	options    nebula.Options
@@ -49,57 +51,56 @@ type host struct {
 	node       *nebula.Node
 }
 
-func labPeer(ip netip.Addr) nebula.PeerID {
-	id, err := pki.NewPeerID(ip, netip.MustParseAddr(fmt.Sprintf("fd42::%x", ip.As4()[3])))
-	if err != nil {
-		panic(err)
-	}
-	return id
-}
-
 func newLab(t *testing.T) *lab {
 	t.Helper()
 	key, err := pki.GenerateKey("ed25519")
 	require.NoError(t, err)
 	now := time.Now()
-	root, err := pki.CreateRoot(key, pki.CAProfile{
+	rootKey, err := pki.GenerateKey("ed25519")
+	require.NoError(t, err)
+	anchor, err := pki.CreateRoot(rootKey, pki.CAProfile{Subject: pkix.Name{CommonName: "ordinary root"}, NotBefore: now.Add(-2 * time.Hour), NotAfter: now.Add(2 * time.Hour), MaxPathLen: 2})
+	require.NoError(t, err)
+	authority := pki.Issuer{Chain: []*x509.Certificate{anchor}, Signer: rootKey}
+	csr, err := pki.CreateCSR(key, pkix.Name{})
+	require.NoError(t, err)
+	clusterCA, err := authority.IssueCA(csr, pki.CAProfile{
 		Scope: &pki.Scope{
 			Network: "lab", Cluster: true,
 			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
 			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27"), netip.MustParsePrefix("fd42::c0/123"), netip.MustParsePrefix("192.0.2.200/32")},
 		},
 		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd42::/64")},
-		MaxPathLen:   1, Subject: pkix.Name{CommonName: "test root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
-	})
+		MaxPathLen:   1, Subject: pkix.Name{CommonName: "test cluster"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+	}, sha256.Sum256(csr.RawSubjectPublicKeyInfo))
 	require.NoError(t, err)
-	l := &lab{
-		t: t, net: newNetwork(), roots: x509.NewCertPool(), issuer: pki.Issuer{Chain: []*x509.Certificate{root}, Signer: key},
+	return &lab{
+		t: t, net: newNetwork(), root: authority, issuer: pki.Issuer{Chain: []*x509.Certificate{clusterCA}, Signer: key},
 		top: nebula.Topology{
 			Network: "lab",
 		},
 	}
-	l.roots.AddCert(root)
-	return l
 }
 
-func issueCredentials(t *testing.T, issuer pki.Issuer, m nebula.Member, algorithm string) nebula.LocalCertificates {
+func (l *lab) issueCredentials(h *host, issuer pki.Issuer) nebula.LocalCertificates {
+	t := l.t
 	t.Helper()
-	key, err := pki.GenerateKey(algorithm)
-	require.NoError(t, err)
+	key, m := h.key, l.top.Members[h.index]
 	req, err := pki.CreateCSR(key, pkix.Name{})
 	require.NoError(t, err)
-	leaf, err := issuer.IssueLeaf(req, pki.Enrollment{
+	approved := sha256.Sum256(req.RawSubjectPublicKeyInfo)
+	leaf, err := issuer.IssueGrant(req, pki.Enrollment{
 		Scope: pki.Scope{Network: "lab", RoutedPrefixes: m.RoutedPrefixes, AnycastIPs: m.AnycastIPs}, IPv4: m.IPv4, IPv6: m.IPv6,
-		Usages:        []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageCodeSigning},
-		PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo),
+		PublicKeyHash: approved,
 		NotBefore:     time.Now().Add(-time.Minute), NotAfter: time.Now().Add(30 * time.Minute),
 	})
 	require.NoError(t, err)
 	chain := [][]byte{leaf.Raw}
-	for _, ca := range issuer.Chain[:len(issuer.Chain)-1] {
+	for _, ca := range issuer.Chain {
 		chain = append(chain, ca.Raw)
 	}
-	return nebula.LocalCertificates{Client: tls.Certificate{Certificate: chain, PrivateKey: key, Leaf: leaf}}
+	node, err := l.root.IssueNode(req, approved, leaf.NotBefore, leaf.NotAfter)
+	require.NoError(t, err)
+	return nebula.LocalCertificates{Node: tls.Certificate{Certificate: [][]byte{node.Raw}, PrivateKey: key, Leaf: node}, Grant: chain}
 }
 
 // Each host owns its underlay stack. All TCP dials, including failed dials,
@@ -108,9 +109,13 @@ func (l *lab) host(segment, physical, via, transport string, publish bool) *host
 	l.t.Helper()
 	number := len(l.hosts) + 1
 	ip := netip.MustParseAddr(fmt.Sprintf("10.13.0.%d", number))
-	member := nebula.Member{IPv4: ip, IPv6: labPeer(ip).IPv6(), PublishTopics: []string{"app/test"}}
-	h := &host{index: len(l.hosts), ip: ip, options: nebula.Options{
-		Auth:                nebula.AuthOptions{Roots: l.roots, ClusterCA: l.issuer.Chain[0]},
+	key, err := pki.GenerateKey("ed25519")
+	require.NoError(l.t, err)
+	id, err := pki.NewPeerID(key.Public())
+	require.NoError(l.t, err)
+	member := nebula.Member{ID: id, IPv4: ip, IPv6: netip.MustParseAddr(fmt.Sprintf("fd42::%x", number)), PublishTopics: []string{"app/test"}}
+	h := &host{key: key, index: len(l.hosts), ip: ip, options: nebula.Options{
+		Auth:                nebula.AuthOptions{RootCA: l.root.Chain[0], ClusterCA: l.issuer.Chain[0]},
 		MaintenanceInterval: 140 * time.Millisecond,
 		DialTimeout:         650 * time.Millisecond,
 	}}
@@ -190,15 +195,15 @@ func (l *lab) addUnderlay(h *host, segment, physical, via, transport string, pub
 
 func (l *lab) link(a, b *host) {
 	left, right := &l.top.Members[a.index], &l.top.Members[b.index]
-	left.Links = append(left.Links, labPeer(b.ip))
-	right.Links = append(right.Links, labPeer(a.ip))
+	left.Links = append(left.Links, l.top.Members[b.index].ID)
+	right.Links = append(right.Links, l.top.Members[a.index].ID)
 }
 
 func (l *lab) start() {
 	l.t.Helper()
 	for _, h := range l.hosts {
-		if h.options.Auth.Certificates.Client.PrivateKey == nil {
-			h.options.Auth.Certificates = issueCredentials(l.t, l.issuer, l.top.Members[h.index], "ed25519")
+		if h.options.Auth.Certificates.Node.PrivateKey == nil {
+			h.options.Auth.Certificates = l.issueCredentials(h, l.issuer)
 		}
 		o := h.options
 		o.Topology = l.top
@@ -228,7 +233,7 @@ func waitPath(t *testing.T, a, b *host, kind string) nebula.PathStatus {
 		path, ok = a.node.PreferredPath(b.node.ID())
 		return ok && path.Transport == kind
 	}, 12*time.Second, 15*time.Millisecond, "%s -> %s: expected active %s", a.ip, b.ip, kind)
-	t.Logf("path %s -> %s via %s endpoint=%s circuit=%v serial=%s localSerial=%s", a.ip, b.ip, kind, path.Endpoint, path.Circuit, path.Serial, path.LocalSerial)
+	t.Logf("path %s -> %s via %s endpoint=%s circuit=%v serial=%s localSerial=%s", a.ip, b.ip, kind, path.Endpoint, path.Circuit, path.GrantSerial, path.LocalGrantSerial)
 	return path
 }
 
@@ -290,7 +295,7 @@ func publicationReceipt(t *testing.T, a, b *host, payload string) {
 		select {
 		case publication := <-sub.Publications():
 			if publication.ID == id {
-				require.Equal(t, labPeer(a.ip), publication.Origin)
+				require.Equal(t, a.node.ID(), publication.Origin)
 				require.Equal(t, payload, string(publication.Payload))
 				return
 			}
@@ -306,15 +311,20 @@ func TestMixedTLSCredentials(t *testing.T) {
 			l := newLab(t)
 			a := l.host("wan", "192.0.2.1", "", tc.transport, true)
 			b := l.host("wan", "192.0.2.2", "", tc.transport, true)
-			a.options.Auth.Certificates = issueCredentials(t, l.issuer, l.top.Members[a.index], tc.client)
-			b.options.Auth.Certificates = issueCredentials(t, l.issuer, l.top.Members[b.index], tc.server)
+			for i, h := range []*host{a, b} {
+				key, err := pki.GenerateKey([]string{tc.client, tc.server}[i])
+				require.NoError(t, err)
+				h.key = key
+				l.top.Members[h.index].ID, err = pki.NewPeerID(key.Public())
+				require.NoError(t, err)
+			}
 			l.start()
 			p := l.connect(a, b, tc.transport)
 			require.EqualValues(t, tls.VersionTLS13, p.TLSVersion)
 			require.Equal(t, meshwire.ALPN, p.ALPN)
 			require.Equal(t, tls.X25519MLKEM768, p.TLSGroup)
-			require.Equal(t, b.options.Auth.Certificates.Client.Leaf.SerialNumber.String(), p.Serial)
-			require.Equal(t, a.options.Auth.Certificates.Client.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).Serial)
+			require.Equal(t, b.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), p.NodeSerial)
+			require.Equal(t, a.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).NodeSerial)
 			publicationReceipt(t, a, b, "client publication")
 			publicationReceipt(t, b, a, "server publication")
 		})
@@ -330,12 +340,12 @@ func TestDualUnderlayFamilyFailover(t *testing.T) {
 			l.addUnderlay(a, "wan6", "2001:db8::1", "", kind, true)
 			l.addUnderlay(b, "wan6", "2001:db8::2", "", kind, true)
 			l.start()
-			require.NoError(t, a.node.ConnectPeer(t.Context(), labPeer(b.ip).IPv6()))
+			require.NoError(t, a.node.ConnectPeer(t.Context(), b.node.Addresses().IPv6))
 			first := waitPath(t, a, b, kind)
 			require.True(t, first.Endpoint.Addr().Is4())
 			left, right := l.business(a), l.business(b)
 			c4, s4 := tcpPair(t, left, right, b.ip.String(), ipv4.ProtocolNumber)
-			c6, s6 := tcpPair(t, left, right, b.node.ID().IPv6().String(), ipv6.ProtocolNumber)
+			c6, s6 := tcpPair(t, left, right, b.node.Addresses().IPv6.String(), ipv6.ProtocolNumber)
 			roundTrip(t, c4, s4)
 			roundTrip(t, c6, s6)
 			l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.segment == "wan4"} })

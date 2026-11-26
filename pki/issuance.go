@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"net"
@@ -36,7 +37,6 @@ type Enrollment struct {
 	Name       string
 	IPv4, IPv6 netip.Addr
 	Scope
-	Usages              []x509.ExtKeyUsage
 	PublicKeyHash       [32]byte
 	NotBefore, NotAfter time.Time
 }
@@ -108,6 +108,9 @@ func CreateRoot(key crypto.Signer, p CAProfile) (*x509.Certificate, error) {
 	if key == nil {
 		return nil, errors.New("CA signing key required")
 	}
+	if p.Scope != nil || len(p.PermittedIPs) != 0 {
+		return nil, errors.New("ordinary root cannot carry network constraints")
+	}
 	c, err := caTemplate(p)
 	if err != nil {
 		return nil, err
@@ -150,6 +153,11 @@ func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile, approvedKeyH
 	if err := verifyRequest(csr, approvedKeyHash); err != nil {
 		return nil, err
 	}
+	if p.Scope != nil && p.Scope.Cluster {
+		if err := ValidateRoot(parent); err != nil {
+			return nil, err
+		}
+	}
 	for i, c := range ca.Chain {
 		if (c.MaxPathLenZero || c.MaxPathLen > 0) && (p.MaxPathLen < 0 || p.MaxPathLen > c.MaxPathLen-i-1) {
 			return nil, errors.New("issuer path length exceeded")
@@ -158,6 +166,9 @@ func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile, approvedKeyH
 	cluster, err := checkDelegation(p.Scope, ca.Chain)
 	if err != nil {
 		return nil, err
+	}
+	if cluster == nil && (p.Scope == nil || !p.Scope.Cluster) {
+		return nil, errors.New("site CA requires a cluster issuer")
 	}
 	if cluster != nil {
 		if _, err := ReadClusterCA(cluster); err != nil {
@@ -174,9 +185,9 @@ func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile, approvedKeyH
 	return issue(c, parent, csr.PublicKey, ca.Signer)
 }
 
-// IssueLeaf checks the CSR signature and approved public key hash, then issues
-// a certificate with the addresses, scope and usages specified by the issuer.
-func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Certificate, error) {
+// IssueGrant checks the CSR signature and approved public key hash, then issues
+// a code-signing grant for the approved addresses and network permissions.
+func (ca Issuer) IssueGrant(csr *x509.CertificateRequest, e Enrollment) (*x509.Certificate, error) {
 	parent, err := ca.authority(time.Now())
 	if err != nil {
 		return nil, err
@@ -184,14 +195,7 @@ func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Ce
 	if err := verifyRequest(csr, e.PublicKeyHash); err != nil {
 		return nil, err
 	}
-	if len(e.Usages) == 0 {
-		return nil, errors.New("enrollment must specify certificate usages")
-	}
-	t := &x509.Certificate{Subject: pkix.Name{CommonName: e.Name}, NotBefore: e.NotBefore, NotAfter: e.NotAfter, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: e.Usages}
-	id, err := NewPeerID(e.IPv4, e.IPv6)
-	if err != nil {
-		return nil, err
-	}
+	t := &x509.Certificate{Subject: pkix.Name{CommonName: e.Name}, NotBefore: e.NotBefore, NotAfter: e.NotAfter, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}}
 	clusterCA, err := checkDelegation(&e.Scope, ca.Chain)
 	if err != nil {
 		return nil, err
@@ -200,7 +204,7 @@ func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Ce
 	if err != nil {
 		return nil, err
 	}
-	if err := cluster.validateIdentity(Identity{id, e.Scope}); err != nil {
+	if err := cluster.validateIdentity(Identity{Addresses: Addresses{e.IPv4, e.IPv6}, Scope: e.Scope}); err != nil {
 		return nil, err
 	}
 	ext, err := e.Scope.extension()
@@ -218,21 +222,51 @@ func (ca Issuer) IssueLeaf(csr *x509.CertificateRequest, e Enrollment) (*x509.Ce
 	if err != nil {
 		return nil, err
 	}
-	// Use the supplied issuance path as the local trust decision. PKIX treats
-	// multiple requested usages as alternatives, so verify each separately.
+	// Check the issued grant against the supplied delegation path.
 	roots := x509.NewCertPool()
 	roots.AddCert(ca.Chain[len(ca.Chain)-1])
-	chain := append([]*x509.Certificate{leaf}, ca.Chain[:len(ca.Chain)-1]...)
+	intermediates := x509.NewCertPool()
+	for _, cert := range ca.Chain[:len(ca.Chain)-1] {
+		intermediates.AddCert(cert)
+	}
 	at := leaf.NotBefore
 	for _, issuer := range ca.Chain {
 		if issuer.NotBefore.After(at) {
 			at = issuer.NotBefore
 		}
 	}
-	for _, usage := range e.Usages {
-		if _, err := VerifyChain(chain, roots, cluster, id, usage, at); err != nil {
-			return nil, fmt.Errorf("issue leaf for %v: %w", usage, err)
-		}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, CurrentTime: at, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}}); err != nil {
+		return nil, err
 	}
 	return leaf, nil
+}
+
+// IssueNode issues an address-free node identity directly from an ordinary root.
+func (ca Issuer) IssueNode(csr *x509.CertificateRequest, approved [32]byte, start, end time.Time) (*x509.Certificate, error) {
+	root, err := ca.authority(time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateRoot(root); err != nil {
+		return nil, err
+	}
+	if err := verifyRequest(csr, approved); err != nil {
+		return nil, err
+	}
+	template := &x509.Certificate{
+		Subject: pkix.Name{CommonName: nodeCommonName}, NotBefore: start, NotAfter: end,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		UnknownExtKeyUsage: []asn1.ObjectIdentifier{nodeUsage},
+	}
+	node, err := issue(template, root, csr.PublicKey, ca.Signer)
+	if err != nil {
+		return nil, err
+	}
+	for _, usage := range template.ExtKeyUsage {
+		if _, err := VerifyNode(node, root, usage, node.NotBefore); err != nil {
+			return nil, err
+		}
+	}
+	return node, nil
 }

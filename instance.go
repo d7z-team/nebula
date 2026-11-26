@@ -7,6 +7,8 @@ import (
 	"errors"
 	"slices"
 	"time"
+
+	"code.d7z.net/d7z-team/nebula/pki"
 )
 
 // InstanceID identifies one Node lifetime. The zero value means unknown.
@@ -27,14 +29,16 @@ func (id *InstanceID) UnmarshalText(text []byte) error {
 }
 
 type instanceClaim struct {
-	instance InstanceID
-	chain    []*x509.Certificate
-	usage    x509.ExtKeyUsage
+	instance  InstanceID
+	chain     []*x509.Certificate
+	node      *x509.Certificate
+	addresses pki.Addresses
+	usage     x509.ExtKeyUsage
 }
 
 func (s *session) handshakeClaim() instanceClaim {
 	_, usage := handshakeUsages(s.outgoing)
-	return instanceClaim{s.instance, s.state.PeerCertificates, usage}
+	return instanceClaim{s.instance, s.remoteGrant, s.state.PeerCertificates[0], s.remoteIdentity.Addresses, usage}
 }
 
 // A fresh ping to the incumbent promotes a challenge into a hold that survives
@@ -84,7 +88,7 @@ func (c *instanceConflict) addClaim(w instanceClaim) bool {
 		return false
 	}
 	for _, known := range c.claims {
-		if known.instance == w.instance && known.usage == w.usage && slices.EqualFunc(known.chain, w.chain, (*x509.Certificate).Equal) {
+		if known.instance == w.instance && known.usage == w.usage && known.node.Equal(w.node) && slices.EqualFunc(known.chain, w.chain, (*x509.Certificate).Equal) {
 			return false
 		}
 	}
@@ -115,7 +119,7 @@ func (n *Node) deliveryInstanceLocked(peer PeerID) (InstanceID, bool) {
 // admitSessionLocked checks path policy and pins the member to one run before
 // register can replace or reuse an existing path.
 func (n *Node) admitSessionLocked(s *session) error {
-	if n.conflictingOwnerLocked(s.peer) {
+	if n.addressConflictLocked(s.remoteIdentity) {
 		n.recordObservationLocked(s.observation("address conflict"), nil)
 		return ErrPathPolicy
 	}
@@ -132,10 +136,7 @@ func (n *Node) admitSessionLocked(s *session) error {
 	}
 	if !recorded && incumbent != nil && incumbent.instance != s.instance {
 		now := time.Now()
-		c = instanceConflict{keep: incumbent.instance, since: now, confirmBy: now.Add(2 * n.o.DialTimeout)}
-		if s.until.Before(c.confirmBy) {
-			c.confirmBy = s.until
-		}
+		c = instanceConflict{keep: incumbent.instance, since: now, confirmBy: earlierDeadline(s.until, now.Add(2*n.o.DialTimeout))}
 		n.recordObservationLocked(incumbent.observation("incumbent at collision"), nil)
 		// The run may have established multiple paths with distinct credentials
 		// or roles. Keep their evidence even if the paths close before review.
@@ -236,7 +237,7 @@ func (n *Node) detachOtherInstancesLocked(peer PeerID, keep InstanceID) []*sessi
 // recheckConflicts reviews the immutable handshake evidence outside the node lock.
 func (n *Node) recheckConflicts(ctx context.Context, p *topologyView, conflicts map[PeerID]instanceConflict) {
 	for peer, c := range conflicts {
-		if _, local := p.members[n.id]; !local || !p.acceptsIdentity(peer) {
+		if _, local := p.members[n.id]; !local {
 			delete(conflicts, peer)
 			continue
 		}
@@ -247,7 +248,10 @@ func (n *Node) recheckConflicts(ctx context.Context, p *topologyView, conflicts 
 		var survivor InstanceID
 		multiple := false
 		for _, w := range c.claims {
-			if _, err := n.authorizeChain(ctx, p, peer, w.chain, w.usage); err != nil {
+			if !p.acceptsIdentity(pki.Identity{ID: peer, Addresses: w.addresses}) {
+				continue
+			}
+			if _, err := n.memberDeadline(ctx, p, peer, w.node, w.chain, w.usage); err != nil {
 				continue
 			}
 			valid = append(valid, w)

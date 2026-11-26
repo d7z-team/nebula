@@ -38,9 +38,15 @@ func TestPeerProcesses(t *testing.T) {
 		t.Helper()
 		require.NoError(t, os.WriteFile(filepath.Join(dir, file), pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: der}), 0o600))
 	}
+	writePEM("root.pem", "CERTIFICATE", opts[0].Auth.RootCA.Raw)
 	writePEM("ca.pem", "CERTIFICATE", opts[0].Auth.ClusterCA.Raw)
 	for i, name := range []string{"alice", "bob"} {
-		pair := opts[i].Auth.Certificates.Client
+		var chain []byte
+		for _, der := range opts[i].Auth.Certificates.Grant {
+			chain = append(chain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name+".grant"), chain, 0o600))
+		pair := opts[i].Auth.Certificates.Node
 		key, err := x509.MarshalPKCS8PrivateKey(pair.PrivateKey)
 		require.NoError(t, err)
 		writePEM(name+".pem", "CERTIFICATE", pair.Certificate[0])
@@ -61,7 +67,7 @@ func TestPeerProcesses(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "invalid.json"), []byte(tc.config), 0o600))
-			cmd := exec.CommandContext(ctx, exe, "--", "-cert", "alice.pem", "-key", "alice.key", "-topology", "invalid.json", "-peer", bob.IPv6.String())
+			cmd := exec.CommandContext(ctx, exe, "--", "-grant", "alice.grant", "-cert", "alice.pem", "-key", "alice.key", "-topology", "invalid.json", "-peer", bob.IPv6.String())
 			cmd.Dir = dir
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err)
@@ -69,7 +75,7 @@ func TestPeerProcesses(t *testing.T) {
 			require.Contains(t, string(out), tc.want)
 		})
 	}
-	server := exec.CommandContext(ctx, exe, "--", "-cert", "alice.pem", "-key", "alice.key", "-peer", bob.IPv6.String())
+	server := exec.CommandContext(ctx, exe, "--", "-grant", "alice.grant", "-cert", "alice.pem", "-key", "alice.key", "-peer", bob.IPv6.String())
 	server.Dir, server.Stderr = dir, os.Stderr
 	stdout, err := server.StdoutPipe()
 	require.NoError(t, err)
@@ -80,16 +86,16 @@ func TestPeerProcesses(t *testing.T) {
 	fields := strings.Fields(lines.Text())
 	require.Len(t, fields, 5)
 	address := fields[2]
-	lookup := exec.CommandContext(ctx, exe, "--", "-cert", "bob.pem", "-key", "bob.key", "-connect", address, "-resolve", alice.IPv6.String())
+	lookup := exec.CommandContext(ctx, exe, "--", "-grant", "bob.grant", "-cert", "bob.pem", "-key", "bob.key", "-connect", address, "-resolve", alice.IPv6.String())
 	lookup.Dir = dir
 	out, err := lookup.CombinedOutput()
 	require.NoError(t, err, "%s", out)
-	require.Contains(t, string(out), "fd13::1 via 10.13.0.1@fd13::1 (fd13::1/128)")
-	client := exec.CommandContext(ctx, exe, "--", "-cert", "bob.pem", "-key", "bob.key", "-connect", address, "-peer", alice.IPv4.String(), "-send", "hello")
+	require.Contains(t, string(out), "fd13::1 via "+alice.ID.String()+" (fd13::1/128)")
+	client := exec.CommandContext(ctx, exe, "--", "-grant", "bob.grant", "-cert", "bob.pem", "-key", "bob.key", "-connect", address, "-peer", alice.IPv4.String(), "-send", "hello")
 	client.Dir = dir
 	out, err = client.CombinedOutput()
 	require.NoError(t, err, "%s", out)
-	require.Regexp(t, `receipt from 10\.13\.0\.1@fd13::1 for [0-9a-f]{64}`, string(out))
+	require.Regexp(t, `receipt from [0-9a-f]{64} for [0-9a-f]{64}`, string(out))
 	require.True(t, lines.Scan())
-	require.Equal(t, `request from 10.13.0.2@fd13::2: "hello"`, lines.Text())
+	require.Equal(t, `request from `+bob.ID.String()+`: "hello"`, lines.Text())
 }

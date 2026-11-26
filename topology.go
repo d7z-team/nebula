@@ -24,11 +24,12 @@ func (e Endpoint) Valid() bool {
 		ip.IsValid() && !ip.IsUnspecified() && !ip.IsMulticast() && !ip.Is4In6() && ip != limitedBroadcast
 }
 
-// PeerID identifies a member by its two certified overlay addresses.
+// PeerID identifies a member by the SHA-256 digest of its node public key.
 type PeerID = pki.PeerID
 
 // Member contains the local routing and application permissions for one peer.
 type Member struct {
+	ID   PeerID     `json:"id"`
 	IPv4 netip.Addr `json:"ipv4"`
 	IPv6 netip.Addr `json:"ipv6"`
 	// Links declares reciprocal neighbors to maintain and use as circuit hops.
@@ -54,6 +55,10 @@ type Member struct {
 	// PublishTopics grants publication on each topic and its descendants.
 	// Forwarding neighbors can read publications regardless of subscriptions.
 	PublishTopics []string `json:"publishTopics,omitempty"`
+}
+
+func (m Member) addresses() pki.Addresses {
+	return pki.Addresses{IPv4: m.IPv4, IPv6: m.IPv6}
 }
 
 // Clone returns an independent copy of the member's routing and application grants.
@@ -173,11 +178,11 @@ func (c Topology) compile(cluster pki.Cluster) (*topologyView, error) {
 }
 
 func (s *topologyView) indexMember(m Member) error {
-	id, err := pki.NewPeerID(m.IPv4, m.IPv6)
-	if err != nil {
-		return err
+	id := m.ID
+	if _, dup := s.members[id]; id == (PeerID{}) || dup {
+		return fmt.Errorf("missing or duplicate member ID %s", id)
 	}
-	if err := s.cluster.ValidateMember(id); err != nil {
+	if err := s.cluster.ValidateMember(m.addresses()); err != nil {
 		return err
 	}
 	if m.BytesPerSecond < 0 {
@@ -233,13 +238,13 @@ func (s *topologyView) indexMember(m Member) error {
 }
 
 // acceptsIdentity prevents dynamic discovery from overriding a configured primary address.
-func (s *topologyView) acceptsIdentity(id PeerID) bool {
-	for _, addr := range []netip.Addr{id.IPv4(), id.IPv6()} {
-		if owner, ok := s.owners[addr]; ok && owner != id {
-			return false
-		}
+func (s *topologyView) acceptsIdentity(identity pki.Identity) bool {
+	if m, ok := s.members[identity.ID]; ok {
+		return m.addresses() == identity.Addresses
 	}
-	return true
+	_, v4Taken := s.owners[identity.IPv4]
+	_, v6Taken := s.owners[identity.IPv6]
+	return !v4Taken && !v6Taken
 }
 
 // LookupPeer returns the local binding for a primary address. A confirmed instance
@@ -251,8 +256,18 @@ func (n *Node) LookupPeer(primary netip.Addr) (PeerID, bool) {
 	return id, id != (PeerID{})
 }
 
-func (n *Node) conflictingOwnerLocked(id PeerID) bool {
-	for _, addr := range []netip.Addr{id.IPv4(), id.IPv6()} {
+func (n *Node) addressConflictLocked(identity pki.Identity) bool {
+	if !n.policy.Load().acceptsIdentity(identity) {
+		return true
+	}
+	id := identity.ID
+	if intro := n.discovered[id]; time.Now().Before(intro.authorizedUntil) && intro.Addresses != identity.Addresses {
+		return true
+	}
+	if active := n.preferredSessionLocked(n.peers[id], false, nil); active != nil && active.remoteIdentity.Addresses != identity.Addresses {
+		return true
+	}
+	for _, addr := range []netip.Addr{identity.IPv4, identity.IPv6} {
 		if owner := n.ownerLocked(addr); owner != (PeerID{}) && owner != id {
 			return true
 		}
@@ -271,15 +286,19 @@ func (n *Node) ownerLocked(addr netip.Addr) PeerID {
 	// A confirmed dispute keeps both primaries bound even after cache expiry
 	// and loss of the incumbent's last path.
 	for peer, conflict := range n.conflicts {
-		if !conflict.confirmedAt.IsZero() && (peer.IPv4() == addr || peer.IPv6() == addr) {
-			return peer
+		if !conflict.confirmedAt.IsZero() {
+			for _, w := range conflict.claims {
+				if w.addresses.IPv4 == addr || w.addresses.IPv6 == addr {
+					return peer
+				}
+			}
 		}
 	}
 	if id, ok := n.discoveredOwners[addr]; ok && time.Now().Before(n.discovered[id].authorizedUntil) {
 		return id
 	}
 	for id, paths := range n.peers {
-		if (addr == id.IPv4() || addr == id.IPv6()) && n.preferredSessionLocked(paths, false, nil) != nil {
+		if s := n.preferredSessionLocked(paths, false, nil); s != nil && (addr == s.remoteIdentity.IPv4 || addr == s.remoteIdentity.IPv6) {
 			return id
 		}
 	}
