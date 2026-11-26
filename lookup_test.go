@@ -1,6 +1,7 @@
 package nebula
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
@@ -15,6 +16,50 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestLookupReplyAfterRequesterWithdrawal(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp")
+	requester := f.cfg.Members[0].ID
+	var denied atomic.Bool
+	f.opts[1].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+		if denied.Load() && c.Member == requester {
+			return time.Time{}, ErrPathPolicy
+		}
+		return time.Time{}, nil
+	}
+	// The owner reviews the query origin before producing its signed reply.
+	// Commit the forwarder's new policy at that point.
+	f.opts[2].Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+		if c.Member == requester && denied.CompareAndSwap(false, true) {
+			return time.Time{}, f.nodes[1].Revalidate(ctx)
+		}
+		return time.Time{}, ctx.Err()
+	}
+	for i := range f.opts {
+		f.opts[i].MaintenanceInterval = time.Hour
+		f.opts[i].DialTimeout = 4 * time.Second
+	}
+	f.start()
+	x, forwarder, owner := f.nodes[0], f.nodes[1], f.nodes[2]
+	require.NoError(t, forwarder.ConnectPeerID(t.Context(), requester))
+	require.NoError(t, forwarder.ConnectPeerID(t.Context(), owner.ID()))
+	s := forwarder.preferredSession(requester, false)
+	require.NotNil(t, s)
+	q := query{
+		ID: "0123456789abcdef0123456789abcdef", Target: &owner.id,
+		Origin: x.localIntroduction(x.policy.Load()).record, Visited: []PeerID{requester}, Budget: forwarder.o.DialTimeout,
+	}
+	body, err := json.Marshal(q)
+	require.NoError(t, err)
+	var reply bytes.Buffer
+	forwarder.handleLookup(s, &reply, body)
+	require.False(t, forwarder.usable(s))
+	require.Zero(t, reply.Len())
+	// The owner's valid reply reached the forwarder under its new policy.
+	matches := forwarder.ipMatches(owner.Addresses().IPv4, nil)
+	require.Len(t, matches, 1)
+	require.Equal(t, owner.ID(), matches[0].Peer)
+}
 
 func TestConnectEndpointAndIPDiscovery(t *testing.T) {
 	for _, network := range []string{"udp", "tcp"} {

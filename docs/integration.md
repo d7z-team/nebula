@@ -1,6 +1,6 @@
 # 将节点嵌入 Go 应用
 
-每个 `Node` 独立持有凭据、拓扑和会话。在 `Options.Auth` 配置根 CA、固定的集群 CA、节点证书和同钥授权链，在 `Options.Topology` 填入宿主批准的成员。初始视图可以只列本机，此时将首个入口的公钥指纹加入 `Auth.TrustedEntrypoints`。节点可直接收发 IP，也可接入宿主的 gVisor 栈。[凭据加载](pki.md#热加载与宿主授权) · [双进程接入](quickstart.md#使用磁盘凭据启动两个进程) · [双栈网关](../examples/gateway/main.go)
+每个 `Node` 独立持有凭据、拓扑和会话。在 `Options.Auth` 配置根 CA、固定的集群 CA、节点证书和同钥授权链，在 `Options.Topology` 填入宿主批准的成员。节点可直接收发 IP，也可接入宿主的 gVisor 栈。[凭据加载](pki.md#热加载与宿主授权) · [双进程接入](quickstart.md#使用磁盘凭据启动两个进程) · [双栈网关](../examples/gateway/main.go)
 
 ## 节点生命周期
 
@@ -41,7 +41,7 @@ func serve(serviceCtx context.Context, opts nebula.Options, ep nebula.Endpoint) 
 | 宿主目的 | 配置或操作 | 对现有连接和消息的影响 |
 | --- | --- | --- |
 | 为同一成员换证 | `ReloadCertificates(ctx, set)` 校验并替换整组本机凭据。 | 新握手和签名使用新凭据。已建立的会话仍按其实际握手证书授权，每条路径的 `PathStatus.LocalNodeSerial` 和 `LocalGrantSerial` 可用于核对。 |
-| 撤回对证书的信任 | 更新 `Options.Auth.CheckChain` 读取的宿主策略，再调用 `Revalidate(ctx)`。 | 返回 `nil` 表示已复查本机凭据、已有会话、实例冲突和缓存主题消息，并清空发现缓存。并发准入可能触发重试；取消或超时返回时，宿主需重新发起未提交的复查。用 `ControlStatus()` 和 `Paths()` 核对结果。已交付的消息由应用处置。 |
+| 撤回对证书或公钥的信任 | 更新 `Options.Auth.CheckChain` 读取的宿主策略，再调用 `Revalidate(ctx)`。 | 本机复查凭据、会话、实例冲突和缓存主题消息，清空发现缓存，关闭失权路径。可用 `ControlStatus()` 和 `Paths()` 核对结果。[按公钥撤权示例](pki.md#热加载与宿主授权) |
 | 调整网关、VIP、邻接或中继权限 | 用 `ApplyTopology(ctx, view)` 安装完整的本地视图。 | 失去授权的路径、电路和排队包会被清理。移除一个远端的成员条目会收回其静态授权，有效集群凭据仍可在路径允许时使用该成员自己的主地址。 |
 | 限制本机到一个成员的路径 | 用 `SetPeerPathPolicy(peerID, RelayOnly)` 限定中继路径，或用 `Blocked` 封锁到该成员的路径。 | 本机关闭与新模式冲突的已有路径。各节点独立决定是否信任同一张证书或接纳其签名消息。 |
 | 限制哪些网关可代表某个源网段 | 网关的集群授权和本机拓扑共同限定地址收发范围。在 `Options.InboundPolicy` 按认证成员与包地址进一步筛选。 | 策略在合规入站 IP 包交付前逐包执行，适用于已有会话。[下一跳与回程](addressing.md#下一跳与回程) |
@@ -49,6 +49,8 @@ func serve(serviceCtx context.Context, opts nebula.Options, ep nebula.Endpoint) 
 | 选择可传播的物理地址 | 用 `Options.Transport.AllowAdvertiseEndpoint` 按候选来源、地址和观测者筛选本机签名介绍。 | 获准地址可以随签名介绍继续转发。已经发布的记录按原有效期过期。 |
 | 限制主动联系的物理地址 | 用 `Options.Transport.AllowOutboundEndpoint` 筛选 TCP、QUIC 拨号、备用路径探测和 UDP 打洞目的地。 | `ConnectEndpoint` 遇到拒绝返回 `ErrPathPolicy`，自动拨号继续选择候选或获准中继。已有会话由成员路径策略控制。 |
 | 调整主题发布权 | 在 `Member.PublishTopics` 指定允许发布的主题或子树，调用 `ApplyTopology`。 | 本机会复核缓存中原发布者的主题授权。`Subscribe` 决定本机投递，转发邻居可以读取正文。机密载荷由应用加密给目标接收者。 |
+
+`Revalidate` 和 `ApplyTopology` 在提交前遇到上下文取消时返回错误，宿主可重新发起调用。提交后，即使上下文取消，也会等到提交时已登记的握手授权帧写完或写入失败，再返回成功。各节点分别生效，已交给传输层的字节仍可能稍后到达。[握手与撤权边界](mesh.md#证书生命周期与宿主授权)
 
 `New` 和 `ApplyTopology` 各自保存一份私有拓扑。如果宿主也要为不同节点准备可独立修改的视图，为每份视图创建自己的 `Members` 切片，用 `member.Clone()` 复制要放入的成员。这样可以在一份视图中修改邻接、端点或主题，其他视图继续使用各自的值。[多节点示例](../examples/demo/nodes.go)
 
@@ -65,7 +67,7 @@ opts.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
 }
 ```
 
-接受动态 NAT 映射时，可额外允许 `c.Source == nebula.EndpointFromObservation && c.Observer == trustedPeer`。其余本机来源是拓扑中的 `EndpointFromTopology` 和具体监听地址 `EndpointFromListener`。两个端点回调均可并发运行，应快速返回。留空时使用默认端点选择，包括单个已认证 QUIC 邻居的有效观测。签名介绍对收到它的成员可见。只允许指定邻居获知本机出口时，可组合 `HideEndpoints`、`Restricted` 和双向 `Links`，并提供可用中继。[可运行的端点过滤示例](../examples/discovery/main.go)
+若还接受可信邻居报告的 NAT 映射，可额外允许 `c.Source == nebula.EndpointFromObservation && c.Observer == trustedPeer`。默认候选来自显式通告、拓扑、具体监听地址和已认证 QUIC 邻居的有效观测。每个邻居可按地址族各提供一个观测。获准端点写入同一份可转发的签名介绍，所有收到介绍的成员都能读取。发布和出站端点回调都应支持并发并及时返回。[端点过滤示例](../examples/discovery/main.go) · [限定直连邻居](#让节点通过已连接的邻居提供中继)
 
 ## 跨机器连接
 
@@ -73,9 +75,11 @@ opts.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
 
 | 已知信息 | 连接方式 |
 | --- | --- |
-| 已认可入口的物理地址和端口 | 用 `ConnectEndpoint(ctx, ep)` 拨号，`ep.Network` 填 `udp` 或 `tcp`。成功后返回在该端点通过认证和路径策略检查的成员 ID。 |
+| 入口的物理地址和端口 | 用 `ConnectEndpoint(ctx, ep)` 连接，`ep.Network` 填 `udp` 或 `tcp`。成功后返回该端点通过认证的成员 ID。 |
 | 对端的一个虚拟主地址 | 如果 `LookupPeer(primary)` 能在本机找到归属，用 `ConnectPeer(ctx, primary)` 连接其所有者。预配置时，在对端的 `Member.Endpoints` 填入可达物理端点。 |
 | 对端的公钥指纹 | 用 `ConnectPeerID(ctx, id)` 等待与该身份的获准路径。要持续维护该邻居，在拓扑中为两端配置双向 `Links`。 |
+
+首次接入时，若本机只配置了自己的拓扑条目，在 `New` 前将入口的公钥指纹加入 `Auth.TrustedEntrypoints`。本机也可通过拓扑中的 `Member.ID` 或已验证且有效的签名介绍认可对端。
 
 `Member.Endpoints`、`Options.Transport.AdvertiseEndpoints` 和 `ConnectEndpoint` 使用集群成员网段和 VIP 池之外的物理单播地址，端口须非零。监听器可绑定通配地址，通告时填写对端可达的具体地址。
 
@@ -127,7 +131,7 @@ for _, m := range matches {
 
 确定需要撤回的节点证书或集群授权后，更新宿主 `Options.Auth.CheckChain` 读取的策略，然后调用 `node.Revalidate(ctx)`。节点按握手实际出示的证书链和用途复查。原实例曾以客户端和服务端两种角色建立路径时，只撤回一种用途仍可能留下有效凭据。复查后仅剩一个获准实例时，可向该实例恢复交付。如果已选实例在重连前失去授权，且仍有多个获准实例，该成员的发送队列暂停接收新包，`WriteIP` 返回 `ErrInstanceConflict`。宿主可从 `InspectIP` 列出的有效候选中重新选择。
 
-同一凭据误部署两次时，先停止错误副本，核实正确设备的 `ControlStatus().Instance`，再在观察节点调用 `node.ResolveInstanceConflict(peer, keep)`。用 `PreferredPath(peer)` 返回的 `PathStatus.Instance` 核对恢复后的路径。共享私钥泄露时，由宿主撤回凭据并换钥。
+同一凭据误部署两次时，先停止错误副本，核实正确设备的 `ControlStatus().Instance`，再在观察节点调用 `node.ResolveInstanceConflict(peer, keep)`。用 `PreferredPath(peer)` 返回的 `PathStatus.Instance` 核对恢复后的路径。若私钥已经泄露，宿主应按公钥撤权并换钥。[按公钥撤权示例](pki.md#热加载与宿主授权)
 
 ## 选择直连或中继
 
@@ -225,7 +229,7 @@ opts.InboundPolicy = func(peer nebula.PeerID, src, dst netip.Addr) bool {
 | 节点是否已经启动、具备本机成员资格 | `ControlStatus().Started` 表示已启动收发。`Ready` 表示本机凭据和成员视图有效，启动前也可以为真。`AuthorizedUntil` 给出本机三个用途、证书链和宿主授权共同限定的截止时刻；`GrantExpires` 是本机集群授权的到期时刻。 |
 | 哪个入口停止接收连接 | `ControlStatus().ListenerErrors` 按 `udp4`、`udp6`、`tcp4`、`tcp6` 记录异常退出的入口。TCP 遇到暂时性错误会退避重试。共享 UDP 的物理套接字读取遇到永久错误时，两个打开的分支都能取得底层错误。 |
 | 拨号为何失败 | 先看本次连接返回的错误。`ControlStatus().LastError` 保留最近的建链错误，`DialFailures` 累计失败的端点拨号。 |
-| 到成员有哪些可用路径 | `Paths()` 列出每条已建路径的传输、证书、授权截止时间和探测数据。`PreferredPath(peerID)` 返回一般流量当前会选的路径。 |
+| 到成员有哪些可用路径 | `Paths()` 列出每条已建路径的传输、双方节点证书和授权叶的序列号、授权截止时间及探测数据。`PreferredPath(peerID)` 返回一般流量当前会选的路径。 |
 | 某个包是否发出 | `IPPort.Stats()` 提供排队和丢包计数，`ObserveTransmit` 给出已出队包的本地提交结果。远端处理情况由应用回执确认。[发送诊断](#ip-收发与网关) |
 
 ## gVisor 的 IPv4 网关构建

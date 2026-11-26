@@ -388,7 +388,10 @@ func (s *session) openRequest(ctx context.Context, op byte, body []byte) (net.Co
 		return nil, err
 	}
 	c.SetDeadline(s.n.exchangeDeadline(ctx))
-	if _, err = c.Write([]byte{op}); err == nil {
+	// Opening a stream may block while a policy update withdraws the session.
+	if !s.n.usable(s) {
+		err = ErrPathPolicy
+	} else if _, err = c.Write([]byte{op}); err == nil {
 		err = writeFrame(c, body)
 	}
 	if err != nil {
@@ -446,7 +449,9 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 		}
 		n.receiveAdvert(s, a)
 		out, _ := json.Marshal(n.advert(s))
-		writeFrame(c, out)
+		if n.usable(s) {
+			writeFrame(c, out)
+		}
 	case opPing:
 		if len(b) <= 32 {
 			writeFrame(c, b)

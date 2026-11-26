@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"net"
+	"io"
 	"net/netip"
 	"slices"
 	"sync"
@@ -395,12 +395,19 @@ func (n *Node) queryNeighbor(ctx context.Context, s *session, q query, results c
 	}
 }
 
-func (n *Node) handleLookup(s *session, c net.Conn, b []byte) {
+func (n *Node) handleLookup(s *session, reply io.Writer, b []byte) {
 	var q query
-	if json.Unmarshal(b, &q) != nil || len(q.ID) != 32 || len(q.Visited) == 0 || len(q.Visited) >= maxCircuitNodes || q.Visited[len(q.Visited)-1] != s.peer || slices.Contains(q.Visited, n.id) || q.Budget <= 0 || q.Target == nil && !n.policy.Load().discoveryAddress(q.IP) {
+	if json.Unmarshal(b, &q) != nil || len(q.ID) != 32 || q.Budget <= 0 {
 		return
 	}
-	if q.Target != nil && (*q.Target == (PeerID{}) || q.IP.IsValid()) {
+	if len(q.Visited) == 0 || len(q.Visited) >= maxCircuitNodes || q.Visited[len(q.Visited)-1] != s.peer || slices.Contains(q.Visited, n.id) {
+		return
+	}
+	if q.Target == nil {
+		if !n.policy.Load().discoveryAddress(q.IP) {
+			return
+		}
+	} else if *q.Target == (PeerID{}) || q.IP.IsValid() {
 		return
 	}
 	ctx, cancel := context.WithTimeout(n.ctx, min(q.Budget, n.o.DialTimeout))
@@ -428,5 +435,7 @@ func (n *Node) handleLookup(s *session, c net.Conn, b []byte) {
 		n.punch(origin)
 	}
 	q.Visited = append(q.Visited, n.id)
-	n.forwardLookup(ctx, q, func(record statement) bool { return writeFrame(c, record) == nil })
+	n.forwardLookup(ctx, q, func(record statement) bool {
+		return n.usable(s) && writeFrame(reply, record) == nil
+	})
 }

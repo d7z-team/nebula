@@ -163,6 +163,7 @@ type Node struct {
 	pathRegistered         chan struct{} // lazy notification for callers waiting for a cold-dial slot
 	port                   *IPPort
 	handshakeSlots         chan struct{}
+	grantWrites            map[chan struct{}]struct{} // in-flight grant frames, protected by mu
 	sizeQuery              []byte
 	routeCursors           map[PeerID]*routeCursor
 	probeSlots             chan struct{}
@@ -297,6 +298,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 		publications:           make(map[string]cachedPublication),
 		subscriptions:          make(map[*Subscription]struct{}),
 		handshakeSlots:         make(chan struct{}, 128),
+		grantWrites:            make(map[chan struct{}]struct{}),
 		backgroundSlots:        make(chan struct{}, 8),
 		neighborDialSlots:      make(chan struct{}, 4),
 		sharedAddressDialSlots: make(chan struct{}, 8),

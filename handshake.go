@@ -74,10 +74,11 @@ func (n *Node) tlsConfig(peer PeerID, outgoing bool, c *credentials) *tls.Config
 	return cfg
 }
 
-// authorizeDisclosure checks the current policy before sending address-bearing material.
-func (s *session) authorizeDisclosure(ctx context.Context, local *credentials) error {
+// writeGrant registers the disclosure under the same lock that commits a policy review.
+func (s *session) writeGrant(ctx context.Context, w io.Writer, local *credentials) error {
 	n := s.n
 	_, usage := handshakeUsages(s.outgoing)
+	var done chan struct{}
 	for {
 		p := n.policy.Load()
 		until, err := n.credentialDeadline(ctx, p, local)
@@ -109,12 +110,32 @@ func (s *session) authorizeDisclosure(ctx context.Context, local *credentials) e
 			n.recordObservationLocked(s.observation("address conflict"), nil)
 			allowed = false
 		}
-		n.mu.Unlock()
 		if !allowed {
+			n.mu.Unlock()
 			return ErrPathPolicy
 		}
-		return nil
+		done = make(chan struct{})
+		n.grantWrites[done] = struct{}{}
+		n.mu.Unlock()
+		break
 	}
+	defer func() {
+		n.mu.Lock()
+		delete(n.grantWrites, done)
+		close(done)
+		n.mu.Unlock()
+	}()
+	size := grantHeaderBytes
+	for _, der := range local.Grant {
+		size += len(der)
+	}
+	body := make([]byte, grantHeaderBytes, size)
+	binary.BigEndian.PutUint16(body, uint16(n.o.MaxIPSize))
+	copy(body[2:], n.instance[:])
+	for _, der := range local.Grant {
+		body = append(body, der...)
+	}
+	return writeFrame(w, body)
 }
 
 // Both roles confirm the pinned cluster on this TLS connection before exchanging grants.
@@ -148,27 +169,12 @@ func (s *session) exchangeGrants(ctx context.Context, c io.ReadWriter, local *cr
 	if subtle.ConstantTimeCompare(token[:], rx) != 1 {
 		return ErrPathPolicy
 	}
-	if !s.outgoing {
-		if _, err = c.Write(tx); err != nil {
-			return err
-		}
-	}
-
-	send := func() error {
-		if err := s.authorizeDisclosure(ctx, local); err != nil {
-			return err
-		}
-		body := binary.BigEndian.AppendUint16(nil, uint16(s.n.o.MaxIPSize))
-		body = append(body, s.n.instance[:]...)
-		for _, der := range local.Grant {
-			body = append(body, der...)
-		}
-		return writeFrame(c, body)
-	}
 	if s.outgoing {
-		if err := send(); err != nil {
+		if err := s.writeGrant(ctx, c, local); err != nil {
 			return err
 		}
+	} else if _, err = c.Write(tx); err != nil {
+		return err
 	}
 	body, err := readFrame(c, maxCredentialBytes+grantHeaderBytes)
 	if err != nil {
@@ -191,7 +197,7 @@ func (s *session) exchangeGrants(ctx context.Context, c io.ReadWriter, local *cr
 		return errors.Join(ErrPathPolicy, err)
 	}
 	if !s.outgoing {
-		return send()
+		return s.writeGrant(ctx, c, local)
 	}
 	return nil
 }

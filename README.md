@@ -29,7 +29,7 @@ go get code.d7z.net/d7z-team/nebula@v0.0.0
 
 1. Give `nebula.New` the root CA, pinned cluster CA, node certificate and same-key cluster grant in `Options.Auth`. The local topology can start with just your own member.
 2. For QUIC, supply a UDP socket for each underlay address family you use. An outbound-only TCP node can use the default dialer. Register any IP receiver or subscription that needs to receive the first delivery, then call `Start`.
-3. Call `ConnectEndpoint(ctx, ep)` with a known entry's physical address. For a first contact outside your topology, configure its public-key fingerprint in `Auth.TrustedEntrypoints` before creating the node. Use reciprocal `Member.Links` for neighbors that should stay connected while idle. [Integration guide](docs/integration.md) · [Discovery example](examples/discovery/main.go)
+3. Call `ConnectEndpoint(ctx, ep)` with the physical address of a known member. If your initial topology contains only your own member, set the entry's public-key fingerprint in `Auth.TrustedEntrypoints` before calling `New`. Use reciprocal `Member.Links` for neighbors that should stay connected while idle. [Integration guide](docs/integration.md) · [Discovery example](examples/discovery/main.go)
 
 ## Examples
 
@@ -46,11 +46,11 @@ The self-contained examples generate short-lived credentials in memory. Their ne
 | `go run ./examples/pki` | Delegate IPv4 and IPv6 ranges to a site CA, verify a root-issued node identity, and validate its same-key site-issued grant. [Source](examples/pki/main.go) |
 | `go run ./examples/portshare` | A mesh peer, an HTTP/2 site and an HTTP/3 site share one loopback port. [Source](examples/portshare/main.go) |
 
-For deployment with existing certificates, run `go run ./examples/peer` with the listener, credential and topology arguments in the walkthrough. It runs the same program in two terminals and checks a signed receipt from the expected member. [Commands](docs/quickstart.md#使用磁盘凭据启动两个进程) · [Source](examples/peer/main.go)
+To use credentials from disk, run `go run ./examples/peer` in two terminals. The walkthrough configures a common root and pinned cluster CA, gives each process its own credentials, and verifies a signed receipt from the expected peer. [Commands](docs/quickstart.md#使用磁盘凭据启动两个进程) · [Source](examples/peer/main.go)
 
 ## Features
 
-- **Authenticated transport.** QUIC and TCP use mutual TLS 1.3 with X25519MLKEM768. TLS presents a root-issued node certificate. After TLS, peers confirm the cluster and exchange grants carrying their overlay addresses and permissions. Mesh and web services can share TCP and UDP ports via ALPN. [Handshake](docs/mesh.md#tls-与成员身份) · [Port sharing](docs/portshare.md)
+- **Authenticated transport.** QUIC and TCP use mutual TLS 1.3 with X25519MLKEM768. TLS presents a root-issued node certificate. The dialer sends its cluster grant to an approved peer. The responder verifies the grant against the TLS public key and pinned cluster CA before returning its own grant. Mesh and web services can share TCP and UDP ports via ALPN. [Handshake](docs/mesh.md#tls-与成员身份) · [Port sharing](docs/portshare.md)
 - **Discovery and relays.** Look up primary addresses and downstream gateways through authenticated neighbors. Connect to a selected public-key identity and inspect its direct or relayed path. Hosts can filter advertised endpoints, limit outbound dials and designate transit neighbors. [Discovery](docs/integration.md#按地址发现成员和下游网关) · [Relay setup](docs/integration.md#让节点通过已连接的邻居提供中继)
 - **IP routing.** Each cluster has one IPv4 and one IPv6 member prefix. The host can enable broadcast and multicast, choose an anycast instance per flow, or route through a gateway authorized for downstream prefixes, including default routes. [Addressing](docs/addressing.md)
 - **Credentials and diagnostics.** Issue credentials with the Go API or offline CLI, reload them and apply host certificate policy. Inspect address claims and confirmed conflicts between instances sharing a node key. [PKI](docs/pki.md) · [Conflict diagnosis](docs/integration.md#排查重复地址与实例)

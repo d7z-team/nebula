@@ -13,7 +13,7 @@ go run ./examples/addressing
 3. 在拓扑条目中分别填入公钥指纹 `Member.ID` 和授权中的两个独占主地址。叶证书用 `Scope.AnycastIPs` 授权精确 VIP，用 `Scope.RoutedPrefixes` 授权下游前缀。
 4. 将信任根和固定的集群 CA 填入 `Options.Auth.RootCA` 和 `Options.Auth.ClusterCA`。启动前可用 `pki.ReadClusterCA(cert)` 和 `topology.Validate(cluster)` 预检地址规划，运行中用 `node.Cluster()` 读取同一规划。[CA 签发参数与证书字段](pki.md#证书配置)
 
-`cluster.MemberPrefixes()` 返回两个 `netip.Prefix`。在其中一个前缀或其规范子范围内，用 `cluster.MemberAddresses(within)` 枚举可分配地址。为节点选定 IPv4 和 IPv6 后，按地址检查，再由宿主在同一事务中预留两个唯一地址。
+`cluster.MemberPrefixes()` 返回两个 `netip.Prefix`。用 `cluster.MemberAddresses(within)` 在集群前缀或其子网内枚举候选地址。经站点 CA 签发时，宿主还要按该签发链的 IP 名称约束选择主地址。用 `ValidateMember` 检查所选地址对符合集群规划后，在宿主分配台账中一次预留两个地址。
 
 ```go
 pair := pki.Addresses{
@@ -25,7 +25,7 @@ if err := cluster.ValidateMember(pair); err != nil {
 }
 ```
 
-分配器跳过 VIP 池和 CA 排除的范围。IPv4 保留集群网段的网络地址和定向广播地址，/31 和 /32 没有这两项保留。IPv6 保留集群网段的全零接口标识，/127 和 /128 除外。站点 CA 的 SAN 范围进一步限制可签发的主地址，逻辑链路边界仍取集群前缀。[分配 API](../pki/cluster.go) · [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021) · [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164)
+枚举时跳过 VIP 池和集群 CA 排除的范围。IPv4 保留集群网段的网络地址和定向广播地址，/31 和 /32 除外。IPv6 保留集群网段的全零接口标识，/127 和 /128 除外。最终签发的授权叶将两个具体地址写入 SAN。[分配 API](../pki/cluster.go) · [RFC 3021](https://www.rfc-editor.org/rfc/rfc3021) · [RFC 6164](https://www.rfc-editor.org/rfc/rfc6164)
 
 多个成员可以共同承载同一 VIP 或下游前缀。核对运行中观察到的主地址、VIP 或网关声明时，在相关节点调用 `InspectIP(ip)`。[排查与恢复](integration.md#排查重复地址与实例)
 

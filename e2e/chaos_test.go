@@ -497,6 +497,78 @@ func TestChaosHiddenTransit(t *testing.T) {
 	require.ElementsMatch(t, []netip.AddrPort{leftAddr, rightAddr}, destinations)
 }
 
+func TestMemberWithdrawalIsolation(t *testing.T) {
+	l := newLab(t)
+	a := l.host("wan", "192.0.2.1", "", "tcp", true)
+	b := l.host("wan", "192.0.2.2", "", "tcp", true)
+	x := l.host("wan", "192.0.2.3", "", "tcp", true)
+	withdrawnID := l.top.Members[x.index].ID
+	observers := []*host{a, b}
+	var denied atomic.Bool
+	for _, h := range observers {
+		h.options.Auth.CheckChain = func(ctx context.Context, check nebula.ChainCheck) (time.Time, error) {
+			if denied.Load() && check.Member == withdrawnID {
+				return time.Time{}, errors.New("member withdrawn")
+			}
+			return time.Time{}, ctx.Err()
+		}
+	}
+	l.start()
+	l.connect(a, b, "tcp")
+	l.connect(a, x, "tcp")
+	l.connect(x, b, "tcp")
+	client := l.business(a)
+	healthy, server := tcpPair(t, client, l.business(b), b.ip.String(), ipv4.ProtocolNumber)
+	toX, atX := tcpPair(t, client, l.business(x), x.ip.String(), ipv4.ProtocolNumber)
+	receipt(t, healthy, server, 1)
+	receipt(t, toX, atX, 2)
+	publicationReceipt(t, a, x, "before withdrawal")
+	sub, err := x.node.Subscribe("app/test")
+	require.NoError(t, err)
+	defer sub.Close()
+
+	denied.Store(true)
+	for _, h := range observers {
+		require.NoError(t, h.node.Revalidate(t.Context()))
+		_, active := h.node.PreferredPath(withdrawnID)
+		require.False(t, active)
+	}
+	receipt(t, healthy, server, 3)
+	publicationReceipt(t, a, b, "after withdrawal")
+	_, err = toX.Write([]byte("after withdrawal"))
+	require.NoError(t, err)
+	require.NoError(t, atX.SetReadDeadline(time.Now().Add(time.Second)))
+	var received [1]byte
+	n, err := atX.Read(received[:])
+	require.Zero(t, n)
+	require.Error(t, err)
+	for _, pair := range [][2]*host{{a, x}, {x, a}, {b, x}, {x, b}} {
+		_, err := pair[0].node.ConnectEndpoint(t.Context(), l.top.Members[pair[1].index].Endpoints[0])
+		require.Errorf(t, err, "%s connected to %s after withdrawal", pair[0].ip, pair[1].ip)
+	}
+	require.Empty(t, sub.Publications())
+
+	// Restart an honest node with the host decision and its original key.
+	require.NoError(t, a.node.Close())
+	require.Eventually(t, func() bool {
+		_, active := b.node.PreferredPath(a.node.ID())
+		return !active
+	}, 3*time.Second, time.Millisecond)
+	o := a.options
+	o.Transport = nebula.TransportOptions{DialTCP: o.Transport.DialTCP}
+	o.Topology = nebula.Topology{Network: l.top.Network, Members: []nebula.Member{l.top.Members[a.index]}}
+	o.Auth.TrustedEntrypoints = []nebula.PeerID{b.node.ID(), withdrawnID}
+	restarted, err := nebula.New(t.Context(), o)
+	require.NoError(t, err)
+	defer restarted.Close()
+	require.NoError(t, restarted.Start())
+	id, err := restarted.ConnectEndpoint(t.Context(), l.top.Members[b.index].Endpoints[0])
+	require.NoError(t, err)
+	require.Equal(t, b.node.ID(), id)
+	_, err = restarted.ConnectEndpoint(t.Context(), l.top.Members[x.index].Endpoints[0])
+	require.ErrorIs(t, err, nebula.ErrPathPolicy)
+}
+
 func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
 	extended(t)
 	l := newLab(t)

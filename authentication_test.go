@@ -14,10 +14,12 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"code.d7z.net/d7z-team/nebula/pki"
@@ -47,6 +49,97 @@ func TestIntroductionAfterSignerReload(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, sender.id, peer)
 	}
+}
+
+// Model an outgoing handshake after TLS has authenticated the remote node.
+func startGrantWrite(local, remote *Node, w io.Writer) <-chan error {
+	s := session{n: local, peer: remote.ID(), outgoing: true, state: tls.ConnectionState{
+		PeerCertificates: []*x509.Certificate{remote.cred.Load().Node.Leaf},
+	}}
+	done := make(chan error, 1)
+	go func() { done <- s.writeGrant(local.ctx, w, local.cred.Load()) }()
+	return done
+}
+
+func TestGrantWriteRechecksPolicy(t *testing.T) {
+	f := newFixture(t, "", "")
+	peer := f.cfg.Members[1].ID
+	entered := make(chan struct{})
+	pause, resume := context.WithCancel(t.Context())
+	defer resume()
+	var denied atomic.Bool
+	f.opts[0].Auth.CheckChain = func(ctx context.Context, check ChainCheck) (time.Time, error) {
+		if check.Member == peer {
+			if denied.Load() {
+				return time.Time{}, ErrPathPolicy
+			}
+			close(entered)
+			<-pause.Done()
+		}
+		return time.Time{}, ctx.Err()
+	}
+	f.start()
+	n := f.nodes[0]
+	var sent bytes.Buffer
+	write := startGrantWrite(n, f.nodes[1], &sent)
+	select {
+	case <-entered:
+	case err := <-write:
+		t.Fatalf("grant write finished before the host check: %v", err)
+	}
+	denied.Store(true)
+	require.NoError(t, n.Revalidate(t.Context()))
+	resume()
+	require.ErrorIs(t, <-write, ErrPathPolicy)
+	require.Zero(t, sent.Len())
+}
+
+func TestRevalidateDuringGrantWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, "", "")
+		f.start()
+		n, peer := f.nodes[0], f.nodes[1]
+		w, r := net.Pipe()
+		defer w.Close()
+		defer r.Close()
+		first := startGrantWrite(n, peer, w)
+		synctest.Wait()
+
+		// Both reviews commit while the first grant is blocked.
+		reviews := make(chan error, 2)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go func() { reviews <- n.Revalidate(ctx) }()
+		synctest.Wait()
+		cancel()
+		go func() { reviews <- n.ApplyTopology(t.Context(), f.cfg) }()
+		synctest.Wait()
+		require.Empty(t, reviews)
+
+		// A later handshake to the same peer belongs to neither snapshot.
+		later, reader := net.Pipe()
+		defer later.Close()
+		defer reader.Close()
+		require.NoError(t, later.SetWriteDeadline(time.Now().Add(time.Second)))
+		second := startGrantWrite(n, peer, later)
+		synctest.Wait()
+		body, err := readFrame(r, grantHeaderBytes+maxCredentialBytes)
+		require.NoError(t, err)
+		require.Equal(t, bytes.Join(n.cred.Load().Grant, nil), body[grantHeaderBytes:])
+		require.NoError(t, <-first)
+		synctest.Wait()
+		require.Len(t, reviews, 2)
+		for range 2 {
+			require.NoError(t, <-reviews)
+		}
+
+		go func() { reviews <- n.Revalidate(t.Context()) }()
+		synctest.Wait()
+		require.Empty(t, reviews)
+		time.Sleep(time.Second)
+		require.ErrorIs(t, <-second, os.ErrDeadlineExceeded)
+		require.NoError(t, <-reviews)
+	})
 }
 
 // pausingSigner lets a real TLS handshake select its certificate before renewal.
@@ -94,8 +187,7 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 				f.opts[i].DialTimeout = 4 * time.Second
 			}
 			signer := &pausingSigner{Signer: cert.PrivateKey.(crypto.Signer), entered: make(chan struct{}), resume: make(chan struct{})}
-			var resume sync.Once
-			release := func() { resume.Do(func() { close(signer.resume) }) }
+			release := sync.OnceFunc(func() { close(signer.resume) })
 			// For relay, first establish outer legs with the original credential, so
 			// the paused signature belongs to the end-to-end TLS handshake.
 			if kind != "relay" {
