@@ -63,7 +63,7 @@ func clientInitialKeys(dcid []byte) (keys initialKeys, err error) {
 		keys.payload, err = cipher.NewGCM(block)
 		keys.largest = -1
 	})
-	return
+	return keys, err
 }
 
 type varints []byte

@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"io"
 	"net"
 	"net/http/httptest"
@@ -169,7 +168,7 @@ func TestResetAfterPeerRestart(t *testing.T) {
 		t.Fatal("mesh missed authentic reset")
 	}
 	var reset *quic.StatelessResetError
-	require.True(t, errors.As(context.Cause(conn.Context()), &reset))
+	require.ErrorAs(t, context.Cause(conn.Context()), &reset)
 	require.NoError(t, u.Other().SetReadDeadline(time.Now().Add(40*time.Millisecond)))
 	_, _, e = u.Other().ReadFrom(make([]byte, 100))
 	require.Error(t, e)

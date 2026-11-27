@@ -1,22 +1,15 @@
-# AGENTS.md
+# 仓库约定
 
-本指南适用于整个仓库。开发环境使用 [go.mod](go.mod) 指定的 Go 版本。
-
-## 代码位置
-
-- 根包 `nebula` 管理节点、路径选择和原始 IP 收发。[handshake.go](handshake.go) 负责 TLS 身份认证和集群授权交换，[session.go](session.go) 负责会话注册与流分派，[publication.go](publication.go) 管理签名主题消息的发布、订阅和补发。[relay_route.go](relay_route.go) 搜索中继路径，[circuit.go](circuit.go) 管理电路准入、排空和转发，[shaping.go](shaping.go) 按邻居调度字节。
-- `portshare/` 负责与宿主服务共享 TCP、UDP 监听端口。`meshwire/` 定义 mesh ALPN 和共享 UDP 套接字接口。[接入示例](examples/portshare/main.go)
-- `pki/` 负责 X.509 证书与签名对象，`cmd/nebula-pki/` 提供离线命令行工具。
-- `nebulagvisor/` 将节点接入调用方的 gVisor 栈。双栈网关用法见[接入指南](docs/integration.md)。
+Nebula 是嵌入 Go 应用的三层网络库。节点负责认证、发现、选路与数据传输。宿主应用提供拓扑和信任策略，通过库的 API 与钩子应用变更。[接入指南](docs/integration.md)
 
 ## 开发约定
 
-- 从仓库根目录运行 `make fmt`，用 gci 整理导入分组、用 gofumpt 格式化 Go 代码。Go 注释、Go doc 和 README 使用英文，其余项目文档使用中文。
-- 释放连接和监听器时直接调用 `Close()` 或 `defer conn.Close()`。关闭操作决定写入是否成功时，检查并返回关闭错误。
-- 变更公共 API 时，同步更新调用方、Go doc、相关指南和可运行示例。针对行为变化，优先从公开入口验证。
+- 节点行为和 IP 收发在根包 `nebula`。与宿主服务共用监听端口时，`portshare` 负责分流，`meshwire` 定义共享套接字接口。gVisor 网络栈的适配放在 `nebulagvisor`。
+- TLS 使用节点证书认证身份，握手后另行验证集群授权。证书签发与解析在 `pki`，离线命令在 `cmd/nebula-pki`。修改握手或授权交换时，对照[协议说明](docs/mesh.md)。
+- Go 注释（含 Go doc）和 `README.md` 使用英文，其余项目文档使用中文。
+- 公开 API 的用法变更时，同步更新对应指南和 `examples/` 下的示例，并运行受影响的示例。[示例入口](README.md#examples)
 
 ## 验证
 
-从仓库根目录运行 `go test ./...` 和 `go vet ./...`。涉及并发、节点生命周期或收发路径时，运行 `go test -race ./...`。
-
-改动示例后直接运行对应命令，例如 `go run ./examples/relay`。其他示例入口见 [README](README.md)，NAT 场景与混沌种子重放命令见[测试指南](docs/testing.md)。
+- 从仓库根目录运行 `make fmt`、`make lint` 和 `make check`。涉及并发、节点生命周期或网络收发路径时，加跑 `make race`。
+- 改动 NAT 穿透、中继或共享端口时，从 `e2e/` 选择对应场景。故障种子重放见[测试指南](docs/testing.md)，gVisor 网关的补丁验证见 [CI 的 gateway 作业](.github/workflows/test.yml)。

@@ -25,8 +25,9 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	err := run(ctx)
+	stop()
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }

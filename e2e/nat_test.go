@@ -273,7 +273,7 @@ func TestGatewayLayouts(t *testing.T) {
 			l := newLab(t)
 			var a, b *host
 			kind := "udp"
-			want := ""
+			var want string
 			switch layout {
 			case "ipv6-udp", "ipv6-tcp":
 				if layout == "ipv6-tcp" {

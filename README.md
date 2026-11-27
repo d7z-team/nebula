@@ -1,69 +1,85 @@
-# Nebula mesh for Go
+# Nebula
 
-Nebula connects Go applications over an encrypted Layer 3 mesh. Each member has one certified IPv4 address and one certified IPv6 address. Applications can exchange signed publications, open a raw IP port, or attach that port to a gVisor stack.
+Nebula is a Go library for connecting applications over a private IPv4/IPv6 network. Each node runs inside your process and has one certified address in each family. Peers communicate over QUIC or TLS 1.3 over TCP. They can use UDP hole punching to connect directly across NATs or reach each other through authorized relays.
 
-## Getting started
+Use an IP port to handle packets in Go, or attach the node to a gVisor stack to use TCP and UDP sockets on the mesh. Applications can also publish and subscribe to signed messages by topic.
 
-With Go 1.27.3 or later, run the two-node example from the repository root.
+## Installation
 
-```sh
-go run ./examples/quickstart
-```
-
-The example generates credentials, connects Bob to Alice over QUIC, and delivers a signed publication and an IPv6 packet. [Walkthrough](docs/quickstart.md)
-
-## Use from a Go module
-
-Add the module to your application.
+Requires Go 1.27.3 or later.
 
 ```sh
 go get gopkg.d7z.net/nebula
 ```
 
-1. Give `nebula.New` the root CA, pinned cluster CA, node certificate and same-key cluster grant in `Options.Auth`. The local topology can start with just your own member.
-2. For QUIC, supply a UDP socket for each underlay address family you use. An outbound-only TCP node can use the default dialer. Register any IP receiver or subscription that needs to receive the first delivery, then call `Start`.
-3. Call `ConnectEndpoint(ctx, ep)` with a member's physical endpoint. If your initial topology contains only your own member, add the entry's public-key fingerprint to `Auth.TrustedEntrypoints` before calling `New`. Use `ResolveIP` to discover an overlay address through connected neighbors. Configure reciprocal `Member.Links` to reconnect designated neighbors after a disconnect. [Integration guide](docs/integration.md) · [Discovery example](examples/discovery/main.go)
+To try the library, run two nodes on loopback. The example generates its own credentials, sends a signed message, and delivers an IPv6 packet over an IPv4 QUIC connection.
+
+```sh
+go run gopkg.d7z.net/nebula/examples/quickstart@latest
+```
+
+## Usage
+
+The receiver below connects to a known member by its mesh IP and logs incoming packets. Supply the local node's credentials, approved topology, and transport in `nebula.Options`. A UDP socket enables QUIC. [Loading credentials and configuring a node](docs/integration.md)
+
+```go
+package meshapp
+
+import (
+	"context"
+	"log"
+	"net/netip"
+
+	"gopkg.d7z.net/nebula"
+)
+
+func Receive(ctx context.Context, opts nebula.Options, peer netip.Addr) error {
+	node, err := nebula.New(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer node.Close()
+
+	_, err = node.OpenIPPort(nebula.IPPortOptions{
+		Deliver: func(from nebula.PeerID, packet []byte) {
+			log.Printf("received %d bytes from %s", len(packet), from)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := node.Start(); err != nil {
+		return err
+	}
+	if err := node.ConnectPeer(ctx, peer); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+```
+
+To send packets as well, keep the port returned by `OpenIPPort` and call `port.WriteIP(nebula.PeerID{}, packet)`. For a known member's primary address, the node selects the peer from the packet's destination IP. A successful call queues the packet for transmission. [Two-node send and receive example](examples/quickstart/main.go)
 
 ## Examples
 
-These examples run as an ordinary user and generate short-lived credentials in memory. Networking examples use ephemeral loopback ports for the underlay. The public `examples/demo` package supplies their fixtures.
+From the repository root, run an example with a command such as `go run ./examples/relay`.
 
-| Command | What the example verifies |
-| --- | --- |
-| `go run ./examples/quickstart` | A signed publication and an IPv6 packet arrive over IPv4 QUIC. [Source](examples/quickstart/main.go) |
-| `go run ./examples/discovery` | Connect to one physical UDP endpoint, resolve a downstream address through a neighbor, and exchange IPv6 packets with the discovered gateway. [Source](examples/discovery/main.go) |
-| `go run ./examples/relay` | R connects to A and B with its endpoints hidden. After R stops accepting new transit circuits, A and B exchange IP packets over their existing circuit. [Source](examples/relay/main.go) |
-| `go run ./examples/gateway` | Route dual-stack traffic through a site gateway and a default exit. Each downstream service sees the client's address. [Source](examples/gateway/main.go) |
-| `go run ./examples/addressing` | Two peers receive a directed broadcast, one subscriber receives a multicast packet, and one service instance receives an anycast packet. [Source](examples/addressing/main.go) |
-| `go run ./examples/anycast` | Drain one of two TCP services on the same VIP, probe it directly, keep its established connection alive, then withdraw its VIP authorization. [Source](examples/anycast/main.go) |
-| `go run ./examples/pki` | Delegate IPv4 and IPv6 ranges to a site CA, verify a root-issued node identity, and validate its same-key site-issued grant. [Source](examples/pki/main.go) |
-| `go run ./examples/portshare -alpn acme-mesh` | A mesh peer negotiates a custom ALPN while HTTP/2 and HTTP/3 sites share its loopback port. [Source](examples/portshare/main.go) |
-
-The two-process example reads PEM credentials from disk and verifies a signed receipt from the expected peer. [Setup and commands](docs/quickstart.md#使用磁盘凭据启动两个进程) · [Source](examples/peer/main.go)
+- Discover the gateway for a downstream IP or connect two peers through a relay. [Discovery](examples/discovery) · [Relay](examples/relay)
+- Attach a gVisor stack, route a subnet through a gateway, or drain an anycast service while existing TCP connections finish. [Gateway](examples/gateway) · [Addressing](examples/addressing) · [Anycast](examples/anycast)
+- Serve HTTPS, HTTP/3, and mesh traffic on the same port. [Port sharing](examples/portshare)
+- Issue credentials or run peers in separate processes using PEM files. [PKI](examples/pki) · [Two-process walkthrough](docs/quickstart.md#使用磁盘凭据启动两个进程)
 
 ## Documentation
 
-The guides are in Chinese.
+Run `go doc gopkg.d7z.net/nebula` for the Go API. The project guides are in Chinese.
 
-| Guide | Contents |
-| --- | --- |
-| [Quickstart](docs/quickstart.md) | Connect two local nodes or use PEM credentials to exchange a request and receipt between two processes. |
-| [Integration guide](docs/integration.md) | Discover members and gateways, configure relays and connection limits, and diagnose address or instance conflicts. |
-| [Addressing](docs/addressing.md) | Allocate dual-stack addresses, enable broadcast and multicast, select anycast instances and use subnet or default gateways. |
-| [Port sharing](docs/portshare.md) | Share TCP with HTTPS and UDP with HTTP/3, configure the listeners and size the mesh handshake limit. |
-| [Mesh protocol](docs/mesh.md) | Mutual TLS 1.3 over QUIC or TCP, configurable key exchange groups, end-to-end relay circuits, and delivery of IP packets and signed publications. |
-| [PKI reference](docs/pki.md) | Issue and verify node certificates and same-key cluster grants with the Go API or offline CLI, and reload credentials. |
-| [Testing guide](docs/testing.md) | Replay NAT and network faults, verify relay capacity and run benchmarks. |
+- [Getting started](docs/quickstart.md) · [Embedding a node](docs/integration.md)
+- [Addressing and routing](docs/addressing.md) · [Sharing a listener](docs/portshare.md)
+- [Certificates and authorization](docs/pki.md) · [Mesh protocol](docs/mesh.md)
 
-## Development
+For development, run `make fmt`, `make lint`, and `make check` from the repository root. The testing guide covers race detection, NAT scenarios, and replaying network faults. [Testing guide](docs/testing.md)
 
-```sh
-make fmt
-go test ./...
-go test -race ./...
-go vet ./...
-```
+## License
 
-## Origin and license
-
-This project originated from Slack's Nebula and now implements its own TLS-based mesh protocol. [Upstream project](https://github.com/slackhq/nebula) · [MIT License](LICENSE)
+Nebula originated from Slack's Nebula project and is distributed under the MIT license. [Upstream Nebula](https://github.com/slackhq/nebula) · [MIT license](LICENSE)

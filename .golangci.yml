@@ -1,6 +1,37 @@
+# Adapted from https://github.com/go-gitea/gitea/blob/17ac892df5ea0c898e4efe649835e4216315bdc7/.golangci.yml
+# Copyright (c) 2016 The Gitea Authors
+# Copyright (c) 2015 The Gogs Authors
+# SPDX-License-Identifier: MIT
 version: "2"
 
+run:
+  timeout: 10m
+
+output:
+  sort-order:
+    - file
+
 linters:
+  default: none
+  enable:
+    - bidichk
+    - bodyclose
+    - errcheck
+    - gocheckcompilerdirectives
+    - gocritic
+    - govet
+    - ineffassign
+    - mirror
+    - nakedret
+    - nilnil
+    - nolintlint
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unparam
+    - unused
+    - usetesting
+    - wastedassign
   settings:
     errcheck:
       verbose: true
@@ -8,11 +39,36 @@ linters:
         - (io.Closer).Close
         - fmt.Fprintf(net/http.ResponseWriter)
         - io.WriteString(net/http.ResponseWriter)
+    gocritic:
+      enabled-checks:
+        - equalFold
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+    govet:
+      enable:
+        - nilness
+        - unusedwrite
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    testifylint:
+      disable:
+        - empty
+        - go-require
+        - require-error
+    usetesting:
+      os-temp-dir: true
   exclusions:
+    generated: lax
     rules:
       # Match network teardown by receiver type, e.g. (net.Conn).Close.
       - linters: [errcheck]
         text: '\b(net|http|quic-go|http3|yamux|gonet|nebula|portshare)\.\w+\)\.Close(WithError)?`'
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
 
 formatters:
   enable:

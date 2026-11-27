@@ -47,7 +47,7 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	pair := f.opts[0].Auth.Certificates
 	leaf, err := x509.ParseCertificate(pair.Grant[0])
 	require.NoError(t, err)
-	leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}, Value: make([]byte, (24<<10)-len(leaf.Raw)-len(leaf.RawIssuer)-len(pair.Grant[1])-len(pair.Node.Certificate[0])-128)})
+	leaf.ExtraExtensions = append(slices.Clip(leaf.Extensions), pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}, Value: make([]byte, (24<<10)-len(leaf.Raw)-len(leaf.RawIssuer)-len(pair.Grant[1])-len(pair.Node.Certificate[0])-128)})
 	pair.Grant[0], err = x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
 	require.NoError(t, err)
 	for i := range f.opts {

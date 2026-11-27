@@ -10,6 +10,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -116,7 +117,7 @@ func TestCredentialAndFrameBudgets(t *testing.T) {
 	// signature size constant throughout the +/- one byte cases.
 	pad := 22 << 10
 	encode := func(n int) []byte {
-		leaf.ExtraExtensions = append(leaf.Extensions, pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 3}, Value: make([]byte, n)})
+		leaf.ExtraExtensions = append(slices.Clip(leaf.Extensions), pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 3}, Value: make([]byte, n)})
 		der, err := x509.CreateCertificate(rand.Reader, leaf, f.ca, leaf.PublicKey, f.key)
 		require.NoError(t, err)
 		return der
