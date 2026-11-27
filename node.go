@@ -99,7 +99,7 @@ type AuthOptions struct {
 	CheckChain func(context.Context, ChainCheck) (time.Time, error)
 }
 
-// EndpointSource identifies how the node obtained a local address for publication.
+// EndpointSource identifies how the node obtained a local address for advertisement.
 type EndpointSource uint8
 
 const (
@@ -173,7 +173,7 @@ type Node struct {
 	done                   chan struct{}
 	cred                   atomic.Pointer[credentials]
 	policy                 atomic.Pointer[topologyView]
-	admissions             uint64 // generation of session, publication and conflict admissions
+	admissions             uint64 // generation of session and conflict admissions
 	introMu                sync.Mutex
 	introCache             cachedIntroduction
 	transports             map[bool]*udpTransport
@@ -188,7 +188,7 @@ type Node struct {
 	deniedUDP              map[netip.AddrPort]deniedEndpoint
 	resolutions            map[netip.Addr]*ipResolution
 	queries                map[string]time.Time
-	backgroundSlots        chan struct{}
+	alternateProbeSlots    chan struct{}
 	neighborDialSlots      chan struct{}
 	sharedAddressDialSlots chan struct{}
 	pathRegistered         chan struct{} // lazy notification for callers waiting for a cold-dial slot
@@ -203,8 +203,6 @@ type Node struct {
 	relay                  RelayStatus
 	shaper                 fairShaper
 	dialFailures           atomic.Uint64
-	publications           map[string]cachedPublication
-	subscriptions          map[*Subscription]struct{}
 	lastConnectError       string
 	listenerErrors         map[string]string
 }
@@ -357,11 +355,9 @@ func New(parent context.Context, o Options) (*Node, error) {
 		observations:           make(map[observer]observation),
 		resolutions:            make(map[netip.Addr]*ipResolution),
 		queries:                make(map[string]time.Time),
-		publications:           make(map[string]cachedPublication),
-		subscriptions:          make(map[*Subscription]struct{}),
 		handshakeSlots:         make(chan struct{}, o.MaxInboundHandshakes),
 		grantWrites:            make(map[chan struct{}]struct{}),
-		backgroundSlots:        make(chan struct{}, 8),
+		alternateProbeSlots:    make(chan struct{}, 8),
 		neighborDialSlots:      make(chan struct{}, 4),
 		sharedAddressDialSlots: make(chan struct{}, 8),
 	}
@@ -373,7 +369,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 		cancel()
 		return nil, err
 	}
-	if err := n.validateIntroduction(view, c); err != nil {
+	if err := n.checkLocalIntroductionBudget(view, c); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -530,10 +526,6 @@ func (n *Node) Close() error {
 	clear(n.peers)
 	n.probes.pending = nil
 	p := n.port
-	for sub := range n.subscriptions {
-		close(sub.publications)
-		delete(n.subscriptions, sub)
-	}
 	n.mu.Unlock()
 	// Let QUIC flush its close frame, even when another service has the
 	// physical writer. A stalled write must not hold up shutdown indefinitely.

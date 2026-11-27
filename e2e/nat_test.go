@@ -236,10 +236,11 @@ func TestNATPaths(t *testing.T) {
 			for _, h := range []*host{a, b} {
 				l.connect(h, r, "udp")
 				waitPath(t, r, h, "udp")
+				matches, err := r.node.ResolveIP(t.Context(), h.ip)
+				require.NoError(t, err)
+				require.Len(t, matches, 1)
+				require.Equal(t, h.node.ID(), matches[0].Peer)
 			}
-			// A delivered signed publication confirms both adjacency sessions carry control traffic.
-			publicationReceipt(t, a, r, "A ready")
-			publicationReceipt(t, b, r, "B ready")
 			if tc.dependent {
 				probe := flow{"wan", netip.MustParseAddrPort("192.0.2.1:45001"), netip.MustParseAddrPort("192.0.2.2:46002"), 17}
 				// The first signed introduction may predate the observer's first hello.

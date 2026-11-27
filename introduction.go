@@ -35,7 +35,7 @@ type introduction struct {
 
 type learnedIntroduction struct {
 	introduction
-	record              statement
+	record              signedIntroduction
 	authorizedUntil     time.Time
 	grantHash, nodeHash [sha256.Size]byte
 	firstSeen, lastSeen time.Time
@@ -43,7 +43,7 @@ type learnedIntroduction struct {
 
 type cachedIntroduction struct {
 	introduction
-	record     statement
+	record     signedIntroduction
 	grantLeaf  *x509.Certificate // Each reload parses a fresh grant leaf, including node-only renewals.
 	policy     weak.Pointer[topologyView]
 	candidates []Endpoint // Includes observations omitted from the signed record for size.
@@ -124,7 +124,22 @@ func (n *Node) buildIntroduction(p *topologyView, id pki.Identity, endpoints []E
 	return intro
 }
 
-func (n *Node) validateIntroduction(p *topologyView, cred *credentials) error {
+type signedIntroduction []byte
+
+type introductionEnvelope struct {
+	Publisher PeerID       `json:"publisher"`
+	Value     introduction `json:"value"`
+}
+
+func (n *Node) signIntroduction(value introduction, signer tls.Certificate) (signedIntroduction, error) {
+	b, err := json.Marshal(introductionEnvelope{n.id, value})
+	if err != nil {
+		return nil, err
+	}
+	return pki.SignObject(n.Cluster().Network(), "introduction", b, signer)
+}
+
+func (n *Node) checkLocalIntroductionBudget(p *topologyView, cred *credentials) error {
 	endpoints, _ := n.introductionEndpoints(p, false)
 	// A future refresh can use all nine fractional digits of RFC 3339.
 	expires := time.Unix(time.Now().Unix(), 999999999)
@@ -136,7 +151,7 @@ func (n *Node) validateIntroduction(p *topologyView, cred *credentials) error {
 }
 
 func (n *Node) checkIntroductionSize(p *topologyView, signer tls.Certificate, intro introduction) error {
-	body, err := n.statementBody(intro)
+	body, err := json.Marshal(introductionEnvelope{n.id, intro})
 	if err != nil {
 		return err
 	}
@@ -159,7 +174,7 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 		return *cache
 	}
 	intro := n.buildIntroduction(p, cred.identity, endpoints, now.Add(introductionLifetime))
-	record, err := n.signStatement("introduction", intro, signer)
+	record, err := n.signIntroduction(intro, signer)
 	if errors.Is(err, pki.ErrDocumentTooLarge) && len(endpoints) > fixed {
 		// The fixed prefix fits and the full list overflowed. Find how many
 		// observations fit between them before invoking the signer again.
@@ -168,7 +183,7 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 			return n.checkIntroductionSize(p, signer, intro) != nil
 		})
 		intro.Endpoints = endpoints[:fixed+count]
-		record, err = n.signStatement("introduction", intro, signer)
+		record, err = n.signIntroduction(intro, signer)
 	}
 	if err != nil {
 		return cachedIntroduction{}
@@ -177,87 +192,119 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 	return *cache
 }
 
-func (n *Node) learnIntroduction(ctx context.Context, record statement, reply *query) (PeerID, bool) {
-	p := n.policy.Load()
-	identity, body, end, err := n.verifyStatement(ctx, "introduction", record, p)
-	a := identity.ID
+func (n *Node) verifyIntroduction(ctx context.Context, p *topologyView, record signedIntroduction, reply *query) (pki.Identity, learnedIntroduction, error) {
+	body, chain, err := pki.VerifyObjectSignature(record, p.cluster.Network(), "introduction")
 	if err != nil {
-		return a, false
+		return pki.Identity{}, learnedIntroduction{}, err
 	}
-	var v introduction
+	identity, nodePath, grantPaths, err := pki.VerifyObjectSigner(chain, n.o.Auth.RootCA, p.cluster, time.Now())
+	if err != nil {
+		return pki.Identity{}, learnedIntroduction{}, err
+	}
+	if _, ok := p.members[n.id]; !ok {
+		return identity, learnedIntroduction{}, ErrPathPolicy
+	}
+	check := ChainCheck{Member: identity.ID, Local: identity.ID == n.id, Purpose: NodeIdentity, Usage: x509.ExtKeyUsageClientAuth}
+	nodeEnd, err := n.chainDeadline(ctx, check, [][]*x509.Certificate{nodePath})
+	if err != nil {
+		return identity, learnedIntroduction{}, err
+	}
+	check.Purpose, check.Usage = ClusterGrant, x509.ExtKeyUsageCodeSigning
+	grantEnd, err := n.chainDeadline(ctx, check, grantPaths)
+	if err != nil {
+		return identity, learnedIntroduction{}, err
+	}
+	var envelope introductionEnvelope
+	if json.Unmarshal(body, &envelope) != nil || envelope.Publisher != identity.ID {
+		return identity, learnedIntroduction{}, ErrPathPolicy
+	}
+	intro := envelope.Value
 	now := time.Now()
-	if json.Unmarshal(body, &v) != nil || v.Instance == (InstanceID{}) || !now.Before(v.Expires) || v.Expires.After(now.Add(introductionLifetime+introductionClockSkew)) || len(v.Endpoints) > maxIntroductionEndpoints {
-		return a, false
+	if intro.Addresses != identity.Addresses || intro.Instance == (InstanceID{}) || len(intro.Endpoints) > maxIntroductionEndpoints {
+		return identity, learnedIntroduction{}, ErrPathPolicy
 	}
-	if v.Addresses != identity.Addresses {
-		return a, false
+	if !now.Before(intro.Expires) || intro.Expires.After(now.Add(introductionLifetime+introductionClockSkew)) {
+		return identity, learnedIntroduction{}, ErrPathPolicy
 	}
-	if reply != nil && !v.match(*reply, a, p.cluster.Subnet(reply.IP).IsValid()).IsValid() {
-		return a, false
+	if reply != nil && !intro.match(*reply, identity.ID, p.cluster.Subnet(reply.IP).IsValid()).IsValid() {
+		return identity, learnedIntroduction{}, ErrPathPolicy
 	}
-	for _, prefix := range v.RoutedPrefixes {
+	for _, prefix := range intro.RoutedPrefixes {
 		if !identity.AllowsRoute(prefix) {
-			return a, false
+			return identity, learnedIntroduction{}, ErrPathPolicy
 		}
 	}
-	for _, e := range v.Endpoints {
-		if !p.physicalEndpoint(e) {
-			return a, false
+	for _, ep := range intro.Endpoints {
+		if !p.physicalEndpoint(ep) {
+			return identity, learnedIntroduction{}, ErrPathPolicy
 		}
 	}
-	end = earlierDeadline(v.Expires, end)
-	intro := learnedIntroduction{
-		introduction: v, record: record, authorizedUntil: end,
-		grantHash: sha256.Sum256(identity.leaf.Raw), nodeHash: sha256.Sum256(identity.node.Raw), firstSeen: now, lastSeen: now,
+	return identity, learnedIntroduction{
+		introduction:    intro,
+		record:          record,
+		authorizedUntil: earlierDeadline(intro.Expires, earlierDeadline(nodeEnd, grantEnd)),
+		grantHash:       sha256.Sum256(chain[0].Raw),
+		nodeHash:        sha256.Sum256(nodePath[0].Raw),
+		firstSeen:       now,
+		lastSeen:        now,
+	}, nil
+}
+
+func (n *Node) learnIntroduction(ctx context.Context, record signedIntroduction, reply *query) (PeerID, bool) {
+	p := n.policy.Load()
+	identity, intro, err := n.verifyIntroduction(ctx, p, record, reply)
+	peer := identity.ID
+	if err != nil {
+		return peer, false
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.policy.Load() != p || n.modes[a] == Blocked {
-		return a, false
+	if n.policy.Load() != p || n.modes[peer] == Blocked {
+		return peer, false
 	}
-	bound, _ := n.deliveryInstanceLocked(a)
-	if a == n.id {
+	bound, _ := n.deliveryInstanceLocked(peer)
+	if peer == n.id {
 		bound = n.instance
 	}
-	addressConflict := n.addressConflictLocked(identity.Identity)
-	if addressConflict || bound != (InstanceID{}) && bound != v.Instance {
-		decision := "instance mismatch"
-		if addressConflict {
-			decision = "address conflict"
+	if n.addressConflictLocked(identity) {
+		n.recordObservationLocked(intro.observation(peer, "address conflict"), intro.RoutedPrefixes)
+		return peer, false
+	}
+	if bound != (InstanceID{}) && bound != intro.Instance {
+		n.recordObservationLocked(intro.observation(peer, "instance mismatch"), intro.RoutedPrefixes)
+		return peer, false
+	}
+	if peer == n.id {
+		return peer, false
+	}
+	old := n.discovered[peer]
+	oldValid := intro.lastSeen.Before(old.authorizedUntil)
+	if oldValid && old.Expires.After(intro.Expires) {
+		if old.Instance != intro.Instance {
+			n.recordObservationLocked(intro.observation(peer, "different signed instance"), intro.RoutedPrefixes)
+			return peer, false
 		}
-		n.recordObservationLocked(intro.observation(a, decision), v.RoutedPrefixes)
-		return a, false
+		return peer, true
 	}
-	if a == n.id {
-		return a, false
-	}
-	old := n.discovered[a]
-	if now.Before(old.authorizedUntil) && old.Expires.After(v.Expires) {
-		if old.Instance != v.Instance {
-			n.recordObservationLocked(intro.observation(a, "different signed instance"), v.RoutedPrefixes)
-			return a, false
-		}
-		return a, true
-	}
-	if old.Instance == v.Instance && old.grantHash == intro.grantHash && old.nodeHash == intro.nodeHash {
+	if old.Instance == intro.Instance && old.grantHash == intro.grantHash && old.nodeHash == intro.nodeHash {
 		intro.firstSeen = old.firstSeen
 		if slices.Equal(old.record, record) {
 			intro.lastSeen = old.lastSeen
 		}
-	} else if now.Before(old.authorizedUntil) && old.Instance != v.Instance {
-		n.recordObservationLocked(old.observation(a, "different signed instance"), old.RoutedPrefixes)
+	} else if oldValid && old.Instance != intro.Instance {
+		n.recordObservationLocked(old.observation(peer, "different signed instance"), old.RoutedPrefixes)
 	}
-	n.forgetIntroductionLocked(a, old)
-	for _, e := range v.Endpoints {
-		if n.introduced[e] == nil {
-			n.introduced[e] = make(map[PeerID]time.Time)
+	n.forgetIntroductionLocked(peer, old)
+	for _, ep := range intro.Endpoints {
+		if n.introduced[ep] == nil {
+			n.introduced[ep] = make(map[PeerID]time.Time)
 		}
-		n.introduced[e][a] = end
+		n.introduced[ep][peer] = intro.authorizedUntil
 	}
-	n.discovered[a] = intro
-	n.discoveredOwners[v.IPv4] = a
-	n.discoveredOwners[v.IPv6] = a
-	return a, true
+	n.discovered[peer] = intro
+	n.discoveredOwners[intro.IPv4] = peer
+	n.discoveredOwners[intro.IPv6] = peer
+	return peer, true
 }
 
 // Remove the derived indexes together when replacing or expiring a signed introduction.

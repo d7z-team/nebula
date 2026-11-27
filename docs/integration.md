@@ -34,29 +34,28 @@ func serve(serviceCtx context.Context, opts nebula.Options, ep nebula.Endpoint) 
 }
 ```
 
-需要接收启动后的第一条消息或第一个包时，在 `Start` 前调用 `Subscribe` 或 `OpenIPPort`。初始路径策略也可在这时安装。连接、网络查询、发布和写包都需要节点已启动。已取消的调用不会启动新的拨号。重复启动返回 `ErrNodeAlreadyStarted`。后台收发或认证回调可以通知宿主退出，由外层 goroutine 调用 `Close` 并等待任务结束。
+需要接收启动后的第一个 IP 包时，在 `Start` 前调用 `OpenIPPort`。初始路径策略也可在这时安装。连接、网络查询和写包都需要节点已启动。已取消的调用不会启动新的拨号。重复启动返回 `ErrNodeAlreadyStarted`。后台收发或认证回调可以通知宿主退出，由外层 goroutine 调用 `Close` 并等待任务结束。
 
 ## 选择本机安全策略
 
-| 宿主目的 | 配置或操作 | 对现有连接和消息的影响 |
+| 宿主目的 | 配置或操作 | 对本机连接与收发的影响 |
 | --- | --- | --- |
 | 为同一成员换证 | `ReloadCertificates(ctx, set)` 校验并替换整组本机凭据。 | 新握手和签名使用新凭据。已建立的会话仍按其实际握手证书授权，每条路径的 `PathStatus.LocalNodeSerial` 和 `LocalGrantSerial` 可用于核对。 |
-| 撤回对证书或公钥的信任 | 更新 `Options.Auth.CheckChain` 读取的宿主策略，再调用 `Revalidate(ctx)`。 | 本机复查凭据、会话、实例冲突和缓存主题消息，清空发现缓存，关闭失权路径。可用 `ControlStatus()` 和 `Paths()` 核对结果。[按公钥撤权示例](pki.md#热加载与宿主授权) |
+| 撤回对证书或公钥的信任 | 更新 `Options.Auth.CheckChain` 读取的宿主策略，再调用 `Revalidate(ctx)`。 | 本机复查凭据、会话和实例冲突，清空发现缓存，关闭失权路径。可用 `ControlStatus()` 和 `Paths()` 核对结果。[按公钥撤权示例](pki.md#热加载与宿主授权) |
 | 调整网关、VIP、邻接或中继权限 | 用 `ApplyTopology(ctx, view)` 安装完整的本地视图。 | 失去授权的路径、电路和排队包会被清理。移除一个远端的成员条目会收回其静态授权，有效集群凭据仍可在路径允许时使用该成员自己的主地址。 |
-| 限制本机到一个成员的路径 | 用 `SetPeerPathPolicy(peerID, RelayOnly)` 限定中继路径，或用 `Blocked` 封锁到该成员的路径。 | 本机关闭与新模式冲突的已有路径。各节点独立决定是否信任同一张证书或接纳其签名消息。 |
+| 限制本机到一个成员的路径 | 用 `SetPeerPathPolicy(peerID, RelayOnly)` 限定中继路径，或用 `Blocked` 封锁该成员。 | 本机关闭与新模式冲突的路径。`Blocked` 还会让本机拒收该成员的签名介绍，并在地址查询结果中排除该成员。 |
 | 限制哪些网关可代表某个源网段 | 网关的集群授权和本机拓扑共同限定地址收发范围。在 `Options.InboundPolicy` 按认证成员与包地址进一步筛选。 | 策略在合规入站 IP 包交付前逐包执行，适用于已有会话。[下一跳与回程](addressing.md#下一跳与回程) |
 | 控制物理地址披露 | 创建节点时设置 `Options.Transport.HideEndpoints`；以 `Member.Restricted` 和双向 `Links` 限定直连邻居。 | 本机的签名介绍省略端点，响应会合查询时只回复记录。直连邻居仍可看到实际套接字地址。 |
-| 选择可传播的物理地址 | 用 `Options.Transport.AllowAdvertiseEndpoint` 按候选来源、地址和观测者筛选本机签名介绍。 | 获准地址可以随签名介绍继续转发。已经发布的记录按原有效期过期。 |
+| 选择可传播的物理地址 | 用 `Options.Transport.AllowAdvertiseEndpoint` 按来源、地址和观测者筛选候选端点。 | 获准端点随本机签名介绍传播。其他成员可能缓存先前的介绍直到到期。 |
 | 限制主动联系的物理地址 | 用 `Options.Transport.AllowOutboundEndpoint` 筛选 TCP、QUIC 拨号、备用路径探测和 UDP 打洞目的地。 | `ConnectEndpoint` 遇到拒绝返回 `ErrPathPolicy`，自动拨号继续选择候选或获准中继。已有会话由成员路径策略控制。 |
-| 调整主题发布权 | 在 `Member.PublishTopics` 指定允许发布的主题或子树，调用 `ApplyTopology`。 | 本机会复核缓存中原发布者的主题授权。`Subscribe` 决定本机投递，转发邻居可以读取正文。机密载荷由应用加密给目标接收者。 |
 
 `Revalidate` 和 `ApplyTopology` 在提交前遇到上下文取消时返回错误，宿主可重新发起调用。提交后，即使上下文取消，也会等到提交时已登记的握手授权帧写完或写入失败，再返回成功。各节点分别生效，已交给传输层的字节仍可能稍后到达。[握手与撤权边界](mesh.md#证书生命周期与宿主授权)
 
-`New` 和 `ApplyTopology` 各自保存一份私有拓扑。如果宿主也要为不同节点准备可独立修改的视图，为每份视图创建自己的 `Members` 切片，用 `member.Clone()` 复制要放入的成员。这样可以在一份视图中修改邻接、端点或主题，其他视图继续使用各自的值。[多节点示例](../examples/demo/nodes.go)
+`New` 和 `ApplyTopology` 各自保存一份私有拓扑。如果宿主也要为不同节点准备可独立修改的视图，为每份视图创建自己的 `Members` 切片，用 `member.Clone()` 复制要放入的成员。这样可以在一份视图中修改邻接、端点或下游前缀，其他视图继续使用各自的值。[多节点示例](../examples/demo/nodes.go)
 
 信任根和集群 CA 在创建节点时固定。无效拓扑或换证失败会保留当前配置。有效视图也可以撤回本机成员资格，此时 `ControlStatus().Ready` 为 false。[凭据示例与授权钩子](pki.md#热加载与宿主授权)
 
-### 只发布指定入口
+### 只通告指定物理端点
 
 例如网关绑定了管理网监听器，同时为其他成员提供固定的公网入口。将入口加入 `AdvertiseEndpoints`，只授权显式通告来源即可。
 
@@ -67,7 +66,7 @@ opts.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
 }
 ```
 
-若还接受可信邻居报告的 NAT 映射，可额外允许 `c.Source == nebula.EndpointFromObservation && c.Observer == trustedPeer`。默认候选来自显式通告、拓扑、具体监听地址和已认证 QUIC 邻居的有效观测。每个邻居可按地址族各提供一个观测。获准端点写入同一份可转发的签名介绍，所有收到介绍的成员都能读取。发布和出站端点回调都应支持并发并及时返回。[端点过滤示例](../examples/discovery/main.go) · [限定直连邻居](#让节点通过已连接的邻居提供中继)
+若还接受可信邻居报告的 NAT 映射，可额外允许 `c.Source == nebula.EndpointFromObservation && c.Observer == trustedPeer`。所有收到签名介绍的成员都能读取其中的端点。`AllowAdvertiseEndpoint` 和 `AllowOutboundEndpoint` 都可能被并发调用，回调应及时返回。[端点过滤示例](../examples/discovery/main.go) · [端点来源和顺序](mesh.md#发现选路与中继)
 
 ## 跨机器连接
 
@@ -179,7 +178,7 @@ if path, ok := node.PreferredPath(peerID); ok {
 | --- | --- | --- |
 | `MaxInboundHandshakes` | 256 | 所有地址族共用的入站直连建链名额。TCP 在 TLS 握手前占用，QUIC 在 TLS 握手后占用，两者均在会话注册或建链失败时释放。[共享端口容量](portshare.md#容量和部署边界) |
 | `MaxCircuits` | 512 | 本机发起、终止和转发的电路合计占用，含正在建立的电路。用 `ControlStatus().Circuits` 读取当前占用。 |
-| `MaintenanceInterval` | 2 秒 | 重试拓扑中的离线邻居，清理过期路径、发现记录和主题消息。 |
+| `MaintenanceInterval` | 2 秒 | 重试拓扑中的离线邻居，清理过期路径和发现记录。 |
 | `Probe.Interval` | 继承 `MaintenanceInterval` | 本机对每条已建路径发起探活的目标间隔。 |
 | `Probe.FailureThreshold` | 3 | 本机连续多少次探活失败后关闭该路径。成功一次就清零。 |
 | `DialTimeout` | 4 秒 | 拨号、握手、控制交换和传输写入的基础超时。中继建链按剩余跳数计算预算。 |
@@ -201,7 +200,7 @@ opts.RelayWeights = map[nebula.PeerID]uint16{backboneID: 8}
 
 每个入站电路从开始建链起占用直接邻居的额度，包括在本机终止的电路。示例将普通邻居限制在 16 条，指定骨干的零值覆盖允许它使用本机总容量。本机始发电路只计入总量。`RelayStatus().InboundCircuits` 给出各邻居的当前占用，`RejectedCapacity`、`RejectedPeerLimit`、`RejectedDraining` 分别累计本机因总量、邻居额度和排空而拒绝的次数。
 
-回程流量经同一骨干汇聚时，本机只能看到一个入向邻居。示例为它设置 8 倍字节权重，其他邻居默认为 1。本机拓扑条目的 `BytesPerSecond` 限制 IP、主题消息与中继流共用的字节速率（字节/秒）。零值允许使用全部可用带宽，中继仍按邻居调度并限制每对邻居的并发写入。[调度与计量](mesh.md#数据交付整形与主题消息)
+回程流量经同一骨干汇聚时，本机只能看到一个入向邻居。示例为它设置 8 倍字节权重，其他邻居默认为 1。本机拓扑条目的 `BytesPerSecond` 限制 IP 包与中继流共用的字节速率（字节/秒）。零值允许使用全部可用带宽，中继仍按邻居调度并限制每对邻居的并发写入。[调度与计量](mesh.md#数据交付与整形)
 
 计划维护时调用 `SetTransitDraining(true)`，等待 `RelayStatus().TransitCircuits` 降到零。排空期间停止接纳新中转电路，既有电路仍可承载新操作，以本机为终点的连接仍可建立。宿主决定等待期限，通过 `SetTransitDraining(false)` 恢复接纳。立即撤回转发授权可用 `ApplyTopology` 撤销 `Transit`。[可运行示例](../examples/relay/main.go)
 
@@ -243,7 +242,7 @@ return err
 | 已出队的这次提交是否成功 | `ObserveTransmit(result)` | 拨号失败或等待带宽时被取消，`Transport` 可以为空。包超过所选路径的对端收包上限时，结果带有所选传输和 `ErrPacketTooLarge`。回调可能并发，应及时返回。 |
 | 远端业务是否处理了请求 | 对端应用回执 | 用请求 ID 和预期成员关联回执。传输接受一个包后，远端仍可能丢弃它。 |
 
-异步上限示例可用 `go test -v -run '^ExampleIPPort_WriteIP$' .` 运行。[可执行示例](../example_test.go) · [双进程应用回执](quickstart.md#使用磁盘凭据启动两个进程)
+异步上限示例可用 `go test -v -run '^ExampleIPPort_WriteIP$' .` 运行。[可执行示例](../example_test.go)
 
 网关示例在外层使用 TLS/TCP。客户端用 `RefreshIP` 发现网关、用 `ApplyTopology` 批准下游前缀，在 gVisor 中为站点前缀和默认出口安装路由。两个下游的 IPv4 和 IPv6 UDP 回显可核对实际出口。[双栈网关源码](../examples/gateway/main.go)
 
@@ -268,9 +267,7 @@ opts.InboundPolicy = func(peer nebula.PeerID, src, dst netip.Addr) bool {
 }
 ```
 
-## 主题消息与运行状态
-
-例如，给发布成员的 `PublishTopics` 配置 `app/demo`，接收方在发布前调用 `Subscribe("app/demo/hello")`，即可从 `sub.Publications()` 读取之后在本机接纳的该主题消息。每个订阅缓冲 32 条，满时的丢弃数见 `sub.Missed()`。关闭订阅或节点会关闭接收通道。`Publish` 返回本机接纳的消息 ID，需要确认远端处理结果时用该 ID 关联业务回执。[收发示例](../examples/quickstart/main.go) · [缓存与补发](mesh.md#签名主题消息)
+## 运行状态
 
 | 排查的问题 | 查看位置 |
 | --- | --- |

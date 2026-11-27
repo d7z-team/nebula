@@ -24,7 +24,6 @@ func main() {
 
 func run(hybrid bool) error {
 	a, b := demo.NewHost(1), demo.NewHost(2)
-	b.PublishTopics = []string{"app/demo"}
 	options, err := demo.NodeOptions(a, b)
 	if err != nil {
 		return err
@@ -48,11 +47,6 @@ func run(hybrid bool) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	sub, err := alice.Subscribe("app/demo/hello")
-	if err != nil {
-		return err
-	}
-	defer sub.Close()
 	if err := bob.ConnectPeerID(ctx, a.ID); err != nil {
 		return err
 	}
@@ -61,25 +55,8 @@ func run(hybrid bool) error {
 		return fmt.Errorf("expected a direct UDP path to Alice, got %q", path.Transport)
 	}
 	fmt.Printf("connected to Alice over %s with %s\n", path.Transport, path.TLSGroup)
-	id, err := bob.Publish(ctx, "app/demo/hello", []byte("hello"))
-	if err != nil {
-		return err
-	}
-	select {
-	case e, ok := <-sub.Publications():
-		if !ok {
-			return fmt.Errorf("subscription closed")
-		}
-		if e.ID != id || e.Origin != bob.ID() || string(e.Payload) != "hello" {
-			return fmt.Errorf("unexpected publication %s from %s", e.ID, e.Origin)
-		}
-		fmt.Printf("%s from %v\n", e.Payload, e.Origin)
-	case <-ctx.Done():
-		return fmt.Errorf("wait for publication: %w", ctx.Err())
-	}
-
 	received := make(chan []byte, 1)
-	rx, err := alice.OpenIPPort(nebula.IPPortOptions{Deliver: func(_ nebula.PeerID, b []byte) {
+	_, err = alice.OpenIPPort(nebula.IPPortOptions{Deliver: func(_ nebula.PeerID, b []byte) {
 		select {
 		case received <- bytes.Clone(b):
 		case <-ctx.Done():
@@ -88,12 +65,10 @@ func run(hybrid bool) error {
 	if err != nil {
 		return err
 	}
-	defer rx.Close()
 	tx, err := bob.OpenIPPort(nebula.IPPortOptions{Deliver: func(nebula.PeerID, []byte) {}})
 	if err != nil {
 		return err
 	}
-	defer tx.Close()
 
 	// IPv6 Next Header 59 marks a packet with no upper-layer payload.
 	packet := make([]byte, 40)

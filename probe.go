@@ -151,5 +151,5 @@ func (n *Node) probeSession(s *session) {
 		n.mu.Unlock()
 		n.exchangeAdvert(s)
 	}
-	n.tryTask(n.backgroundSlots, func() { n.probeAlternatePaths(s, failures) })
+	n.tryTask(n.alternateProbeSlots, func() { n.probeAlternatePaths(s, failures) })
 }

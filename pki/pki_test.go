@@ -75,25 +75,25 @@ func TestIssuanceAndCMS(t *testing.T) {
 			leaf, err := issuer.IssueGrant(req, enrollment)
 			require.NoError(t, err)
 			crt := tls.Certificate{Certificate: [][]byte{leaf.Raw, inter.Raw, root.Raw}, PrivateKey: signer}
-			wire, err := SignObject("team", "publication", []byte("original publisher"), crt)
+			wire, err := SignObject("team", "introduction", []byte("original content"), crt)
 			require.NoError(t, err)
-			body, chain, err := VerifyObjectSignature(wire, "team", "publication")
+			body, chain, err := VerifyObjectSignature(wire, "team", "introduction")
 			require.NoError(t, err)
-			require.Equal(t, "original publisher", string(body))
+			require.Equal(t, "original content", string(body))
 			_, err = VerifyGrant(chain, roots, cluster, peer, now)
 			require.NoError(t, err)
-			_, _, err = VerifyObjectSignature(wire, "other", "publication")
+			_, _, err = VerifyObjectSignature(wire, "other", "introduction")
 			require.Error(t, err)
-			_, _, err = VerifyObjectSignature(wire, "team", "introduction")
+			_, _, err = VerifyObjectSignature(wire, "team", "other-purpose")
 			require.Error(t, err)
 			changed := bytes.Replace(wire, []byte("original"), []byte("modified"), 1)
-			_, _, err = VerifyObjectSignature(changed, "team", "publication")
+			_, _, err = VerifyObjectSignature(changed, "team", "introduction")
 			require.Error(t, err)
 			t.Run("document limit", func(t *testing.T) {
 				data := make([]byte, MaxDocument)
 				chainOnly := tls.Certificate{Certificate: crt.Certificate}
 				limit := sort.Search(len(data), func(i int) bool {
-					err := CheckObjectSize("team", "publication", data[:i+1], chainOnly)
+					err := CheckObjectSize("team", "introduction", data[:i+1], chainOnly)
 					if err != nil {
 						require.ErrorIs(t, err, ErrDocumentTooLarge)
 					}
@@ -101,18 +101,18 @@ func TestIssuanceAndCMS(t *testing.T) {
 				})
 				require.Positive(t, limit)
 				require.Less(t, limit, len(data))
-				wire, err := SignObject("team", "publication", data[:limit], crt)
+				wire, err := SignObject("team", "introduction", data[:limit], crt)
 				require.NoError(t, err)
-				got, _, err := VerifyObjectSignature(wire, "team", "publication")
+				got, _, err := VerifyObjectSignature(wire, "team", "introduction")
 				require.NoError(t, err)
 				require.Equal(t, data[:limit], got)
-				_, _, err = VerifyObjectSignature(append(wire, 0), "team", "publication")
+				_, _, err = VerifyObjectSignature(append(wire, 0), "team", "introduction")
 				require.Error(t, err)
 				// ECDSA integers have variable DER length. Other signatures fill
 				// the preflight budget exactly.
 				if name != "ECDSA" {
 					require.Len(t, wire, MaxDocument)
-					_, err = SignObject("team", "publication", data[:limit+1], crt)
+					_, err = SignObject("team", "introduction", data[:limit+1], crt)
 					require.ErrorIs(t, err, ErrDocumentTooLarge)
 				}
 			})
@@ -128,7 +128,7 @@ func TestIssuanceAndCMS(t *testing.T) {
 				cmd.Stdin = bytes.NewReader(wire)
 				out, err := cmd.CombinedOutput()
 				require.NoError(t, err, "%s", out)
-				require.Contains(t, string(out), "original publisher")
+				require.Contains(t, string(out), "original content")
 			}
 		})
 	}

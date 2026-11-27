@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -380,7 +379,7 @@ func TestSlowProbeRenewsIntroductionAndReconnects(t *testing.T) {
 	intro := a.localIntroduction(a.policy.Load())
 	intro.Expires = time.Now().UTC().Add(introductionRefreshLead + 2*time.Second)
 	var err error
-	intro.record, err = a.signStatement("introduction", intro.introduction, a.cred.Load().cmsSigner)
+	intro.record, err = a.signIntroduction(intro.introduction, a.cred.Load().cmsSigner)
 	require.NoError(t, err)
 	a.introMu.Lock()
 	a.introCache = intro
@@ -563,40 +562,6 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first circuit did not deliver the packet")
 	}
-}
-
-func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
-	f := newFixture(t, "tcp", "tcp", "tcp")
-	f.cfg.Members[0].BytesPerSecond = 256
-	f.opts[0].MaintenanceInterval = 40 * time.Millisecond
-	f.opts[1].MaintenanceInterval = time.Hour
-	f.opts[2].MaintenanceInterval = time.Hour
-	f.start()
-	a, b, c := f.nodes[0], f.nodes[1], f.nodes[2]
-	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
-	require.True(t, a.shaper.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
-	var id string
-	for i := range cap(a.backgroundSlots) + 2 {
-		var err error
-		id, err = a.Publish(t.Context(), "app/test", []byte{byte(i)})
-		require.NoError(t, err)
-	}
-	require.Eventually(t, func() bool { return len(a.backgroundSlots) == cap(a.backgroundSlots) }, time.Second, time.Millisecond)
-	f.link(0, 2)
-	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
-	require.Eventually(t, func() bool {
-		path, ok := a.PreferredPath(c.id)
-		return ok && path.Transport == "tcp"
-	}, 2*time.Second, 5*time.Millisecond)
-	// Withdraw the slow neighbor while its pushes are waiting on the limiter.
-	require.NoError(t, a.SetPeerPathPolicy(b.id, Blocked))
-	require.Eventually(t, func() bool { return len(a.backgroundSlots) == 0 }, time.Second, time.Millisecond)
-	// The message is still valid, but this fetch cannot finish pacing within
-	// its exchange deadline. The responder releases the stream immediately.
-	require.Eventually(t, func() bool { return c.preferredSession(a.id, true) != nil }, time.Second, time.Millisecond)
-	_, err := c.preferredSession(a.id, true).request(t.Context(), opGetPublication, []byte(id), maxControlFrame)
-	require.ErrorIs(t, err, io.EOF)
-	require.Zero(t, a.ControlStatus().BytesScheduled)
 }
 
 type failingUDPReader struct {

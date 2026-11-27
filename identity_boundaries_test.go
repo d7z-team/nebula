@@ -1,7 +1,6 @@
 package nebula
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,7 +19,7 @@ import (
 )
 
 func TestAuthorizedPKIXPaths(t *testing.T) {
-	f := newFixture(t, "tcp")
+	f := newFixture(t, "")
 	now := time.Now().Truncate(time.Second)
 	profile := pki.CAProfile{Subject: pkix.Name{CommonName: "second root"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), MaxPathLen: 1}
 	rootKey, err := pki.GenerateKey("ed25519")
@@ -40,7 +39,6 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	profile.MaxPathLen = 0
 	profile.NotBefore = now.Add(-time.Minute)
 	profile.NotAfter = now.Add(10 * time.Minute)
-	var intermediates []*x509.Certificate
 	issuer := pki.Issuer{Chain: []*x509.Certificate{f.ca}, Signer: f.key}
 	inter, err := issuer.IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 	require.NoError(t, err)
@@ -50,15 +48,13 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	require.NoError(t, err)
 	alt, err := x509.ParseCertificate(altDER)
 	require.NoError(t, err)
-	intermediates = append(intermediates, inter, alt)
 	leafKey := labKey(f.ips[0])
 	req, err = pki.CreateCSR(leafKey, pkix.Name{})
 	require.NoError(t, err)
 	enroll := pki.Enrollment{Name: "host-1", Scope: pki.Scope{Network: "lab"}, IPv4: f.ips[0], IPv6: f.cfg.Members[0].IPv6, PublicKeyHash: sha256.Sum256(req.RawSubjectPublicKeyInfo), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(5 * time.Minute)}
-	leaf, err := (pki.Issuer{Chain: []*x509.Certificate{intermediates[0], f.ca}, Signer: key}).IssueGrant(req, enroll)
+	leaf, err := (pki.Issuer{Chain: []*x509.Certificate{inter, f.ca}, Signer: key}).IssueGrant(req, enroll)
 	require.NoError(t, err)
-	chain := append([]*x509.Certificate{leaf}, intermediates...)
-	chain = append(chain, f.ca)
+	chain := []*x509.Certificate{leaf, inter, alt, f.ca}
 	paths, err := pki.VerifyGrant(chain, roots, f.cluster, f.cfg.Members[0].ID, now)
 	require.NoError(t, err)
 	require.Len(t, paths, 1)
@@ -108,8 +104,8 @@ func TestAuthorizedPKIXPaths(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestCredentialAndFrameBudgets(t *testing.T) {
-	f := newFixture(t, "tcp")
+func TestCredentialBudget(t *testing.T) {
+	f := newFixture(t, "")
 	set := f.opts[0].Auth.Certificates
 	leaf, err := x509.ParseCertificate(set.Grant[0])
 	require.NoError(t, err)
@@ -131,26 +127,6 @@ func TestCredentialAndFrameBudgets(t *testing.T) {
 			require.Error(t, err)
 		} else {
 			require.NoError(t, err)
-		}
-	}
-	f.start()
-	for _, delta := range []int{-1, 0, 1} {
-		_, err := f.nodes[0].Publish(t.Context(), "app/test", make([]byte, maxPublicationPayload+delta))
-		if delta > 0 {
-			require.Error(t, err)
-		} else {
-			require.NoError(t, err)
-		}
-		var wire bytes.Buffer
-		payload := bytes.Repeat([]byte{42}, maxControlFrame+delta)
-		require.NoError(t, writeFrame(&wire, payload))
-		got, err := readFrame(&wire, maxControlFrame)
-		if delta > 0 {
-			require.Error(t, err)
-			require.Equal(t, len(payload), wire.Len())
-		} else {
-			require.NoError(t, err)
-			require.Equal(t, payload, got)
 		}
 	}
 }

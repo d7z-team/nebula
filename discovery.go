@@ -10,10 +10,9 @@ import (
 )
 
 type advert struct {
-	Observed  netip.AddrPort `json:"observed"`
-	Record    statement      `json:"record"`
-	Seen      int64          `json:"seen,omitempty"`
-	Inventory []string       `json:"inventory"`
+	Observed netip.AddrPort     `json:"observed"`
+	Record   signedIntroduction `json:"record"`
+	Seen     int64              `json:"seen,omitempty"`
 }
 
 type observer struct {
@@ -44,7 +43,6 @@ func (n *Node) advert(s *session) (advert, time.Time) {
 	if s.acknowledgedIntro.Load() != intro.Expires.UnixNano() {
 		a.Record = intro.record
 	}
-	n.addPublicationInventory(s, &a)
 	return a, intro.Expires
 }
 
@@ -101,7 +99,6 @@ func (n *Node) receiveAdvert(s *session, a advert) {
 		}
 		n.mu.Unlock()
 	}
-	n.fetchMissingPublications(s, a.Inventory)
 }
 
 func (n *Node) rendezvous(ctx context.Context, target PeerID) bool {

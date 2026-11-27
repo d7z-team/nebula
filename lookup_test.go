@@ -188,10 +188,8 @@ func TestHiddenIntroduction(t *testing.T) {
 	h.mu.Unlock()
 	require.Zero(t, observations)
 
-	_, body, _, err := relay.verifyStatement(t.Context(), "introduction", hello.Record, relay.policy.Load())
+	_, intro, err := relay.verifyIntroduction(t.Context(), relay.policy.Load(), hello.Record, nil)
 	require.NoError(t, err)
-	var intro introduction
-	require.NoError(t, json.Unmarshal(body, &intro))
 	require.Empty(t, intro.Endpoints)
 	require.Equal(t, []netip.Prefix{prefix}, intro.RoutedPrefixes)
 	require.True(t, h.rendezvous(t.Context(), relay.id))
@@ -214,7 +212,7 @@ func TestHiddenIntroduction(t *testing.T) {
 	// with private endpoints. The relay must keep the newer signed record.
 	intro.Endpoints = f.cfg.Members[0].Endpoints
 	intro.Expires = intro.Expires.Add(-time.Second)
-	older, err := h.signStatement("introduction", intro, h.cred.Load().cmsSigner)
+	older, err := h.signIntroduction(intro.introduction, h.cred.Load().cmsSigner)
 	require.NoError(t, err)
 	_, accepted := relay.learnIntroduction(t.Context(), older, nil)
 	require.True(t, accepted)
@@ -379,7 +377,7 @@ func TestLookupReplyUsesObjectCertificate(t *testing.T) {
 	intro := g.localIntroduction(g.policy.Load()).introduction
 	require.Equal(t, []netip.Prefix{narrow}, intro.RoutedPrefixes)
 	intro.RoutedPrefixes = []netip.Prefix{wide}
-	validSignature, err := g.signStatement("introduction", intro, g.cred.Load().cmsSigner)
+	validSignature, err := g.signIntroduction(intro, g.cred.Load().cmsSigner)
 	require.NoError(t, err)
 	_, accepted := a.learnIntroduction(t.Context(), validSignature, &query{IP: netip.MustParseAddr("172.30.8.1")})
 	require.False(t, accepted)
@@ -510,17 +508,15 @@ func TestGatewayIntroductionBudget(t *testing.T) {
 	}
 	n.mu.Unlock()
 	local := n.localIntroduction(n.policy.Load())
-	var intro introduction
-	_, body, _, err := n.verifyStatement(t.Context(), "introduction", local.record, n.policy.Load())
+	_, intro, err := n.verifyIntroduction(t.Context(), n.policy.Load(), local.record, nil)
 	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(body, &intro))
 	require.Greater(t, len(intro.Endpoints), len(member.Endpoints))
 	require.Less(t, len(intro.Endpoints), len(local.candidates))
 	require.Equal(t, member.Endpoints[0], intro.Endpoints[0])
 	require.Equal(t, local.candidates[:len(intro.Endpoints)], intro.Endpoints)
 	require.Equal(t, member.RoutedPrefixes, intro.RoutedPrefixes)
 	intro.Endpoints = local.candidates[:len(intro.Endpoints)+1]
-	_, err = n.signStatement("introduction", intro, n.cred.Load().cmsSigner)
+	_, err = n.signIntroduction(intro.introduction, n.cred.Load().cmsSigner)
 	require.ErrorIs(t, err, pki.ErrDocumentTooLarge)
 	for _, dst := range []netip.Addr{member.IPv6, member.RoutedPrefixes[len(member.RoutedPrefixes)-1].Addr()} {
 		matches, err := n.ResolveIP(t.Context(), dst)

@@ -12,7 +12,7 @@ go vet ./...
 go test -race -count=1 ./...
 ```
 
-常规 CI 在 Linux、macOS 和 Windows 上运行测试及八个自带凭据的示例，Linux 另测竞态、共享端口与打过补丁的 gVisor 网关。磁盘凭据双进程示例的签名回执由 `TestPeerProcesses` 验证。[示例入口](../README.md#examples) · [双进程测试](../examples/peer/main_test.go) · [CI 配置](../.github/workflows/test.yml)
+常规 CI 在 Linux、macOS 和 Windows 上运行测试及八个自带凭据的示例，Linux 另测竞态、共享端口与打过补丁的 gVisor 网关。磁盘凭据双进程示例的握手和地址查询由 `TestPeerProcesses` 验证。[示例入口](../README.md#examples) · [双进程测试](../examples/peer/main_test.go) · [CI 配置](../.github/workflows/test.yml)
 
 quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理套接字的缓冲区小于期望值，QUIC 会按实际大小运行。Linux 上可用 `sysctl net.core.rmem_max net.core.wmem_max` 查看内核上限。使用 gVisor 等虚拟套接字时，也可能看到 `connection doesn't allow setting of receive buffer size`。诊断测试失败时，先定位 `--- FAIL` 对应的断言。[quic-go 缓冲区说明](https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes)
 
@@ -27,13 +27,13 @@ quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理�
 | 换址或切换地址族后断流 | `TestNATPaths` 和 `TestGatewayLayouts` 覆盖不同的映射、过滤及多层 NAT。`TestChaosMobileHandover` 和 `TestDualUnderlayFamilyFailover` 在既有业务连接上检查回执。[NAT](../e2e/nat_test.go) · [移动换址](../e2e/chaos_test.go) · [双栈切换](../e2e/mesh_test.go) |
 | 整形期间切路或建邻失败 | `TestChaosRelayOnlyWhileShaping` 检查在途包和后续包的路径；`TestColdCircuitAcrossSlowHops` 在延迟中继上交付首包。[发送队列](../addressing_test.go) · [中继与邻接](../interconnect_test.go) |
 | 撤回中继路径或关闭流时阻塞 | `TestCircuitWithdrawalWhileOpening` 在下游握手停顿时撤回路径，核对拨号返回、名额释放和邻接复用。`TestQUICStreamCloseDuringWrite` 检查关闭流能唤醒阻塞写入，同一连接的其他流仍可读到完整响应和 EOF。[电路生命周期](../circuit_capacity_test.go) · [QUIC 流关闭](../wire_test.go) |
-| 查询缺少端点或网关前缀 | `TestAdvertRetainsUsableNATMapping` 检查 NAT 观测的筛选和保留；`TestRefreshIPWithCachedDefault` 比较本轮应答和有效缓存。[地址发现](../lookup_test.go) |
+| 查询缺少端点或网关前缀 | `TestAdvertRetainsUsableNATMapping` 检查 NAT 观测的筛选。`TestGatewayIntroductionBudget` 检查签名介绍接近大小上限时能否保留固定端点和已授权前缀。`TestRefreshIPWithCachedDefault` 比较本轮应答和有效缓存。[地址发现](../lookup_test.go) |
 | TLS 密钥交换组不符或无法建链 | `TestTLSAdmissionAndPeerIdentity` 检查无共同组时的握手拒绝，`TestMixedTLSCredentials` 核对 TCP 和 QUIC 两端的协商结果，`TestChaosRelayPartition` 在中继分区恢复前后核对端到端组。[握手准入](../policy_integration_test.go) · [直连](../e2e/mesh_test.go) · [中继恢复](../e2e/chaos_test.go) |
 | 握手、换证或撤权异常 | `TestGrantDisclosure` 检查 TCP 和 QUIC 的授权交换。`TestGrantWriteRechecksPolicy` 和 `TestRevalidateDuringGrantWrite` 分别覆盖校验中和写入中提交新策略。`TestNodeAndGrantProof` 验证同钥续证。[握手](../authentication_test.go) · [证书](../pki/boundaries_test.go) |
-| 撤权后仍有业务或查询应答 | `TestMemberWithdrawalIsolation` 在三个节点间核对业务回执、主题投递、双向重连及重启后的入口认证。`TestLookupReplyAfterRequesterWithdrawal` 检查下游晚到的有效介绍在转发处停止。`TestRevalidateConcurrentPublication` 覆盖复查与消息准入并发。[端到端隔离](../e2e/chaos_test.go) · [查询](../lookup_test.go) · [主题准入](../policy_integration_test.go) |
+| 撤权后仍有业务或查询应答 | `TestMemberWithdrawalIsolation` 在三个节点间核对业务回执、双向重连及重启后的入口认证。`TestLookupReplyAfterRequesterWithdrawal` 检查下游晚到的有效介绍在转发处停止。`TestRevalidateConcurrentSessionAdmission` 核对复查期间新建会话在策略提交或取消后的状态。[端到端隔离](../e2e/chaos_test.go) · [查询](../lookup_test.go) · [会话复查](../policy_integration_test.go) |
 | 主地址重复或同一密钥出现多个实例 | `TestInspectAddressClaims` 核对竞争声明。`TestInstanceConflictWhileProbesBusy` 和 `TestInstanceConflictRecovery` 分别覆盖满载时的冲突复核和选定实例后的交付。`TestRelayTCPWithDuplicateInstance` 检查既有 TCP 连接。[实例诊断](../instance_test.go) · [中继长连接](../e2e/addressing_test.go) |
 | VIP 或下游地址交付失败 | 任播示例验证排空期间的新旧连接，网关测试核对双栈回包、IPv4 TTL 和 IPv6 Hop Limit。[任播](../examples/anycast/main.go) · [网关](../e2e/forwarding_test.go) · [gVisor 构建](integration.md#gvisor-的-ipv4-网关构建) |
-| 协议互通或消息补发异常 | 查看帧的预期字节、共享端口的 mesh 与网站分流，以及消息推送与缓存补取。[线协议](../wire_test.go) · [端口复用](../portshare_test.go) · [主题消息](../publication_test.go) |
+| 协议互通异常 | 查看帧的预期字节与共享端口的 mesh、网站分流测试。[线协议](../wire_test.go) · [端口复用](../portshare_test.go) |
 
 ## 重放故障
 
@@ -48,7 +48,7 @@ go test -race -count=1 -timeout=5m ./e2e -args -extended -portshare
 
 ```sh
 go test -race -count=10 -run '^(TestConnectEndpointSharesDial|TestPeerPolicyChangeDuringDirectDial|TestGroupSendUsesInboundPathWhileWaitingForDialSlot)$' .
-go test -race -count=5 -run '^(TestColdCircuitAcrossSlowHops|TestChaosRelayOnlyWhileShaping|TestChaosDefaultExitWithdrawal|TestNeighborDialWhilePublicationsArePaced)$' .
+go test -race -count=5 -run '^(TestColdCircuitAcrossSlowHops|TestChaosRelayOnlyWhileShaping|TestChaosDefaultExitWithdrawal)$' .
 go test -v -count=1 -run '^TestNATPaths$/^(port|destination-specific)$' ./e2e
 go test -race -v -count=1 -run '^TestChaos(HiddenTransit|RelayPartition)$' ./e2e -args -extended
 ```

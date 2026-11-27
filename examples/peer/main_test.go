@@ -30,7 +30,6 @@ func TestMain(m *testing.M) {
 
 func TestPeerProcesses(t *testing.T) {
 	alice, bob := demo.NewHost(1), demo.NewHost(2)
-	alice.PublishTopics, bob.PublishTopics = []string{"app/peer/receipt"}, []string{"app/peer/request"}
 	opts, err := demo.NodeOptions(alice, bob)
 	require.NoError(t, err)
 	dir := t.TempDir()
@@ -62,12 +61,12 @@ func TestPeerProcesses(t *testing.T) {
 	for _, tc := range []struct {
 		name, config, want string
 	}{
-		{"unknown member field", strings.Replace(string(data), `"publishTopics"`, `"restrictd":true,"publishTopics"`, 1), `unknown field "restrictd"`},
+		{"unknown member field", strings.Replace(string(data), `"id"`, `"restrictd":true,"id"`, 1), `unknown field "restrictd"`},
 		{"second value", string(data) + "\n{}", "unexpected data after topology"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "invalid.json"), []byte(tc.config), 0o600))
-			cmd := exec.CommandContext(ctx, exe, "--", "-grant", "alice.grant", "-cert", "alice.pem", "-key", "alice.key", "-topology", "invalid.json", "-peer", bob.IPv6.String())
+			cmd := exec.CommandContext(ctx, exe, "--", "-grant", "alice.grant", "-cert", "alice.pem", "-key", "alice.key", "-topology", "invalid.json")
 			cmd.Dir = dir
 			out, err := cmd.CombinedOutput()
 			require.Error(t, err)
@@ -75,7 +74,7 @@ func TestPeerProcesses(t *testing.T) {
 			require.Contains(t, string(out), tc.want)
 		})
 	}
-	server := exec.CommandContext(ctx, exe, "--", "-grant", "alice.grant", "-cert", "alice.pem", "-key", "alice.key", "-peer", bob.IPv6.String())
+	server := exec.CommandContext(ctx, exe, "--", "-grant", "alice.grant", "-cert", "alice.pem", "-key", "alice.key")
 	server.Dir, server.Stderr = dir, os.Stderr
 	stdout, err := server.StdoutPipe()
 	require.NoError(t, err)
@@ -91,11 +90,5 @@ func TestPeerProcesses(t *testing.T) {
 	out, err := lookup.CombinedOutput()
 	require.NoError(t, err, "%s", out)
 	require.Contains(t, string(out), "fd13::1 via "+alice.ID.String()+" (fd13::1/128)")
-	client := exec.CommandContext(ctx, exe, "--", "-grant", "bob.grant", "-cert", "bob.pem", "-key", "bob.key", "-connect", address, "-peer", alice.IPv4.String(), "-send", "hello")
-	client.Dir = dir
-	out, err = client.CombinedOutput()
-	require.NoError(t, err, "%s", out)
-	require.Regexp(t, `receipt from [0-9a-f]{64} for [0-9a-f]{64}`, string(out))
-	require.True(t, lines.Scan())
-	require.Equal(t, `request from `+bob.ID.String()+`: "hello"`, lines.Text())
+	require.Contains(t, string(out), "connected to "+alice.ID.String()+" at "+address)
 }

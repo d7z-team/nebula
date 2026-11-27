@@ -358,7 +358,7 @@ func TestNodeAndGrantProof(t *testing.T) {
 	require.NoError(t, err)
 	_, err = VerifyNode(leaf, root, x509.ExtKeyUsageServerAuth, now)
 	require.Error(t, err)
-	wire, err := SignObject("private", "publication", []byte("ready"), tls.Certificate{Certificate: [][]byte{grant.Raw, ca.Raw, node.Raw}, PrivateKey: nodeKey})
+	wire, err := SignObject("private", "introduction", []byte("ready"), tls.Certificate{Certificate: [][]byte{grant.Raw, ca.Raw, node.Raw}, PrivateKey: nodeKey})
 	require.NoError(t, err)
 	// A relay can re-encode the unsigned CMS certificate bag. Even a valid
 	// renewal for the same key must not replace the identity used at signing.
@@ -371,6 +371,6 @@ func TestNodeAndGrantProof(t *testing.T) {
 	}
 	tampered, err := wrapCMS(cms)
 	require.NoError(t, err)
-	_, _, err = VerifyObjectSignature(tampered, "private", "publication")
+	_, _, err = VerifyObjectSignature(tampered, "private", "introduction")
 	require.Error(t, err)
 }

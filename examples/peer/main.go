@@ -1,5 +1,4 @@
-// Command peer exchanges signed requests and application receipts between two
-// processes using certificates and a host-approved topology loaded from disk.
+// Command peer connects nodes and looks up mesh addresses using credentials from disk.
 package main
 
 import (
@@ -38,17 +37,15 @@ func run(ctx context.Context) error {
 	certFile := flag.String("cert", "node.pem", "one root-issued node certificate in PEM")
 	keyFile := flag.String("key", "node.key", "private key shared by the node certificate and cluster grant")
 	viewFile := flag.String("topology", "topology.json", "approved topology JSON")
-	message := flag.String("send", "", "send a request and wait for its receipt (default: serve requests)")
 	grantFile := flag.String("grant", "grant.pem", "PEM chain from the grant leaf through the cluster CA")
 	var listen, endpoint netip.AddrPort
-	var peer, resolve netip.Addr
+	var resolve netip.Addr
 	flag.TextVar(&listen, "listen", netip.MustParseAddrPort("127.0.0.1:0"), "local UDP address and port")
-	flag.TextVar(&peer, "peer", netip.Addr{}, "expected peer's overlay IPv4 or IPv6 address")
 	flag.TextVar(&endpoint, "connect", netip.AddrPort{}, "connect to this physical UDP endpoint after startup")
 	flag.TextVar(&resolve, "resolve", netip.Addr{}, "print signed matches for an overlay or downstream IP and exit")
 	flag.Parse()
-	if flag.NArg() != 0 || peer.IsValid() == resolve.IsValid() || resolve.IsValid() && *message != "" {
-		return errors.New("specify -peer for a publication exchange or -resolve for a lookup (see -h)")
+	if flag.NArg() != 0 {
+		return errors.New("unexpected positional arguments (see -h)")
 	}
 
 	readCertificates := func(path string) ([]*x509.Certificate, error) {
@@ -101,10 +98,10 @@ func run(ctx context.Context) error {
 	if _, err := decoder.Token(); err != io.EOF {
 		return fmt.Errorf("%s: unexpected data after topology", *viewFile)
 	}
-	return exchange(ctx, opts, listen, endpoint, peer, resolve, *message)
+	return runNode(ctx, opts, listen, endpoint, resolve)
 }
 
-func exchange(ctx context.Context, opts nebula.Options, listen, endpoint netip.AddrPort, peer, resolve netip.Addr, message string) error {
+func runNode(ctx context.Context, opts nebula.Options, listen, endpoint netip.AddrPort, resolve netip.Addr) error {
 	network := "udp4"
 	if listen.Addr().Is6() {
 		network = "udp6"
@@ -124,31 +121,22 @@ func exchange(ctx context.Context, opts nebula.Options, listen, endpoint netip.A
 		return err
 	}
 	defer node.Close()
-	const request, receipt = "app/peer/request", "app/peer/receipt"
-	topic := request
-	if message != "" {
-		topic = receipt
-	}
-	var sub *nebula.Subscription
-	if !resolve.IsValid() {
-		sub, err = node.Subscribe(topic)
-		if err != nil {
-			return err
-		}
-	}
 	if err := node.Start(); err != nil {
 		return err
 	}
 	fmt.Printf("listening on %s as %s\n", socket.LocalAddr(), node.ID())
-	if message != "" || resolve.IsValid() {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
+	if !endpoint.IsValid() && !resolve.IsValid() {
+		<-ctx.Done()
+		return ctx.Err()
 	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	if endpoint.IsValid() {
-		if _, err := node.ConnectEndpoint(ctx, nebula.Endpoint{Network: "udp", Address: endpoint}); err != nil {
+		id, err := node.ConnectEndpoint(ctx, nebula.Endpoint{Network: "udp", Address: endpoint})
+		if err != nil {
 			return err
 		}
+		fmt.Printf("connected to %s at %s\n", id, endpoint)
 	}
 	if resolve.IsValid() {
 		matches, err := node.ResolveIP(ctx, resolve)
@@ -158,44 +146,6 @@ func exchange(ctx context.Context, opts nebula.Options, listen, endpoint netip.A
 		for _, m := range matches {
 			fmt.Printf("%s via %s (%s)\n", resolve, m.Peer, m.Prefix)
 		}
-		return nil
 	}
-	expected, ok := node.LookupPeer(peer)
-	if !ok || expected == node.ID() {
-		return fmt.Errorf("expected a remote publisher at %s in the approved topology", peer)
-	}
-	var id string
-	if message != "" {
-		if err := node.ConnectPeerID(ctx, expected); err != nil {
-			return fmt.Errorf("connect to %s: %w", expected, err)
-		}
-		id, err = node.Publish(ctx, request, []byte(message))
-		if err != nil {
-			return err
-		}
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case publication, ok := <-sub.Publications():
-			if !ok {
-				return ctx.Err()
-			}
-			if publication.Origin != expected {
-				continue
-			}
-			if topic == receipt {
-				if string(publication.Payload) == id {
-					fmt.Printf("receipt from %s for %s\n", publication.Origin, id)
-					return nil
-				}
-				continue
-			}
-			fmt.Printf("request from %s: %q\n", publication.Origin, publication.Payload)
-			if _, err := node.Publish(ctx, receipt, []byte(publication.ID)); err != nil {
-				return err
-			}
-		}
-	}
+	return nil
 }

@@ -160,7 +160,6 @@ func (n *Node) maintain() {
 	upkeep := func() {
 		n.prunePaths()
 		n.mu.Lock()
-		n.expirePublicationsLocked(time.Now())
 		nextNeighbor = n.dialNeighborsLocked(nextNeighbor)
 		n.mu.Unlock()
 	}

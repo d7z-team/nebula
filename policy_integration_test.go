@@ -95,7 +95,7 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 			_ = n.Paths()
 		} // host callbacks may query live state
 		if deny.Load() && c.Usage == x509.ExtKeyUsageCodeSigning && c.Member == f.cfg.Members[0].ID {
-			return time.Time{}, errors.New("publisher suspended")
+			return time.Time{}, errors.New("grant suspended")
 		}
 		return time.Time{}, nil
 	}
@@ -106,24 +106,14 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	require.NoError(t, x.ConnectPeer(t.Context(), b))
 	s := y.preferredSession(x.ID(), false)
 	require.Equal(t, creds.Node.Certificate[0], s.state.PeerCertificates[0].Raw)
-	sub, err := y.Subscribe("app/test/control")
-	require.NoError(t, err)
-	defer sub.Close()
-	id, err := x.Publish(t.Context(), "app/test/control", []byte("host decision"))
-	require.NoError(t, err)
-	select {
-	case got := <-sub.Publications():
-		require.Equal(t, id, got.ID)
-	case <-time.After(time.Second):
-		t.Fatal("missing signed publication")
-	}
+	record := x.localIntroduction(x.policy.Load()).record
+	_, accepted := y.learnIntroduction(t.Context(), record, nil)
+	require.True(t, accepted)
 	deny.Store(true)
 	require.NoError(t, y.Revalidate(t.Context()))
 	require.Nil(t, y.preferredSession(x.ID(), false))
-	y.mu.Lock()
-	_, cached := y.publications[id]
-	y.mu.Unlock()
-	require.False(t, cached)
+	_, accepted = y.learnIntroduction(t.Context(), record, nil)
+	require.False(t, accepted)
 	wrong := creds
 	wrong.Grant = f.opts[1].Auth.Certificates.Grant
 	require.Error(t, x.ReloadCertificates(t.Context(), wrong))
@@ -131,13 +121,13 @@ func TestRoleCredentialsAndObjectAuthorization(t *testing.T) {
 	require.Error(t, y.ReloadCertificates(t.Context(), untrusted.opts[1].Auth.Certificates))
 }
 
-func TestRevalidateConcurrentPublication(t *testing.T) {
+func TestRevalidateConcurrentSessionAdmission(t *testing.T) {
 	for _, outcome := range []string{"commit", "cancel"} {
 		t.Run(outcome, func(t *testing.T) {
-			f := newFixture(t, "")
+			f := newFixture(t, "tcp", "tcp")
+			peer := f.cfg.Members[1].ID
+			var pause, deny atomic.Bool
 			entered, release := make(chan struct{}), make(chan struct{})
-			limit := time.Now().Add(time.Minute)
-			var pause, shorten atomic.Bool
 			f.opts[0].Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
 				if pause.CompareAndSwap(true, false) {
 					close(entered)
@@ -147,8 +137,8 @@ func TestRevalidateConcurrentPublication(t *testing.T) {
 					case <-release:
 					}
 				}
-				if shorten.Load() && c.Purpose == ClusterGrant {
-					return limit, nil
+				if deny.Load() && c.Member == peer {
+					return time.Time{}, ErrPathPolicy
 				}
 				return time.Time{}, nil
 			}
@@ -164,10 +154,8 @@ func TestRevalidateConcurrentPublication(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
-			// The publication was absent from the review's initial snapshot.
-			id, err := n.Publish(ctx, "app/test", []byte("during review"))
-			require.NoError(t, err)
-			shorten.Store(true)
+			require.NoError(t, n.ConnectPeerID(ctx, peer))
+			deny.Store(true)
 			if outcome == "cancel" {
 				cancel()
 				require.ErrorIs(t, <-done, context.Canceled)
@@ -175,17 +163,8 @@ func TestRevalidateConcurrentPublication(t *testing.T) {
 				close(release)
 				require.NoError(t, <-done)
 			}
-			n.mu.Lock()
-			publication, ok := n.publications[id]
-			n.mu.Unlock()
-			require.True(t, ok)
-			if outcome == "commit" {
-				require.Equal(t, limit, publication.expires)
-				require.Equal(t, limit, n.ControlStatus().AuthorizedUntil)
-			} else {
-				require.True(t, publication.expires.After(limit))
-				require.True(t, n.ControlStatus().AuthorizedUntil.After(limit))
-			}
+			_, active := n.PreferredPath(peer)
+			require.Equal(t, outcome == "cancel", active)
 		})
 	}
 }
@@ -197,8 +176,7 @@ func TestConcurrentTopologyAndCredentialUpdates(t *testing.T) {
 	require.NoError(t, n.ConnectPeer(t.Context(), remote.Addresses().IPv4))
 	s := n.preferredSession(remote.id, false)
 	seed := f.cfg
-	seed.Members = slices.Clone(f.cfg.Members)
-	seed.Members = slices.Delete(seed.Members, 2, 3)
+	seed.Members = seed.Members[:2]
 	updates := []func() error{
 		func() error { return n.ApplyTopology(t.Context(), seed) },
 		func() error { return n.ReloadCertificates(t.Context(), f.opts[0].Auth.Certificates) },
@@ -227,10 +205,9 @@ func TestConcurrentTopologyAndCredentialUpdates(t *testing.T) {
 func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
 	b, third := f.ips[1], f.ips[2]
-	// Each endpoint receives only the two members it currently needs.
+	// The first node initially knows only its own identity and the second member.
 	local := f.cfg
-	local.Members = slices.Clone(f.cfg.Members)
-	local.Members = slices.Delete(local.Members, 2, 3)
+	local.Members = slices.Clone(local.Members[:2])
 	require.NoError(t, local.Validate(f.cluster))
 	deadline := time.Now().Add(15 * time.Minute)
 	var limit atomic.Pointer[time.Time]
@@ -244,38 +221,19 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 		}
 		return time.Time{}, nil
 	}
-	for i := range f.opts {
-		o := f.opts[i]
-		o.Topology = f.cfg
-		if i == 0 {
-			o.Topology = local
-		}
-		n, err := New(t.Context(), o)
-		require.NoError(t, err)
-		f.nodes = append(f.nodes, n)
-		t.Cleanup(func() { n.Close() })
-		status := n.ControlStatus()
-		require.True(t, status.Ready)
-		require.False(t, status.Started)
-		if i == 0 {
-			require.Equal(t, deadline, status.AuthorizedUntil)
-			require.True(t, status.GrantExpires.After(status.AuthorizedUntil))
-		}
-		require.NoError(t, n.Start())
-	}
+	f.opts[0].Topology = local
+	f.start()
 	n := f.nodes[0]
+	status := n.ControlStatus()
+	require.Equal(t, deadline, status.AuthorizedUntil)
+	require.True(t, status.GrantExpires.After(status.AuthorizedUntil))
 	require.NoError(t, n.ConnectPeer(t.Context(), b))
 	require.ErrorIs(t, n.ConnectPeer(t.Context(), third), ErrPeerUnavailable)
-	// Caller-owned maps and slices may be reused after ApplyTopology.
-	m := local.Members[0]
-	m.PublishTopics[0] = "app/changed"
-	require.Equal(t, "app/test", n.policy.Load().members[n.ID()].PublishTopics[0])
-	// Preflight and installation report the same conflicting address. The
-	// installed view still admits the peer after the failed update.
-	conflict := f.cfg.Members[2].ID
-	m.ID, m.IPv4, m.IPv6 = conflict, b, f.cfg.Members[2].IPv6
-	local.Members = append(local.Members, m)
-	want := fmt.Sprintf("duplicate primary address %s: %s and %s", b, f.cfg.Members[1].ID, conflict)
+	// Preflight and installation must agree on which address conflicts.
+	conflict := f.cfg.Members[2]
+	conflict.IPv4 = b
+	local.Members = append(local.Members, conflict)
+	want := fmt.Sprintf("duplicate primary address %s: %s and %s", b, f.cfg.Members[1].ID, conflict.ID)
 	require.EqualError(t, local.Validate(f.cluster), want)
 	require.EqualError(t, n.ApplyTopology(t.Context(), local), want)
 	require.NoError(t, n.ConnectPeer(t.Context(), b))
@@ -305,10 +263,12 @@ func TestRestrictedEndpointUpdates(t *testing.T) {
 
 	m := &f.cfg.Members[1]
 	// A TCP client can use any source port on its configured host.
-	first := netip.AddrPortFrom(m.Endpoints[0].Address.Addr(), 50123)
+	original := m.Endpoints[0]
+	first := netip.AddrPortFrom(original.Address.Addr(), 50123)
 	next := netip.MustParseAddrPort("192.0.2.9:50123")
 	m.Endpoints[0].Address = netip.AddrPortFrom(next.Addr(), 4242)
 	require.NoError(t, n.Revalidate(t.Context()))
+	require.Equal(t, original, n.policy.Load().members[m.ID].Endpoints[0])
 	require.True(t, n.endpointAllowed("tcp", first, true))
 	require.False(t, n.endpointAllowed("tcp", next, true))
 	require.NoError(t, n.ApplyTopology(t.Context(), f.cfg))

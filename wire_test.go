@@ -16,9 +16,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestControlFrameBudget(t *testing.T) {
+	for _, delta := range []int{-1, 0, 1} {
+		var wire bytes.Buffer
+		payload := bytes.Repeat([]byte{42}, maxControlFrame+delta)
+		require.NoError(t, writeFrame(&wire, payload))
+		got, err := readFrame(&wire, maxControlFrame)
+		if delta > 0 {
+			require.ErrorIs(t, err, errFrameTooLarge)
+			require.Equal(t, len(payload), wire.Len())
+		} else {
+			require.NoError(t, err)
+			require.Equal(t, payload, got)
+		}
+	}
+}
+
 func TestWireStreams(t *testing.T) {
-	require.Equal(t, []byte{1, 2, 3, 4, 5, 6, 7}, []byte{
-		opPing, opHello, opLookup, opCircuit, opIP, opPushPublication, opGetPublication,
+	require.Equal(t, []byte{1, 2, 3, 4, 5}, []byte{
+		opPing, opHello, opLookup, opCircuit, opIP,
 	})
 	f := newFixture(t, "tcp", "tcp", "tcp")
 	f.link(0, 1)
@@ -148,8 +164,7 @@ func TestWireJSON(t *testing.T) {
 	ep := Endpoint{"udp", netip.MustParseAddrPort("[2001:db8::1]:4242")}
 	token := "0123456789abcdef0123456789abcdef"
 	intro := introduction{Addresses: addresses, Instance: InstanceID{1}, Endpoints: []Endpoint{ep}, RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("172.16.1.0/24")}, Expires: expiry}
-	q := query{ID: token, IP: addresses.IPv4, Origin: statement{0xfb, 0xff}, Visited: []PeerID{id}, Budget: 1234 * time.Millisecond}
-	pub := Publication{id, "app/test", token, []byte{0xfb, 0xff}, expiry}
+	q := query{ID: token, IP: addresses.IPv4, Origin: signedIntroduction{0xfb, 0xff}, Visited: []PeerID{id}, Budget: 1234 * time.Millisecond}
 
 	// Compare JSON values without rounding integers or depending on object key order.
 	decode := func(t *testing.T, r io.Reader) any {
@@ -167,14 +182,13 @@ func TestWireJSON(t *testing.T) {
 	}{
 		{
 			"hello",
-			advert{ep.Address, statement{0xfb, 0xff}, 1700000000000000001, nil},
-			`{"seen":1700000000000000001,"inventory":null,"observed":"[2001:db8::1]:4242","record":"+/8="}`,
+			advert{ep.Address, signedIntroduction{0xfb, 0xff}, 1700000000000000001},
+			`{"seen":1700000000000000001,"observed":"[2001:db8::1]:4242","record":"+/8="}`,
 		},
-		{"empty hello", advert{}, `{"observed":"","record":null,"inventory":null}`},
+		{"empty hello", advert{}, `{"observed":"","record":null}`},
 		{"introduction", intro, `{"ipv4":"10.13.0.1","ipv6":"fd42::1","instance":"01000000000000000000000000000000","endpoints":[{"network":"udp","address":"[2001:db8::1]:4242"}],"routedPrefixes":["172.16.1.0/24"],"expires":"2026-01-02T03:04:05.123456789Z"}`},
 		{"member introduction", introduction{Addresses: addresses, Instance: InstanceID{1}, Expires: expiry}, `{"ipv4":"10.13.0.1","ipv6":"fd42::1","instance":"01000000000000000000000000000000","endpoints":null,"expires":"2026-01-02T03:04:05.123456789Z"}`},
 		{"lookup", q, `{"id":"0123456789abcdef0123456789abcdef","ip":"10.13.0.1","origin":"+/8=","visited":["` + id.String() + `"],"budget":1234000000}`},
-		{"publication", publishedStatement[Publication]{id, pub}, `{"publisher":"` + id.String() + `","value":{"origin":"` + id.String() + `","topic":"app/test","nonce":"0123456789abcdef0123456789abcdef","payload":"+/8=","expires":"2026-01-02T03:04:05.123456789Z"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := json.Marshal(tc.value)

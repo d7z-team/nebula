@@ -84,7 +84,7 @@ CA 的 X.509 名称约束用 `permittedSubtrees` 指定可签发的主地址范�
 
 宿主用 `Options.Auth.CheckChain` 检查通过验证的证书路径。`Purpose` 区分 `NodeIdentity` 与 `ClusterGrant`。返回错误会拒绝该路径，非零时间可缩短有效期，零时间沿用证书链的期限。撤回单张证书可匹配 DER 指纹或签发者和序列号。
 
-私钥泄露时，匹配 `check.Member` 可覆盖同一公钥的续证、两个握手方向和签名对象。宿主负责保存并分发决定，在创建节点前载入，运行中更新后调用 `Revalidate`。[本机生效范围](integration.md#选择本机安全策略)
+私钥泄露时，按 `check.Member` 拒绝该公钥，可同时覆盖同钥续证、入站及出站握手，以及本机接收的签名介绍。宿主负责保存并分发决定，在创建节点前载入，运行中更新后调用 `Revalidate`。[本机生效范围](integration.md#选择本机安全策略)
 
 ```go
 var denied sync.Map // nebula.PeerID keys
@@ -104,6 +104,6 @@ if err := node.Revalidate(ctx); err != nil {
 
 ## 签名对象
 
-介绍和主题消息使用 CMS（Cryptographic Message Syntax）的封装型 SignedData。签名覆盖网络名、用途、签名叶指纹、完整 DER 证书集合的摘要和业务正文。CMS 附原节点叶、授权叶和授权签发链。验证转发或补发的对象时，先用 `VerifyObjectSignature` 校验域、签名和证书集合，再将返回的证书交给 `VerifyObjectSigner`。后者验证身份和授权路径并核对同一公钥。宿主再检查实际发布者、授权期限和主题。节点的订阅 API 已完成这些检查。[独立验签示例](../pki/example_test.go) · [RFC 5652](https://www.rfc-editor.org/rfc/rfc5652)
+节点介绍使用 CMS（Cryptographic Message Syntax）的封装型 SignedData。签名覆盖网络名、用途、签名叶指纹、完整 DER 证书集合的摘要和业务正文。CMS 附原节点叶、授权叶和授权签发链。验证转发的介绍时，先用 `VerifyObjectSignature` 校验域、签名和证书集合，再将返回的证书交给 `VerifyObjectSigner`。后者验证身份和授权路径并核对同一公钥。节点再按宿主信任策略、介绍的有效期和证书授权检查其中的地址与前缀。[独立验签示例](../pki/example_test.go) · [RFC 5652](https://www.rfc-editor.org/rfc/rfc5652)
 
-`CheckObjectSize` 可按签名算法的最大签名长度预检完整 CMS 的 44 KiB 上限，超限返回 `ErrDocumentTooLarge`。节点叶证书、授权链的 DER 及授权叶的 `RawIssuer` 合计上限为 24 KiB。新建、热加载及拓扑更新同时校验本机必需的介绍能否装入控制帧。[尺寸预检](../pki/cms.go)
+本机凭据预算为 24 KiB，计入节点叶和授权链的 DER，以及授权叶的 `RawIssuer`。完整 CMS 签名介绍另有 44 KiB 上限。`pki.CheckObjectSize` 按签名算法的最大签名长度预检，超限返回 `pki.ErrDocumentTooLarge`。节点在创建、热加载凭据或调整本机通告内容时，用此上限检查固定端点和授权前缀。[CMS 尺寸预检](../pki/cms.go) · [本机介绍](../introduction.go)

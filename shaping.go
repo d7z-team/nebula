@@ -176,7 +176,7 @@ func (f *fairShaper) finishWrite(peer PeerID) {
 }
 
 // schedule arbitrates byte service before taking tokens. The zero peer accounts
-// for indivisible local packets and publications. Relay callers return write
+// for indivisible local IP packets. Relay callers return write
 // credit after the actual transport write, independently of the token wait.
 func (f *fairShaper) schedule(ctx context.Context, peer PeerID, size int) (int, error) {
 	if err := ctx.Err(); err != nil {

@@ -113,7 +113,7 @@ func (l *lab) host(segment, physical, via, transport string, publish bool) *host
 	require.NoError(l.t, err)
 	id, err := pki.NewPeerID(key.Public())
 	require.NoError(l.t, err)
-	member := nebula.Member{ID: id, IPv4: ip, IPv6: netip.MustParseAddr(fmt.Sprintf("fd42::%x", number)), PublishTopics: []string{"app/test"}}
+	member := nebula.Member{ID: id, IPv4: ip, IPv6: netip.MustParseAddr(fmt.Sprintf("fd42::%x", number))}
 	h := &host{key: key, index: len(l.hosts), ip: ip, options: nebula.Options{
 		Auth:                nebula.AuthOptions{RootCA: l.root.Chain[0], ClusterCA: l.issuer.Chain[0]},
 		MaintenanceInterval: 140 * time.Millisecond,
@@ -283,28 +283,6 @@ func forwardingPair(t *testing.T) (client, gateway *nebula.Node) {
 	return c.node, g.node
 }
 
-func publicationReceipt(t *testing.T, a, b *host, payload string) {
-	t.Helper()
-	sub, err := b.node.Subscribe("app/test")
-	require.NoError(t, err)
-	defer sub.Close()
-	id, err := a.node.Publish(t.Context(), "app/test", []byte(payload))
-	require.NoError(t, err)
-	deadline := time.After(4 * time.Second)
-	for {
-		select {
-		case publication := <-sub.Publications():
-			if publication.ID == id {
-				require.Equal(t, a.node.ID(), publication.Origin)
-				require.Equal(t, payload, string(publication.Payload))
-				return
-			}
-		case <-deadline:
-			t.Fatalf("missing publication %s from %s", id, a.ip)
-		}
-	}
-}
-
 func TestMixedTLSCredentials(t *testing.T) {
 	for _, tc := range []struct {
 		transport    string
@@ -338,8 +316,12 @@ func TestMixedTLSCredentials(t *testing.T) {
 			}
 			require.Equal(t, b.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), p.NodeSerial)
 			require.Equal(t, a.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), remote.NodeSerial)
-			publicationReceipt(t, a, b, "client publication")
-			publicationReceipt(t, b, a, "server publication")
+			for _, pair := range [][2]*host{{a, b}, {b, a}} {
+				matches, err := pair[0].node.ResolveIP(t.Context(), pair[1].ip)
+				require.NoError(t, err)
+				require.Len(t, matches, 1)
+				require.Equal(t, pair[1].node.ID(), matches[0].Peer)
+			}
 		})
 	}
 }

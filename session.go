@@ -23,13 +23,11 @@ import (
 
 // The first byte on each application stream selects its wire format.
 const (
-	opPing            byte = 0x01
-	opHello           byte = 0x02
-	opLookup          byte = 0x03
-	opCircuit         byte = 0x04
-	opIP              byte = 0x05
-	opPushPublication byte = 0x06
-	opGetPublication  byte = 0x07
+	opPing    byte = 0x01
+	opHello   byte = 0x02
+	opLookup  byte = 0x03
+	opCircuit byte = 0x04
+	opIP      byte = 0x05
 )
 
 const (
@@ -87,7 +85,6 @@ func (s *qStream) Close() error {
 
 type session struct {
 	acknowledgedIntro             atomic.Int64
-	inventoryOffset               atomic.Uint64
 	localGrant, remoteGrant       []*x509.Certificate
 	localNode                     *x509.Certificate
 	until                         time.Time // protected by n.mu
@@ -470,8 +467,7 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 			c.Close()
 		}
 	}()
-	deadline := time.Now().Add(n.o.DialTimeout)
-	if err := c.SetDeadline(deadline); err != nil {
+	if err := c.SetDeadline(time.Now().Add(n.o.DialTimeout)); err != nil {
 		return
 	}
 	var op [1]byte
@@ -526,22 +522,6 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 		}
 	case opLookup:
 		n.handleLookup(s, c, b)
-	case opPushPublication:
-		if _, err := n.acceptPublication(s.ctx, s, b, ""); err == nil {
-			_ = writeFrame(c, nil)
-		}
-	case opGetPublication:
-		id := string(b)
-		n.mu.Lock()
-		pub, ok := n.publications[id]
-		n.mu.Unlock()
-		if ok {
-			ctx, cancel := context.WithDeadline(s.ctx, earlierDeadline(pub.expires, deadline))
-			defer cancel()
-			if n.pacePublication(ctx, s, id, pub.record) {
-				_ = writeFrame(c, pub.record)
-			}
-		}
 	case opCircuit:
 		if len(s.path) == 0 {
 			owned = !n.forwardCircuit(s, c, b)

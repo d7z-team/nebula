@@ -27,7 +27,7 @@ func (e Endpoint) Valid() bool {
 // PeerID identifies a member by the SHA-256 digest of its node public key.
 type PeerID = pki.PeerID
 
-// Member contains the local routing and application permissions for one peer.
+// Member contains the local routing and forwarding policy for one peer.
 type Member struct {
 	ID   PeerID     `json:"id"`
 	IPv4 netip.Addr `json:"ipv4"`
@@ -49,26 +49,22 @@ type Member struct {
 	AnycastIPs []netip.Addr `json:"anycastIPs,omitempty"`
 	// MulticastGroups subscribes this member to exact multicast destinations.
 	MulticastGroups []netip.Addr `json:"multicastGroups,omitempty"`
-	// BytesPerSecond is the total outbound application byte rate enforced by
-	// this member on its own node. Zero is unlimited.
+	// BytesPerSecond limits the combined rate of locally sent IP packets and
+	// relayed data on this node. Zero is unlimited.
 	BytesPerSecond int `json:"bytesPerSecond,omitempty"`
-	// PublishTopics grants publication on each topic and its descendants.
-	// Forwarding neighbors can read publications regardless of subscriptions.
-	PublishTopics []string `json:"publishTopics,omitempty"`
 }
 
 func (m Member) addresses() pki.Addresses {
 	return pki.Addresses{IPv4: m.IPv4, IPv6: m.IPv6}
 }
 
-// Clone returns an independent copy of the member's routing and application grants.
+// Clone returns an independent copy of the member's policy.
 func (m Member) Clone() Member {
 	m.Links = slices.Clone(m.Links)
 	m.Endpoints = slices.Clone(m.Endpoints)
 	m.RoutedPrefixes = slices.Clone(m.RoutedPrefixes)
 	m.AnycastIPs = slices.Clone(m.AnycastIPs)
 	m.MulticastGroups = slices.Clone(m.MulticastGroups)
-	m.PublishTopics = slices.Clone(m.PublishTopics)
 	return m
 }
 
@@ -191,11 +187,6 @@ func (s *topologyView) indexMember(m Member) error {
 	for _, p := range m.RoutedPrefixes {
 		if !s.cluster.AllowsRoute(p) {
 			return fmt.Errorf("invalid routed prefix %s", p)
-		}
-	}
-	for _, topic := range m.PublishTopics {
-		if !ValidTopic(topic) {
-			return fmt.Errorf("invalid topic %q", topic)
 		}
 	}
 	for _, ip := range []netip.Addr{m.IPv4, m.IPv6} {

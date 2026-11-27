@@ -20,9 +20,9 @@ func (n *Node) ApplyTopology(ctx context.Context, t Topology) error {
 }
 
 // Revalidate reapplies the host's current chain decisions to local credentials,
-// sessions, instance conflict claims and cached publications. Success means the
-// review completed, including withdrawals. Concurrent admissions may restart
-// the review. Cancellation or timeout before commit leaves this review unapplied.
+// sessions and instance conflict claims. It clears cached introductions on commit.
+// Concurrent admissions may restart the review. Cancellation or timeout before
+// commit leaves this review unapplied.
 // After commit it waits for grant frames admitted under the previous policy to
 // finish writing or reach their handshake deadline, even if ctx is canceled.
 // ControlStatus, Paths and InspectIP report the outcome.
@@ -38,7 +38,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		n.mu.Lock()
 		old, creds, admissions := n.policy.Load(), n.cred.Load(), n.admissions
 		conflicts := maps.Clone(n.conflicts)
-		sessions, publications := n.sessionListLocked(), maps.Clone(n.publications)
+		sessions := n.sessionListLocked()
 		n.mu.Unlock()
 		p := next
 		if p == nil {
@@ -52,7 +52,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		if after, local := p.members[n.id]; next != nil && local {
 			before, existed := old.members[n.id]
 			if !existed || !slices.Equal(before.RoutedPrefixes, after.RoutedPrefixes) || !slices.Equal(before.Endpoints, after.Endpoints) {
-				if err := n.validateIntroduction(next, creds); err != nil {
+				if err := n.checkLocalIntroductionBudget(next, creds); err != nil {
 					return err
 				}
 			}
@@ -65,15 +65,6 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 			}
 		}
 		n.recheckConflicts(ctx, p, conflicts)
-		for id, publication := range publications {
-			_, until, err := n.verifyPublication(ctx, p, publication.record)
-			if err != nil {
-				delete(publications, id)
-				continue
-			}
-			publication.expires = until
-			publications[id] = publication
-		}
 		n.mu.Lock()
 		if n.ctx.Err() != nil {
 			n.mu.Unlock()
@@ -92,13 +83,6 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 			s.until = deadlines[i]
 			if hold, ok := conflicts[s.peer]; ok && hold.selected && hold.keep == s.instance && time.Now().Before(s.until) && !s.closed.Load() {
 				delete(conflicts, s.peer)
-			}
-		}
-		for id := range n.publications {
-			if publication, ok := publications[id]; ok {
-				n.publications[id] = publication
-			} else {
-				delete(n.publications, id)
 			}
 		}
 		updated := *creds

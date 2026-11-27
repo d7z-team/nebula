@@ -134,7 +134,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 			MaintenanceInterval: 120 * time.Millisecond,
 			DialTimeout:         700 * time.Millisecond,
 		}
-		m := Member{ID: id, IPv4: a, IPv6: labAddresses(a).IPv6, PublishTopics: []string{"app/test"}}
+		m := Member{ID: id, IPv4: a, IPv6: labAddresses(a).IPv6}
 		const loopback = "127.0.0.1:0"
 		var sock *meteredSocket
 		if kind == "udp" || kind == "both" {
@@ -441,11 +441,6 @@ func TestMixedRelayOnlyAndTopologyWithdrawal(t *testing.T) {
 	a, b := f.nodes[0], f.nodes[3]
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
-	// This relay has its own publishing policy while the whole path is authorized.
-	local := f.cfg
-	local.Members = slices.Clone(f.cfg.Members)
-	local.Members[1].PublishTopics = []string{"app/relay"}
-	require.NoError(t, f.nodes[1].ApplyTopology(ctx, local))
 	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
 	err := a.ConnectPeer(ctx, b.Addresses().IPv4)
 	if err != nil {
@@ -644,10 +639,11 @@ func TestNodeLifecycle(t *testing.T) {
 	n, err := New(t.Context(), o)
 	require.NoError(t, err)
 	t.Cleanup(func() { n.Close() })
+	status := n.ControlStatus()
+	require.True(t, status.Ready)
+	require.False(t, status.Started)
 	peer := f.cfg.Members[1]
 	port, err := n.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
-	require.NoError(t, err)
-	sub, err := n.Subscribe("app/test")
 	require.NoError(t, err)
 	require.NoError(t, n.SetPeerPathPolicy(peer.ID, DirectOnly))
 	offlineIP := netip.MustParseAddr("10.13.0.42")
@@ -667,8 +663,6 @@ func TestNodeLifecycle(t *testing.T) {
 		require.ErrorIs(t, err, want)
 		_, err = n.ResolveIP(t.Context(), peer.IPv4)
 		require.ErrorIs(t, err, want)
-		_, err = n.Publish(t.Context(), "app/test", nil)
-		require.ErrorIs(t, err, want)
 		require.ErrorIs(t, port.WriteIP(peer.ID, ip), want)
 	}
 	checkOperations(ErrNodeNotStarted)
@@ -679,6 +673,4 @@ func TestNodeLifecycle(t *testing.T) {
 	require.NoError(t, n.Close())
 	require.ErrorIs(t, n.Start(), ErrNodeClosed)
 	checkOperations(ErrNodeClosed)
-	_, open := <-sub.Publications()
-	require.False(t, open)
 }

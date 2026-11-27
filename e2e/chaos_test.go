@@ -283,7 +283,8 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 	l.connect(fixed, observer, "udp")
 	require.NoError(t, fixed.node.SetPeerPathPolicy(mobile.node.ID(), nebula.RelayOnly))
 	l.connect(fixed, mobile, "relay")
-	c, d := tcpPair(t, l.business(fixed), l.business(mobile), mobile.ip.String(), ipv4.ProtocolNumber)
+	mobileStack := l.business(mobile)
+	c, d := tcpPair(t, l.business(fixed), mobileStack, mobile.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, c, d, 0)
 
 	first := make(chan time.Time, 1)
@@ -310,7 +311,8 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 	g.bindings[0].port++
 	g.install(t, l.net)
 	next := netip.AddrPortFrom(g.public.Addr(), g.bindings[0].port)
-	publicationReceipt(t, mobile, observer, "new mapping")
+	up, down := tcpPair(t, mobileStack, l.business(observer), observer.ip.String(), ipv4.ProtocolNumber)
+	roundTrip(t, up, down)
 	// The next healthy canary is at least five seconds away.
 	require.Eventually(t, func() bool {
 		p, ok := fixed.node.PreferredPath(mobile.node.ID())
@@ -529,10 +531,6 @@ func TestMemberWithdrawalIsolation(t *testing.T) {
 	toX, atX := tcpPair(t, client, l.business(x), x.ip.String(), ipv4.ProtocolNumber)
 	receipt(t, healthy, server, 1)
 	receipt(t, toX, atX, 2)
-	publicationReceipt(t, a, x, "before withdrawal")
-	sub, err := x.node.Subscribe("app/test")
-	require.NoError(t, err)
-	defer sub.Close()
 
 	denied.Store(true)
 	for _, h := range observers {
@@ -541,8 +539,7 @@ func TestMemberWithdrawalIsolation(t *testing.T) {
 		require.False(t, active)
 	}
 	receipt(t, healthy, server, 3)
-	publicationReceipt(t, a, b, "after withdrawal")
-	_, err = toX.Write([]byte("after withdrawal"))
+	_, err := toX.Write([]byte("after withdrawal"))
 	require.NoError(t, err)
 	require.NoError(t, atX.SetReadDeadline(time.Now().Add(time.Second)))
 	var received [1]byte
@@ -553,7 +550,6 @@ func TestMemberWithdrawalIsolation(t *testing.T) {
 		_, err := pair[0].node.ConnectEndpoint(t.Context(), l.top.Members[pair[1].index].Endpoints[0])
 		require.Errorf(t, err, "%s connected to %s after withdrawal", pair[0].ip, pair[1].ip)
 	}
-	require.Empty(t, sub.Publications())
 
 	// Restart an honest node with the host decision and its original key.
 	require.NoError(t, a.node.Close())
@@ -574,49 +570,6 @@ func TestMemberWithdrawalIsolation(t *testing.T) {
 	require.Equal(t, b.node.ID(), id)
 	_, err = restarted.ConnectEndpoint(t.Context(), l.top.Members[x.index].Endpoints[0])
 	require.ErrorIs(t, err, nebula.ErrPathPolicy)
-}
-
-func TestChaosPublisherWithdrawalAndRepair(t *testing.T) {
-	extended(t)
-	l := newLab(t)
-	a := l.host("wan", "192.0.2.1", "", "tcp", true)
-	r := l.host("wan", "192.0.2.2", "", "tcp", true)
-	c := l.host("wan", "192.0.2.3", "", "tcp", true)
-	var denied atomic.Bool
-	r.options.Auth.CheckChain = func(_ context.Context, check nebula.ChainCheck) (time.Time, error) {
-		if denied.Load() && check.Usage == x509.ExtKeyUsageCodeSigning && check.Member == l.top.Members[a.index].ID {
-			return time.Time{}, errors.New("publisher withdrawn")
-		}
-		return time.Time{}, nil
-	}
-	l.start()
-	l.connect(a, r, "tcp")
-	publicationReceipt(t, a, r, "withdrawn publication")
-	denied.Store(true)
-	require.NoError(t, r.node.Revalidate(t.Context()))
-	_, active := r.node.PreferredPath(a.node.ID())
-	require.False(t, active)
-	id, err := r.node.Publish(t.Context(), "app/test", []byte("cached while partitioned"))
-	require.NoError(t, err)
-	sub, err := c.node.Subscribe("app/test")
-	require.NoError(t, err)
-	defer sub.Close()
-	l.connect(c, r, "tcp")
-	select {
-	case publication := <-sub.Publications():
-		require.Equal(t, id, publication.ID)
-		require.Equal(t, l.top.Members[r.index].ID, publication.Origin)
-	case <-time.After(4 * time.Second):
-		t.Fatal("late subscriber missed the authorized cached publication")
-	}
-	require.Never(t, func() bool {
-		select {
-		case <-sub.Publications():
-			return true
-		default:
-			return false
-		}
-	}, 4*c.options.MaintenanceInterval, 20*time.Millisecond)
 }
 
 func TestChaosCloseWithBacklog(t *testing.T) {
@@ -642,11 +595,6 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 		require.NoError(t, port.WriteIP(b.node.ID(), pkt))
 	}
 	require.Eventually(t, func() bool { return received.Load() >= 4 && port.Stats().Queued > 0 }, 3*time.Second, 10*time.Millisecond)
-	sub, err := b.node.Subscribe("app/test")
-	require.NoError(t, err)
-	defer sub.Close()
-	_, err = a.node.Publish(t.Context(), "app/test", bytes.Repeat([]byte{42}, 4096))
-	require.NoError(t, err)
 	var attempts atomic.Int32
 	l.net.disturb(func(d datagram) disturbance {
 		if d.to.Addr() == netip.MustParseAddr("192.0.2.3") {
@@ -683,7 +631,6 @@ func TestChaosCloseWithBacklog(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("dial still waiting after close")
 	}
-	require.Empty(t, sub.Publications())
 	require.Zero(t, port.Stats().Queued)
 	require.True(t, a.node.ControlStatus().Closed)
 }

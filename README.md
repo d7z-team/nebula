@@ -2,7 +2,7 @@
 
 Nebula is a Go library for connecting applications over a private IPv4/IPv6 network. Each node runs inside your process and has one certified address in each family. Peers communicate over QUIC or TLS 1.3 over TCP. They can use UDP hole punching to connect directly across NATs or reach each other through authorized relays.
 
-Use an IP port to handle packets in Go, or attach the node to a gVisor stack to use TCP and UDP sockets on the mesh. Applications can also publish and subscribe to signed messages by topic.
+Use an IP port to handle packets in Go, or attach the node to a gVisor stack to use TCP and UDP sockets on the mesh.
 
 ## Installation
 
@@ -12,7 +12,7 @@ Requires Go 1.27.3 or later.
 go get gopkg.d7z.net/nebula
 ```
 
-To try the library, run two nodes on loopback. The example generates its own credentials, sends a signed message, and delivers an IPv6 packet over an IPv4 QUIC connection.
+To try the library, run two nodes on loopback. The example generates its own credentials and delivers an IPv6 packet over an IPv4 QUIC connection.
 
 ```sh
 go run gopkg.d7z.net/nebula/examples/quickstart@latest

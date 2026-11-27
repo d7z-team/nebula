@@ -28,12 +28,12 @@ type IPMatch struct {
 }
 
 type query struct {
-	ID      string        `json:"id"`
-	IP      netip.Addr    `json:"ip"`
-	Target  *PeerID       `json:"target,omitempty"` // Set only for live NAT rendezvous.
-	Origin  statement     `json:"origin"`
-	Visited []PeerID      `json:"visited"`
-	Budget  time.Duration `json:"budget"`
+	ID      string             `json:"id"`
+	IP      netip.Addr         `json:"ip"`
+	Target  *PeerID            `json:"target,omitempty"` // Set only for live NAT rendezvous.
+	Origin  signedIntroduction `json:"origin"`
+	Visited []PeerID           `json:"visited"`
+	Budget  time.Duration      `json:"budget"`
 }
 
 type ipResolution struct {
@@ -213,7 +213,7 @@ func longestPrefix(ip netip.Addr, prefixes []netip.Prefix) netip.Prefix {
 
 type lookupAnswer struct {
 	match  IPMatch
-	record statement
+	record signedIntroduction
 }
 
 // A nil peer set accepts all matches. A refresh reads only records from
@@ -284,10 +284,10 @@ func (n *Node) runLookup(ctx context.Context, ip netip.Addr, target *PeerID) map
 
 // Each branch streams bounded, individual CMS records so one large chain
 // cannot crowd other gateways out of the same control frame.
-func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement) bool) map[PeerID]bool {
+func (n *Node) forwardLookup(ctx context.Context, q query, yield func(signedIntroduction) bool) map[PeerID]bool {
 	clusterIP := n.Cluster().Subnet(q.IP).IsValid()
 	seen := make(map[PeerID]bool)
-	send := func(id PeerID, record statement) bool {
+	send := func(id PeerID, record signedIntroduction) bool {
 		if seen[id] {
 			return true
 		}
@@ -331,7 +331,7 @@ func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement)
 		jobs <- s
 	}
 	close(jobs)
-	results := make(chan statement)
+	results := make(chan signedIntroduction)
 	var workers sync.WaitGroup
 	for range min(4, len(neighbors)) {
 		workers.Go(func() {
@@ -365,7 +365,7 @@ func (n *Node) forwardLookup(ctx context.Context, q query, yield func(statement)
 	return seen
 }
 
-func (n *Node) queryNeighbor(ctx context.Context, s *session, q query, results chan<- statement) {
+func (n *Node) queryNeighbor(ctx context.Context, s *session, q query, results chan<- signedIntroduction) {
 	if !n.usable(s) {
 		return
 	}
@@ -435,7 +435,7 @@ func (n *Node) handleLookup(s *session, reply io.Writer, b []byte) {
 		n.punch(origin)
 	}
 	q.Visited = append(q.Visited, n.id)
-	n.forwardLookup(ctx, q, func(record statement) bool {
+	n.forwardLookup(ctx, q, func(record signedIntroduction) bool {
 		return n.usable(s) && writeFrame(reply, record) == nil
 	})
 }

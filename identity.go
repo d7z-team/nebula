@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"slices"
 	"time"
@@ -215,7 +214,7 @@ func (n *Node) ReloadCertificates(ctx context.Context, in LocalCertificates) err
 		if err != nil {
 			return err
 		}
-		if err := n.validateIntroduction(p, c); err != nil {
+		if err := n.checkLocalIntroductionBudget(p, c); err != nil {
 			return err
 		}
 		n.mu.Lock()
@@ -252,60 +251,4 @@ func (n *Node) memberOf(p *topologyView) bool {
 
 func (n *Node) ready(p *topologyView) bool {
 	return n.memberOf(p) && time.Now().Before(n.cred.Load().until)
-}
-
-type (
-	statement                 []byte
-	publishedStatement[T any] struct {
-		Publisher PeerID `json:"publisher"`
-		Value     T      `json:"value"`
-	}
-)
-
-func (n *Node) signStatement(kind string, value any, signer tls.Certificate) (statement, error) {
-	b, err := n.statementBody(value)
-	if err != nil {
-		return nil, err
-	}
-	return pki.SignObject(n.Cluster().Network(), kind, b, signer)
-}
-
-func (n *Node) statementBody(value any) ([]byte, error) {
-	return json.Marshal(publishedStatement[any]{n.id, value})
-}
-
-type statementSigner struct {
-	pki.Identity
-	leaf, node *x509.Certificate
-}
-
-func (n *Node) verifyStatement(ctx context.Context, kind string, s statement, p *topologyView) (statementSigner, []byte, time.Time, error) {
-	var signer statementSigner
-	b, chain, err := pki.VerifyObjectSignature(s, p.cluster.Network(), kind)
-	if err != nil {
-		return signer, nil, time.Time{}, err
-	}
-	id, nodePath, grantPaths, err := pki.VerifyObjectSigner(chain, n.o.Auth.RootCA, p.cluster, time.Now())
-	if err != nil {
-		return signer, nil, time.Time{}, err
-	}
-	signer = statementSigner{id, chain[0], nodePath[0]}
-	if _, ok := p.members[n.id]; !ok || kind != "introduction" && !p.acceptsIdentity(id) {
-		return signer, nil, time.Time{}, ErrPathPolicy
-	}
-	check := ChainCheck{Member: id.ID, Local: id.ID == n.id, Purpose: NodeIdentity, Usage: x509.ExtKeyUsageClientAuth}
-	nodeEnd, err := n.chainDeadline(ctx, check, [][]*x509.Certificate{nodePath})
-	if err != nil {
-		return signer, nil, time.Time{}, err
-	}
-	check.Purpose, check.Usage = ClusterGrant, x509.ExtKeyUsageCodeSigning
-	end, err := n.chainDeadline(ctx, check, grantPaths)
-	if err != nil {
-		return signer, nil, time.Time{}, err
-	}
-	var obj publishedStatement[json.RawMessage]
-	if json.Unmarshal(b, &obj) != nil || obj.Publisher != signer.ID {
-		return signer, nil, time.Time{}, ErrPathPolicy
-	}
-	return signer, obj.Value, earlierDeadline(nodeEnd, end), nil
 }
