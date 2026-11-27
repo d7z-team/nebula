@@ -235,6 +235,34 @@ func TestUDPByteReplay(t *testing.T) {
 	require.Error(t, e)
 }
 
+func TestUDPBranchCloseWithBacklog(t *testing.T) {
+	raw, src := listenUDP(t), listenUDP(t)
+	p := NewUDP(raw)
+	defer p.Close()
+	// Fill the logical queue independently of the kernel receive buffer.
+	for i := range 256 {
+		p.other.deliver(datagram{data: []byte{'x', byte(i)}, from: src.LocalAddr()})
+	}
+	_, err := src.WriteTo([]byte("overflow"), raw.LocalAddr())
+	require.NoError(t, err)
+	cid, err := p.mesh.GenerateConnectionID()
+	require.NoError(t, err)
+	b := append([]byte{0x40}, cid.Bytes()...)
+	_, err = src.WriteTo(b, raw.LocalAddr())
+	require.NoError(t, err)
+	got, from := readDatagram(t, p.Mesh())
+	require.Equal(t, b, got)
+	require.Len(t, p.other.in, 256)
+	first, _ := readDatagram(t, p.Other())
+	require.Equal(t, []byte{'x', 0}, first)
+	require.NoError(t, p.Other().Close())
+	require.Zero(t, len(p.other.in))
+	_, err = p.Mesh().WriteTo(b, from)
+	require.NoError(t, err)
+	got, _ = readDatagram(t, src)
+	require.Equal(t, b, got)
+}
+
 func captureInitialFlight(t *testing.T, protos []string) [][]byte {
 	t.Helper()
 	server, client := listenUDP(t), listenUDP(t)

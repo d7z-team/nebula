@@ -76,7 +76,7 @@ opts.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
 | 已知信息 | 连接方式 |
 | --- | --- |
 | 入口的物理地址和端口 | 用 `ConnectEndpoint(ctx, ep)` 连接，`ep.Network` 填 `udp` 或 `tcp`。成功后返回该端点通过认证的成员 ID。 |
-| 对端的一个虚拟主地址 | 如果 `LookupPeer(primary)` 能在本机找到归属，用 `ConnectPeer(ctx, primary)` 连接其所有者。预配置时，在对端的 `Member.Endpoints` 填入可达物理端点。 |
+| 对端的一个虚拟主地址 | `ConnectPeer(ctx, primary)` 按本机已知的地址归属建链。归属未知时先用 `ResolveIP` 查询邻居，再用结果的 `Peer` 调用 `ConnectPeerID`。 |
 | 对端的公钥指纹 | 用 `ConnectPeerID(ctx, id)` 等待与该身份的获准路径。要持续维护该邻居，在拓扑中为两端配置双向 `Links`。 |
 
 首次接入时，若本机只配置了自己的拓扑条目，在 `New` 前将入口的公钥指纹加入 `Auth.TrustedEntrypoints`。本机也可通过拓扑中的 `Member.ID` 或已验证且有效的签名介绍认可对端。
@@ -135,7 +135,16 @@ for _, m := range matches {
 
 ## 选择直连或中继
 
-`SetPeerPathPolicy(peerID, mode)` 绑定节点公钥指纹，可在建链和发现前预设。只有一个主地址时，可先用 `LookupPeer(ip)` 确认当前归属。调用 `configured, effective := node.PeerPathPolicy(peerID)` 可读取配置值和叠加拓扑限制后的有效模式。`Auto` 清除本机覆盖并允许在合规路径间选路，`DirectOnly` 只许直连，`RelayOnly` 只许经中继，`Blocked` 封锁到该成员的路径。两端任一成员启用 `Restricted` 后，只有列在双向 `Links` 的邻居才能直连。电路每个中间成员还须启用 `Transit`。节点参数取零时选择默认值，负值会使 `New` 返回错误。`MaintenanceInterval` 默认 2 秒，控制邻居维护与探测节奏。`DialTimeout` 默认 4 秒，是拨号、握手、控制交换与传输写入的基础超时；中继建链按剩余跳数计算预算。`MaxCircuits` 默认 128，限制本机并发电路数。[三节点配置和 IP 回执](../examples/relay/main.go)
+`SetPeerPathPolicy(peerID, mode)` 绑定节点公钥指纹，可在建链和发现前预设。只有一个主地址时，可先用 `LookupPeer(ip)` 确认当前归属。调用 `configured, effective := node.PeerPathPolicy(peerID)` 可读取配置值和叠加拓扑限制后的有效模式。`Auto` 清除本机覆盖并允许在合规路径间选路，`DirectOnly` 只许直连，`RelayOnly` 只许经中继，`Blocked` 封锁到该成员的路径。两端任一成员启用 `Restricted` 后，只有列在双向 `Links` 的邻居才能直连。电路每个中间成员还须启用 `Transit`。
+
+`Options` 中以下参数取零时使用默认值。
+
+| 参数 | 默认值 | 作用范围 |
+| --- | --- | --- |
+| `MaxInboundHandshakes` | 256 | 本节点所有地址族的 TCP 和 QUIC 共用的入站建链名额。建链结束即释放，已注册的直连会话不占名额。[共享端口容量](portshare.md#容量和部署边界) |
+| `MaxCircuits` | 512 | 本机发起、终止和转发的电路合计占用，含正在建立的电路。用 `ControlStatus().Circuits` 读取当前占用。 |
+| `MaintenanceInterval` | 2 秒 | 邻居维护及已建路径探活的调度间隔。 |
+| `DialTimeout` | 4 秒 | 拨号、握手、控制交换和传输写入的基础超时。中继建链按剩余跳数计算预算。 |
 
 ```go
 if err := node.SetPeerPathPolicy(peerID, nebula.RelayOnly); err != nil {
@@ -199,7 +208,7 @@ return err
 
 网关示例在外层使用 TLS/TCP。客户端用 `RefreshIP` 发现网关、用 `ApplyTopology` 批准下游前缀，在 gVisor 中为站点前缀和默认出口安装路由。两个下游的 IPv4 和 IPv6 UDP 回显可核对实际出口。[双栈网关源码](../examples/gateway/main.go)
 
-通过 `nebulagvisor.NewEndpoint` 独占节点 IP 端口，再用 `CreateNIC` 加入用户态网络栈。注册失败调用 `Endpoint.Close`，成功后用 `RemoveNIC` 拆卸。双栈 NIC 的默认 MTU 为 1300 字节，受节点 `MaxIPSize` 限制，最低 1280 字节。逐路由设置 MTU 时，例如 `node.RecommendedMTU(gateway, destination.Is6(), int(ep.MTU()))`，第二个参数表示内层目的地址族。查询在没有活动路径时也可返回给定上限。[适配器](../nebulagvisor/endpoint.go)
+通过 `nebulagvisor.NewEndpoint` 独占节点 IP 端口，再用 `CreateNIC` 加入用户态网络栈。注册失败调用 `Endpoint.Close`，成功后用 `RemoveNIC` 拆卸。节点的 `Options.MaxIPSize` 默认 65535 字节，可设为 1280～65535。双栈 NIC 的默认 MTU 取 1300 字节与该上限的较小值。逐路由设置 MTU 可调用 `node.RecommendedMTU(gateway, destination.Is6(), int(ep.MTU()))`，无可用路径时只按本机上限计算。[适配器](../nebulagvisor/endpoint.go) · [路径 MTU](mesh.md#路由-mtu)
 
 访问下游失败时，沿报文方向检查以下设置。
 
@@ -222,12 +231,13 @@ opts.InboundPolicy = func(peer nebula.PeerID, src, dst netip.Addr) bool {
 
 ## 主题消息与运行状态
 
-发布方的 `Member.PublishTopics` 可授予 `app/demo` 及其子树；订阅方按完整主题 `app/demo/hello` 调用 `Subscribe`。先注册订阅并从 `sub.Publications()` 读取 `nebula.DeliveredPublication`，再触发业务。`Publish` 返回的 ID 表示本机已接纳，可以用它关联接收端回执。邻居在有效期内补发缺失主题消息；本机新建的订阅从之后接纳的主题消息开始交付。缓冲上限为 32 条，`sub.Missed()` 记录本订阅因缓冲满而丢弃的数量。`sub.Close()` 或关闭节点都会关闭交付 channel。[主题消息收发示例](../examples/quickstart/main.go)
+例如，给发布成员的 `PublishTopics` 配置 `app/demo`，接收方在发布前调用 `Subscribe("app/demo/hello")`，即可从 `sub.Publications()` 读取之后在本机接纳的该主题消息。每个订阅缓冲 32 条，满时的丢弃数见 `sub.Missed()`。关闭订阅或节点会关闭接收通道。`Publish` 返回本机接纳的消息 ID，需要确认远端处理结果时用该 ID 关联业务回执。[收发示例](../examples/quickstart/main.go) · [缓存与补发](mesh.md#签名主题消息)
 
 | 排查的问题 | 查看位置 |
 | --- | --- |
 | 节点是否已经启动、具备本机成员资格 | `ControlStatus().Started` 表示已启动收发。`Ready` 表示本机凭据和成员视图有效，启动前也可以为真。`AuthorizedUntil` 给出本机三个用途、证书链和宿主授权共同限定的截止时刻；`GrantExpires` 是本机集群授权的到期时刻。 |
 | 哪个入口停止接收连接 | `ControlStatus().ListenerErrors` 按 `udp4`、`udp6`、`tcp4`、`tcp6` 记录异常退出的入口。TCP 遇到暂时性错误会退避重试。共享 UDP 的物理套接字读取遇到永久错误时，两个打开的分支都能取得底层错误。 |
+| 是否因入站建链名额耗尽而拒连 | 比较两次 `ControlStatus().RejectedInboundHandshakes` 的差值，可得这段时间因本节点名额已满而拒绝的连接数。共享端口丢包和 QUIC 传输层拒绝连接发生在节点接入之前。 |
 | 拨号为何失败 | 先看本次连接返回的错误。`ControlStatus().LastError` 保留最近的建链错误，`DialFailures` 累计失败的端点拨号。 |
 | 到成员有哪些可用路径 | `Paths()` 列出每条已建路径的传输、双方节点证书和授权叶的序列号、授权截止时间及探测数据。`PreferredPath(peerID)` 返回一般流量当前会选的路径。 |
 | 某个包是否发出 | `IPPort.Stats()` 提供排队和丢包计数，`ObserveTransmit` 给出已出队包的本地提交结果。远端处理情况由应用回执确认。[发送诊断](#ip-收发与网关) |

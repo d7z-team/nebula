@@ -38,6 +38,62 @@ func (s *countingMeshSocket) WriteTo(b []byte, to net.Addr) (int, error) {
 	return s.SharedSocket.WriteTo(b, to)
 }
 
+func TestSharedListenersInboundHandshakes(t *testing.T) {
+	for _, first := range []string{"tcp", "udp"} {
+		t.Run(first, func(t *testing.T) {
+			f := newFixture(t, "both", "both", "both")
+			opts := &f.opts[0]
+			opts.MaxInboundHandshakes = 1
+			udp := portshare.NewUDP(opts.Transport.UDP4)
+			tcp := portshare.NewTCP(opts.Transport.TCP4)
+			t.Cleanup(func() { udp.Close(); tcp.Close() })
+			opts.Transport.UDP4, opts.Transport.TCP4 = udp.Mesh(), tcp.Mesh()
+			for i := range f.opts {
+				f.opts[i].DialTimeout = 5 * time.Second
+				f.opts[i].MaintenanceInterval = time.Hour
+			}
+			checking, resume := make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(resume) })
+			defer release()
+			started := sync.OnceFunc(func() { close(checking) })
+			opts.Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+				if c.Purpose == ClusterGrant && c.Member == f.cfg.Members[1].ID {
+					started()
+					select {
+					case <-resume:
+					case <-ctx.Done():
+						return time.Time{}, ctx.Err()
+					}
+				}
+				return time.Time{}, nil
+			}
+			f.start()
+			hub, a, b := f.nodes[0], f.nodes[1], f.nodes[2]
+			one, two := f.cfg.Members[0].Endpoints[0], f.cfg.Members[0].Endpoints[1]
+			if one.Network != first {
+				one, two = two, one
+			}
+			done := make(chan error, 1)
+			go func() { _, err := a.ConnectEndpoint(t.Context(), one); done <- err }()
+			select {
+			case <-checking:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first connection did not reach grant verification")
+			}
+			_, err := b.ConnectEndpoint(t.Context(), two)
+			require.Error(t, err)
+			require.Equal(t, uint64(1), hub.ControlStatus().RejectedInboundHandshakes)
+			release()
+			require.NoError(t, <-done)
+			require.Eventually(t, func() bool { return len(hub.handshakeSlots) == 0 }, time.Second, time.Millisecond)
+			_, err = b.ConnectEndpoint(t.Context(), two)
+			require.NoError(t, err)
+			require.Eventually(t, func() bool { return len(hub.Paths()) == 2 }, time.Second, time.Millisecond)
+			require.Equal(t, uint64(1), hub.ControlStatus().RejectedInboundHandshakes)
+		})
+	}
+}
+
 func TestShareSitesAndPolicy(t *testing.T) {
 	f := newFixture(t, "both", "both")
 	socks := make([]*portshare.UDP, 2)

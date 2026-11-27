@@ -49,7 +49,12 @@ type Options struct {
 	// and transport writes. Circuit setup budgets one timeout per remaining hop.
 	// Zero selects four seconds.
 	DialTimeout time.Duration
-	// MaxCircuits limits concurrent circuits at this node. Zero selects 128.
+	// MaxInboundHandshakes limits concurrent inbound direct session setup across
+	// both address families. TCP reserves a slot before TLS, QUIC after TLS.
+	// The slot is released when setup finishes. Zero selects 256.
+	MaxInboundHandshakes int
+	// MaxCircuits limits concurrent relay circuits originating, terminating or
+	// forwarding at this node, including circuits under construction. Zero selects 512.
 	MaxCircuits int
 	// MaxIPSize bounds a complete inner packet in bytes and is advertised to authenticated peers.
 	// The range is 1280 through 65535. Zero selects 65535.
@@ -163,6 +168,7 @@ type Node struct {
 	pathRegistered         chan struct{} // lazy notification for callers waiting for a cold-dial slot
 	port                   *IPPort
 	handshakeSlots         chan struct{}
+	handshakeRejections    uint64                     // Protected by mu.
 	grantWrites            map[chan struct{}]struct{} // in-flight grant frames, protected by mu
 	sizeQuery              []byte
 	routeCursors           map[PeerID]*routeCursor
@@ -251,11 +257,17 @@ func New(parent context.Context, o Options) (*Node, error) {
 	if o.DialTimeout == 0 {
 		o.DialTimeout = 4 * time.Second
 	}
+	if o.MaxInboundHandshakes < 0 {
+		return nil, errors.New("negative MaxInboundHandshakes")
+	}
+	if o.MaxInboundHandshakes == 0 {
+		o.MaxInboundHandshakes = 256
+	}
 	if o.MaxCircuits < 0 {
 		return nil, errors.New("negative MaxCircuits")
 	}
 	if o.MaxCircuits == 0 {
-		o.MaxCircuits = 128
+		o.MaxCircuits = 512
 	}
 	if o.MaxIPSize == 0 {
 		o.MaxIPSize = MaxIPPacketSize
@@ -297,7 +309,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 		queries:                make(map[string]time.Time),
 		publications:           make(map[string]cachedPublication),
 		subscriptions:          make(map[*Subscription]struct{}),
-		handshakeSlots:         make(chan struct{}, 128),
+		handshakeSlots:         make(chan struct{}, o.MaxInboundHandshakes),
 		grantWrites:            make(map[chan struct{}]struct{}),
 		backgroundSlots:        make(chan struct{}, 8),
 		neighborDialSlots:      make(chan struct{}, 4),
@@ -349,6 +361,18 @@ func (n *Node) tryTaskLocked(slots chan struct{}, fn func()) bool {
 	}
 }
 
+func (n *Node) tryInboundHandshake(fn func()) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.tryTaskLocked(n.handshakeSlots, fn) {
+		return true
+	}
+	if n.state == running && n.ctx.Err() == nil {
+		n.handshakeRejections++
+	}
+	return false
+}
+
 // Start begins accepting peer connections and maintaining authorized paths.
 // A second call on a running node returns ErrNodeAlreadyStarted.
 func (n *Node) Start() error {
@@ -393,7 +417,7 @@ func (n *Node) Start() error {
 					n.recordListenerError(family, err)
 					return
 				}
-				if !n.tryTask(n.handshakeSlots, func() {
+				if !n.tryInboundHandshake(func() {
 					n.attachQUIC(n.ctx, q, PeerID{}, false, q.Context().Value(credentialContextKey{}).(*credentials))
 				}) {
 					q.CloseWithError(0, "closing")
@@ -417,7 +441,7 @@ func (n *Node) Start() error {
 					c.Close()
 					continue
 				}
-				if !n.tryTask(n.handshakeSlots, func() { n.attachTLS(n.ctx, c, PeerID{}, nil, false, nil) }) {
+				if !n.tryInboundHandshake(func() { n.attachTLS(n.ctx, c, PeerID{}, nil, false, nil) }) {
 					c.Close()
 				}
 			}
@@ -520,7 +544,8 @@ func (n *Node) newUDPTransport(udp net.PacketConn) *udpTransport {
 	}
 	t := &udpTransport{Transport: &quic.Transport{Conn: pc}, config: &quic.Config{
 		Versions: []quic.Version{quic.Version1}, EnableDatagrams: true, InitialPacketSize: 1200,
-		HandshakeIdleTimeout: n.o.DialTimeout, MaxIncomingStreams: maxSessionStreams, MaxIncomingUniStreams: -1,
+		HandshakeIdleTimeout: n.o.DialTimeout, MaxIncomingUniStreams: -1,
+		MaxIncomingStreams: min(int64(n.o.MaxCircuits), (1<<60)-maxSessionStreams) + maxSessionStreams,
 	}}
 	if shared, ok := udp.(meshwire.SharedSocket); ok {
 		shared.ConfigureMeshQUIC(t.Transport, t.config)

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -265,6 +266,60 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	require.Equal(t, ep.Address, send(b.Addresses().IPv4))
 }
 
+func TestInboundTCPCanaryAndExplicitDial(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp")
+	for i := range f.opts {
+		f.opts[i].MaintenanceInterval = time.Hour
+	}
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+	_, err := a.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return b.preferredSession(a.id, true) != nil }, time.Second, time.Millisecond)
+	s := b.preferredSession(a.id, true)
+	b.mu.Lock()
+	b.peers[a.id].lastCanary = time.Time{}
+	b.mu.Unlock()
+	b.probeAlternatePaths(s, 0)
+	require.Len(t, b.Paths(), 1)
+	id, err := b.ConnectEndpoint(t.Context(), f.cfg.Members[0].Endpoints[0])
+	require.NoError(t, err)
+	require.Equal(t, a.id, id)
+	require.Len(t, b.Paths(), 2)
+}
+
+func TestMaintenanceProbesWholeHub(t *testing.T) {
+	const interval = 500 * time.Millisecond
+	f := newFixture(t, slices.Repeat([]string{"tcp"}, 17)...)
+	for i := range f.opts {
+		f.opts[i].MaintenanceInterval = time.Hour
+	}
+	f.opts[0].MaintenanceInterval = interval
+	f.start()
+	hub := f.nodes[0]
+	for _, peer := range f.nodes[1:] {
+		_, err := peer.ConnectEndpoint(t.Context(), f.cfg.Members[0].Endpoints[0])
+		require.NoError(t, err)
+	}
+	since := time.Now()
+	require.Eventually(t, func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		if len(hub.peers) != len(f.nodes)-1 {
+			return false
+		}
+		oldest := time.Now()
+		for _, paths := range hub.peers {
+			alive := paths.sessions[0].lastAlive
+			if alive.Before(oldest) {
+				oldest = alive
+			}
+		}
+		// Sixteen replies fit in two ticks even with a delayed maintenance pass.
+		return oldest.After(since) && time.Since(oldest) < 2*interval
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
 func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
 	f := newFixture(t, slices.Repeat([]string{"tcp"}, 19)...)
 	last := len(f.opts) - 1
@@ -430,14 +485,18 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 
 func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	f.cfg.Members[0].BytesPerSecond = 1
+	f.cfg.Members[0].BytesPerSecond = 256
 	f.opts[0].MaintenanceInterval = 40 * time.Millisecond
+	f.opts[1].MaintenanceInterval = time.Hour
+	f.opts[2].MaintenanceInterval = time.Hour
 	f.start()
 	a, b, c := f.nodes[0], f.nodes[1], f.nodes[2]
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
 	require.True(t, a.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	var id string
 	for i := range cap(a.backgroundSlots) + 2 {
-		_, err := a.Publish(t.Context(), "app/test", []byte{byte(i)})
+		var err error
+		id, err = a.Publish(t.Context(), "app/test", []byte{byte(i)})
 		require.NoError(t, err)
 	}
 	require.Eventually(t, func() bool { return len(a.backgroundSlots) == cap(a.backgroundSlots) }, time.Second, time.Millisecond)
@@ -447,6 +506,15 @@ func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
 		path, ok := a.PreferredPath(c.id)
 		return ok && path.Transport == "tcp"
 	}, 2*time.Second, 5*time.Millisecond)
+	// Withdraw the slow neighbor while its pushes are waiting on the limiter.
+	require.NoError(t, a.SetPeerPathPolicy(b.id, Blocked))
+	require.Eventually(t, func() bool { return len(a.backgroundSlots) == 0 }, time.Second, time.Millisecond)
+	// The message is still valid, but this fetch cannot finish pacing within
+	// its exchange deadline. The responder releases the stream immediately.
+	require.Eventually(t, func() bool { return c.preferredSession(a.id, true) != nil }, time.Second, time.Millisecond)
+	_, err := c.preferredSession(a.id, true).request(t.Context(), opGetPublication, []byte(id), maxControlFrame)
+	require.ErrorIs(t, err, io.EOF)
+	require.Zero(t, a.ControlStatus().BytesScheduled)
 }
 
 type failingUDPReader struct {

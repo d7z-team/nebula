@@ -34,6 +34,22 @@ type circuitLease struct {
 	closed bool
 }
 
+func (l *circuitLease) reserve() bool {
+	n := l.n
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.circuits) >= n.o.MaxCircuits {
+		return false
+	}
+	l.ctx, l.cancel = context.WithCancel(n.ctx)
+	if !l.allowedLocked() {
+		l.cancel()
+		return false
+	}
+	n.circuits[l] = struct{}{}
+	return true
+}
+
 func (l *circuitLease) bind(c net.Conn) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -56,6 +72,8 @@ func (l *circuitLease) close() {
 	ends := l.ends
 	l.mu.Unlock()
 	for _, c := range ends {
+		// A yamux stream may keep reading after a local FIN.
+		c.SetReadDeadline(time.Now())
 		c.Close()
 	}
 	l.n.mu.Lock()
@@ -298,15 +316,10 @@ func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.C
 }
 
 func (n *Node) startCircuit(ctx context.Context, path []PeerID) error {
-	n.mu.Lock()
-	if !n.circuitAllowedLocked(path) || path[0] != n.id || len(n.circuits) >= n.o.MaxCircuits {
-		n.mu.Unlock()
+	l := &circuitLease{n: n, path: path}
+	if len(path) == 0 || path[0] != n.id || !l.reserve() {
 		return ErrPathPolicy
 	}
-	l := &circuitLease{n: n, path: path}
-	l.ctx, l.cancel = context.WithCancel(n.ctx)
-	n.circuits[l] = struct{}{}
-	n.mu.Unlock()
 	c, err := n.openLeg(ctx, path[1], l)
 	if err != nil {
 		l.close()
@@ -335,16 +348,14 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 	if json.Unmarshal(b, &req) != nil {
 		return false
 	}
-	n.mu.Lock()
 	pos := slices.Index(req.Path, n.id)
-	if !n.sessionAllowedLocked(s) || !n.circuitAllowedLocked(req.Path) || pos <= 0 || s.peer != req.Path[pos-1] || len(n.circuits) >= n.o.MaxCircuits {
-		n.mu.Unlock()
+	if pos <= 0 || s.peer != req.Path[pos-1] {
 		return false
 	}
 	l := &circuitLease{n: n, path: req.Path, ends: []net.Conn{c}, legs: []*session{s}}
-	l.ctx, l.cancel = context.WithCancel(n.ctx)
-	n.circuits[l] = struct{}{}
-	n.mu.Unlock()
+	if !l.reserve() {
+		return false
+	}
 	if pos == len(req.Path)-1 {
 		if _, err := c.Write([]byte{circuitReady}); err != nil {
 			l.close()
@@ -371,34 +382,34 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 		return true
 	}
 	c.SetDeadline(time.Time{})
-	pump := func(dst, src net.Conn) {
-		defer l.close()
-		buf := make([]byte, 16<<10)
-		for {
-			count, err := src.Read(buf)
-			if count > 0 {
-				if e := n.shape(l.ctx, count); e != nil {
-					return
-				}
-				n.mu.Lock()
-				permit := l.allowedLocked()
-				n.mu.Unlock()
-				if !permit {
-					return
-				}
-				if _, e := dst.Write(buf[:count]); e != nil {
-					return
-				}
+	// The lease owns both streams. Release the incoming request slot once ready.
+	n.wg.Go(func() { l.forward(next, c) })
+	n.wg.Go(func() { l.forward(c, next) })
+	return true
+}
+
+func (l *circuitLease) forward(dst, src net.Conn) {
+	defer l.close()
+	n := l.n
+	buf := make([]byte, 16<<10)
+	for l.ctx.Err() == nil {
+		count, err := src.Read(buf)
+		if count > 0 {
+			if n.shape(l.ctx, count) != nil {
+				return
 			}
-			if err != nil {
+			n.mu.Lock()
+			permit := l.allowedLocked()
+			n.mu.Unlock()
+			if !permit {
+				return
+			}
+			if _, err := dst.Write(buf[:count]); err != nil {
 				return
 			}
 		}
+		if err != nil {
+			return
+		}
 	}
-	// Either direction closes both streams; the handler waits for both copies.
-	var wg sync.WaitGroup
-	wg.Go(func() { pump(next, c) })
-	pump(c, next)
-	wg.Wait()
-	return true
 }

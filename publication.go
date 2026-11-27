@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
+	"maps"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -44,6 +44,10 @@ type DeliveredPublication struct {
 type cachedPublication struct {
 	record  statement
 	expires time.Time
+}
+
+func (n *Node) expirePublicationsLocked(now time.Time) {
+	maps.DeleteFunc(n.publications, func(_ string, p cachedPublication) bool { return !now.Before(p.expires) })
 }
 
 // Subscription receives new publications on one exact topic.
@@ -168,18 +172,16 @@ func (n *Node) acceptPublication(ctx context.Context, from *session, record stat
 		n.mu.Unlock()
 		return "", ErrPathPolicy
 	}
-	if _, ok := n.publications[id]; ok {
+	if existing, ok := n.publications[id]; ok && now.Before(existing.expires) {
 		n.mu.Unlock()
 		return id, nil
 	}
-	for k, v := range n.publications {
-		if !v.expires.After(now) {
-			delete(n.publications, k)
-		}
-	}
 	if len(n.publications) >= maxPublications {
-		n.mu.Unlock()
-		return "", ErrQueueFull
+		n.expirePublicationsLocked(now)
+		if len(n.publications) >= maxPublications {
+			n.mu.Unlock()
+			return "", ErrQueueFull
+		}
 	}
 	n.admissions++
 	n.publications[id] = cachedPublication{record: record, expires: until}
@@ -206,17 +208,19 @@ func (n *Node) acceptPublication(ctx context.Context, from *session, record stat
 	n.mu.Unlock()
 	for _, s := range neighbors {
 		n.tryTask(n.backgroundSlots, func() {
-			if n.allowPublicationSend(s, id, record) {
-				s.request(n.ctx, opPushPublication, record, 0)
+			ctx, cancel := context.WithDeadline(s.ctx, until)
+			defer cancel()
+			if n.pacePublication(ctx, s, id, record) {
+				s.request(ctx, opPushPublication, record, 0)
 			}
 		})
 	}
 	return id, nil
 }
 
-// Publication and inventory repair must both recheck authorization after pacing.
-func (n *Node) allowPublicationSend(s *session, id string, record statement) bool {
-	if n.shape(n.ctx, len(record)) != nil {
+// Push and fetch both recheck the cached signature and path after waiting for bandwidth.
+func (n *Node) pacePublication(ctx context.Context, s *session, id string, record statement) bool {
+	if n.shape(ctx, len(record)) != nil {
 		return false
 	}
 	n.mu.Lock()
@@ -225,32 +229,12 @@ func (n *Node) allowPublicationSend(s *session, id string, record statement) boo
 	return ok && bytes.Equal(p.record, record) && time.Now().Before(p.expires) && n.usableLocked(s)
 }
 
-// handlePublication transfers original CMS DER in both push and fetch operations.
-func (n *Node) handlePublication(s *session, stream io.Writer, op byte, body []byte) {
-	switch op {
-	case opPushPublication:
-		if _, err := n.acceptPublication(n.ctx, s, body, ""); err == nil {
-			writeFrame(stream, nil)
-		}
-	case opGetPublication:
-		id := string(body)
-		n.mu.Lock()
-		p, ok := n.publications[id]
-		n.mu.Unlock()
-		if ok && time.Now().Before(p.expires) && n.allowPublicationSend(s, id, p.record) {
-			writeFrame(stream, p.record)
-		}
-	}
-}
-
 func (n *Node) addPublicationInventory(s *session, a *advert) {
 	now := time.Now()
 	n.mu.Lock()
 	for id, e := range n.publications {
 		if now.Before(e.expires) {
 			a.Inventory = append(a.Inventory, id)
-		} else {
-			delete(n.publications, id)
 		}
 	}
 	n.mu.Unlock()
@@ -287,9 +271,9 @@ func (n *Node) fetchMissingPublications(s *session, ids []string) {
 		n.mu.Unlock()
 		if !known {
 			n.tryTask(n.backgroundSlots, func() {
-				record, err := s.request(n.ctx, opGetPublication, []byte(id), pki.MaxDocument)
+				record, err := s.request(s.ctx, opGetPublication, []byte(id), pki.MaxDocument)
 				if err == nil {
-					n.acceptPublication(n.ctx, s, record, id)
+					n.acceptPublication(s.ctx, s, record, id)
 				}
 			})
 		}

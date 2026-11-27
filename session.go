@@ -57,6 +57,8 @@ type session struct {
 	until                         time.Time // protected by n.mu
 	probing                       bool      // protected by n.mu
 	n                             *Node
+	ctx                           context.Context
+	cancel                        context.CancelFunc
 	lease                         *circuitLease
 	peer                          PeerID
 	instance                      InstanceID
@@ -108,6 +110,9 @@ func (s *session) open(ctx context.Context) (net.Conn, error) {
 func (s *session) close() {
 	if s.closed.Swap(true) {
 		return
+	}
+	if s.cancel != nil {
+		s.cancel()
 	}
 	if s.q != nil {
 		s.q.CloseWithError(0, "session closed")
@@ -276,6 +281,7 @@ func (n *Node) register(s *session) (*session, error) {
 	if replaced == nil && sameFamily >= maxDirectPerFamily {
 		replaced = standby
 	}
+	s.ctx, s.cancel = context.WithCancel(n.ctx)
 	paths.sessions = append(paths.sessions, s)
 	if n.pathRegistered != nil {
 		close(n.pathRegistered)
@@ -294,7 +300,7 @@ func (n *Node) register(s *session) (*session, error) {
 	if s.q != nil {
 		n.wg.Go(func() {
 			for {
-				packet, err := s.q.ReceiveDatagram(n.ctx)
+				packet, err := s.q.ReceiveDatagram(s.ctx)
 				if err != nil {
 					return
 				}
@@ -331,12 +337,12 @@ func (n *Node) serveSession(s *session) {
 		var err error
 		if s.q != nil {
 			var st *quic.Stream
-			st, err = s.q.AcceptStream(n.ctx)
+			st, err = s.q.AcceptStream(s.ctx)
 			if err == nil {
 				c = qStream{st, s.q}
 			}
 		} else {
-			c, err = s.mux.AcceptStreamWithContext(n.ctx)
+			c, err = s.mux.AcceptStreamWithContext(s.ctx)
 		}
 		if err != nil {
 			return
@@ -408,7 +414,8 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 			c.Close()
 		}
 	}()
-	c.SetDeadline(time.Now().Add(n.o.DialTimeout))
+	deadline := time.Now().Add(n.o.DialTimeout)
+	c.SetDeadline(deadline)
 	var op [1]byte
 	if _, err := io.ReadFull(c, op[:]); err != nil {
 		return
@@ -458,8 +465,22 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 		}
 	case opLookup:
 		n.handleLookup(s, c, b)
-	case opPushPublication, opGetPublication:
-		n.handlePublication(s, c, op[0], b)
+	case opPushPublication:
+		if _, err := n.acceptPublication(s.ctx, s, b, ""); err == nil {
+			writeFrame(c, nil)
+		}
+	case opGetPublication:
+		id := string(b)
+		n.mu.Lock()
+		pub, ok := n.publications[id]
+		n.mu.Unlock()
+		if ok {
+			ctx, cancel := context.WithDeadline(s.ctx, earlierDeadline(pub.expires, deadline))
+			defer cancel()
+			if n.pacePublication(ctx, s, id, pub.record) {
+				writeFrame(c, pub.record)
+			}
+		}
 	case opCircuit:
 		if len(s.path) == 0 {
 			owned = !n.forwardCircuit(s, c, b)

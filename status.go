@@ -118,25 +118,39 @@ type ControlStatus struct {
 	// ListenerErrors records terminal listener errors keyed by udp4, udp6, tcp4 or tcp6.
 	ListenerErrors map[string]string
 	// Ready means local membership and credentials are valid, including before Start.
-	Ready    bool
+	Ready bool
+	// Circuits counts relay circuits reserved at this node, including those being established.
 	Circuits int
-	// BytesScheduled counts shaped application bytes. DialFailures counts failed endpoint dials.
-	BytesScheduled, DialFailures uint64
+	// BytesScheduled counts bytes admitted by the shaper before the transport write.
+	BytesScheduled uint64
+	// DialFailures counts failed physical endpoint dials.
+	DialFailures uint64
+	// RejectedInboundHandshakes counts direct connections refused by this node
+	// because all inbound handshake slots were occupied.
+	RejectedInboundHandshakes uint64
 }
 
 // ControlStatus returns a snapshot of this node. Started indicates that I/O has started.
 func (n *Node) ControlStatus() ControlStatus {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	v := ControlStatus{Instance: n.instance, Circuits: len(n.circuits), BytesScheduled: n.bytesScheduled.Load(), DialFailures: n.dialFailures.Load(), LastError: n.lastConnectError, ListenerErrors: maps.Clone(n.listenerErrors)}
 	credentials := n.cred.Load()
 	leaf := credentials.cmsSigner.Leaf
-	v.NodeSerial = credentials.Node.Leaf.SerialNumber.String()
-	v.Peer, v.GrantSerial, v.GrantExpires = n.id, leaf.SerialNumber.String(), leaf.NotAfter
-	v.AuthorizedUntil = credentials.until
-	v.Started, v.Closed = n.state == running, n.state == closed
-	if p := n.policy.Load(); p != nil {
-		v.Ready = !v.Closed && n.ready(p)
+	return ControlStatus{
+		Peer:                      n.id,
+		Instance:                  n.instance,
+		NodeSerial:                credentials.Node.Leaf.SerialNumber.String(),
+		GrantSerial:               leaf.SerialNumber.String(),
+		GrantExpires:              leaf.NotAfter,
+		AuthorizedUntil:           credentials.until,
+		Started:                   n.state == running,
+		Closed:                    n.state == closed,
+		Ready:                     n.state != closed && n.ready(n.policy.Load()),
+		Circuits:                  len(n.circuits),
+		BytesScheduled:            n.bytesScheduled.Load(),
+		DialFailures:              n.dialFailures.Load(),
+		RejectedInboundHandshakes: n.handshakeRejections,
+		LastError:                 n.lastConnectError,
+		ListenerErrors:            maps.Clone(n.listenerErrors),
 	}
-	return v
 }

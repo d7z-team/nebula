@@ -45,7 +45,9 @@ go build -o "$lab/nebula-pki" ./cmd/nebula-pki
 )
 ```
 
-`pki.GenerateKey`、`CreateRoot`、`CreateCSR`、`Issuer.IssueCA`、`Issuer.IssueNode`、`Issuer.IssueGrant` 提供对应 Go API。密钥采用 PKCS#8，申请采用 PKCS#10，签发者可以接入 `crypto.Signer`。`VerifyNode` 校验根直签和节点角色，`VerifyGrant` 检查公钥绑定、固定集群、PKIX 路径和委派约束。运行 `go run ./examples/pki` 可验证经站点 CA 签发的授权。[Go 示例](../examples/pki/main.go) · [X.509](https://www.rfc-editor.org/rfc/rfc5280) · [双进程接入](quickstart.md#使用磁盘凭据启动两个进程)
+`keygen` 默认生成 Ed25519 私钥，`-algorithm` 也可指定 `p256`、`rsa`（3072 位）或 `ml-dsa-44`。CLI 输出 PKCS#8 私钥和 PKCS#10 申请的 PEM 编码。Go 调用方可用 `pki.GenerateKey` 生成密钥，也可将已有的 `crypto.Signer` 交给 `CreateRoot`、`CreateCSR` 或 `Issuer`。
+
+分别用 `Issuer.IssueCA`、`IssueNode` 和 `IssueGrant` 签发 CA、节点证书及授权。`ReadClusterCA` 解析集群地址规划。`VerifyNode` 校验节点角色及根直签，`VerifyGrant` 使用可信根、固定的集群 CA 和预期公钥指纹校验授权链及其委派范围。[站点 CA 的 Go 示例](../examples/pki/main.go) · [双进程接入](quickstart.md#使用磁盘凭据启动两个进程)
 
 ## 证书配置
 

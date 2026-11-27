@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"time"
+	"weak"
 
 	"code.d7z.net/d7z-team/nebula/pki"
 )
@@ -44,7 +45,7 @@ type cachedIntroduction struct {
 	introduction
 	record     statement
 	grantLeaf  *x509.Certificate // Each reload parses a fresh grant leaf, including node-only renewals.
-	policy     *topologyView
+	policy     weak.Pointer[topologyView]
 	candidates []Endpoint // Includes observations omitted from the signed record for size.
 }
 
@@ -153,7 +154,8 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 	cache := &n.introCache
 	cred := n.cred.Load()
 	signer := cred.cmsSigner
-	if cache.policy == p && cache.grantLeaf == signer.Leaf && now.Add(introductionRefreshLead).Before(cache.Expires) && slices.Equal(endpoints, cache.candidates) {
+	policy := weak.Make(p)
+	if cache.policy == policy && cache.grantLeaf == signer.Leaf && now.Add(introductionRefreshLead).Before(cache.Expires) && slices.Equal(endpoints, cache.candidates) {
 		return *cache
 	}
 	intro := n.buildIntroduction(p, cred.identity, endpoints, now.Add(introductionLifetime))
@@ -171,7 +173,7 @@ func (n *Node) localIntroduction(p *topologyView) cachedIntroduction {
 	if err != nil {
 		return cachedIntroduction{}
 	}
-	*cache = cachedIntroduction{introduction: intro, record: record, grantLeaf: signer.Leaf, policy: p, candidates: endpoints}
+	*cache = cachedIntroduction{introduction: intro, record: record, grantLeaf: signer.Leaf, policy: policy, candidates: endpoints}
 	return *cache
 }
 

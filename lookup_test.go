@@ -7,15 +7,32 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"runtime"
 	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
 	"code.d7z.net/d7z-team/nebula/pki"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestCachedIntroductionReleasesPreviousTopology(t *testing.T) {
+	f := newFixture(t, "tcp")
+	f.start()
+	n := f.nodes[0]
+	_, err := n.ResolveIP(t.Context(), f.ips[0])
+	require.NoError(t, err)
+	old := weak.Make(n.policy.Load())
+	require.NoError(t, n.ApplyTopology(t.Context(), f.cfg))
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return old.Value() == nil
+	}, 2*time.Second, 10*time.Millisecond)
+	runtime.KeepAlive(n)
+}
 
 func TestLookupReplyAfterRequesterWithdrawal(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")

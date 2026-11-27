@@ -21,6 +21,8 @@ quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理�
 | 现象 | 从哪里开始 |
 | --- | --- |
 | 有端点但连不上 | 用 `TestTCPFallbackOnInitialDial` 检查 UDP 黑洞后的 TCP 回退，用 `TestOutboundEndpointPolicyWithRelay` 核对出站策略和中继路径。[传输回退](../mesh_test.go) · [端点拨号](../dial_test.go) |
+| 共享端口集中接入时拒连或丢包 | `TestSharedListenersInboundHandshakes` 检查 TCP 与 QUIC 共用名额时的拒绝计数和后续重连。`TestUDPBranchCloseWithBacklog` 检查分支满时的报文保留顺序、关闭时释放积压，以及另一分支的收发。[节点接入](../portshare_test.go) · [分支收发](../portshare/raw_test.go) |
+| 大量邻居探活滞后或 TCP 路径翻倍 | `TestMaintenanceProbesWholeHub` 验证四个探活名额在同一轮持续处理邻居。`TestInboundTCPCanaryAndExplicitDial` 核对唯一 TCP 候选的后台探测和显式拨号。[邻接测试](../interconnect_test.go) |
 | 换址或切换地址族后断流 | `TestNATPaths` 和 `TestGatewayLayouts` 覆盖不同的映射、过滤及多层 NAT。`TestChaosMobileHandover` 和 `TestDualUnderlayFamilyFailover` 在既有业务连接上检查回执。[NAT](../e2e/nat_test.go) · [移动换址](../e2e/chaos_test.go) · [双栈切换](../e2e/mesh_test.go) |
 | 整形期间切路或建邻失败 | `TestChaosRelayOnlyWhileShaping` 检查在途包和后续包的路径；`TestColdCircuitAcrossSlowHops` 在延迟中继上交付首包。[发送队列](../addressing_test.go) · [中继与邻接](../interconnect_test.go) |
 | 查询缺少端点或网关前缀 | `TestAdvertRetainsUsableNATMapping` 检查 NAT 观测的筛选和保留；`TestRefreshIPWithCachedDefault` 比较本轮应答和有效缓存。[地址发现](../lookup_test.go) |
@@ -40,11 +42,19 @@ go test -race -count=5 -run '^(TestColdCircuitAcrossSlowHops|TestChaosRelayOnlyW
 go test -v -count=1 -run '^TestNATPaths$/^(port|destination-specific)$' ./e2e
 ```
 
-用 `-extended` 启用较长的故障场景。`TestSeededChaos` 用 `-seed` 生成八步故障序列，续签动作按步号单独更新节点证书或集群授权，`-v` 显示操作和业务回执。记录提交号、种子和首次失败步骤，可在同一版本重放操作顺序。定时和手动 CI 会重放种子 1 至 10。[混沌场景](../e2e/chaos_test.go)
+`TestSeededChaos` 用 `-seed` 生成八步故障序列，每步检查既有 TCP 连接能否交付业务回执。`-v` 显示种子、步号和动作。记录提交号、种子和首次失败步骤，即可重放操作顺序。定时和手动 CI 会重放种子 1 至 10。[混沌场景](../e2e/chaos_test.go)
 
 ```sh
 go test -race -v -count=1 -run '^TestChaos(MobileHandover|CanaryAfterNATRebind)$' ./e2e -args -extended
 go test -v -count=1 -run '^TestSeededChaos$' ./e2e -args -extended -seed 7
+```
+
+## 中继容量验收
+
+`TestRelayCapacity` 在两台中继之间建立唯一的物理邻接，常规测试由 8 个源节点连接 9 个目的节点，共 72 条端到端认证电路。以下命令使用 16 个源和 32 个目的，分别在 TCP 和 QUIC 邻接上达到默认的 512 条上限。满载时检查探活、未缓存的 IP 查询和双向 IP 交付，再撤回一台中继的转发权并等待所有节点释放电路。日志中的堆占用是全部 50 个节点同进程运行时一次 GC 后的采样。[容量用例](../circuit_capacity_test.go)
+
+```sh
+go test -v -count=1 -run '^TestRelayCapacity$' . -args -full-relay-capacity
 ```
 
 ## 性能对照

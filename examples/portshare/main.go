@@ -26,13 +26,14 @@ import (
 
 func main() {
 	port := flag.Uint("port", 0, "loopback TCP and UDP port (0 selects an available port)")
+	maxHandshakes := flag.Int("max-inbound-handshakes", 0, "mesh node concurrent inbound handshakes (0 uses the node default)")
 	flag.Parse()
-	if err := run(*port); err != nil {
+	if err := run(*port, *maxHandshakes); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(port uint) error {
+func run(port uint, maxHandshakes int) error {
 	listener, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return err
@@ -54,6 +55,7 @@ func run(port uint) error {
 		return err
 	}
 	options[0].Transport.UDP4, options[0].Transport.TCP4 = udp.Mesh(), tcp.Mesh()
+	options[0].MaxInboundHandshakes = maxHandshakes
 	options[1].Transport.UDP4, err = net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		return err

@@ -603,7 +603,8 @@ func TestNodeOptionLimits(t *testing.T) {
 	t.Cleanup(func() { n.Close() })
 	require.Equal(t, 2*time.Second, n.o.MaintenanceInterval)
 	require.Equal(t, 4*time.Second, n.o.DialTimeout)
-	require.Equal(t, 128, n.o.MaxCircuits)
+	require.Equal(t, 256, cap(n.handshakeSlots))
+	require.Equal(t, 512, n.o.MaxCircuits)
 	require.Equal(t, MaxIPPacketSize, n.MaxIPSize())
 
 	for _, tc := range []struct {
@@ -612,6 +613,7 @@ func TestNodeOptionLimits(t *testing.T) {
 	}{
 		{"MaintenanceInterval", Options{MaintenanceInterval: -time.Second}},
 		{"DialTimeout", Options{DialTimeout: -time.Second}},
+		{"MaxInboundHandshakes", Options{MaxInboundHandshakes: -1}},
 		{"MaxCircuits", Options{MaxCircuits: -1}},
 	} {
 		t.Run(tc.field, func(t *testing.T) {

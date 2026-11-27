@@ -149,7 +149,7 @@ func (n *Node) admitSessionLocked(s *session) error {
 		n.admissions++
 		recorded = true
 		if !incumbent.probing && n.tryTaskLocked(n.probeSlots, func() { n.probeSession(incumbent) }) {
-			incumbent.probing = true
+			incumbent.lastProbe, incumbent.probing = now, true
 		}
 	}
 	if recorded {

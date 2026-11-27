@@ -17,14 +17,17 @@ Bob 的拓扑条目授予 `app/demo` 子树的发布权。Alice 订阅完整主�
 
 ## 使用磁盘凭据启动两个进程
 
-先在仓库根目录按 PKI 指南的命令签发 Alice 和 Bob 的 PEM 文件。以下命令沿用同一 shell 的 `$lab` 临时目录。实际部署时，每台机器只需自己的节点证书、集群授权链、私钥、可信根、固定的集群 CA 和宿主批准的拓扑。[签发证书](pki.md#签发证书) · [示例源码](../examples/peer/main.go)
+在仓库根目录按 PKI 指南签发 Alice 和 Bob 的 PEM 文件，保留同一终端的 `$lab` 变量。两个进程共用可信根、固定的集群 CA 和拓扑，各自加载自己的私钥、节点证书及集群授权。[签发证书](pki.md#签发证书) · [示例源码](../examples/peer/main.go)
 
-将以下拓扑保存到凭据目录，并记下输出的目录路径。示例只接受一个完整的拓扑 JSON 对象，遇到未知字段会在绑定端口前报告文件名和字段名。Bob 在启动后按命令行提供的物理 UDP 端点连接 Alice，Alice 通过同一会话发送回执。两端分别拥有请求或回执主题的发布权。
+编译示例并进入凭据目录。拓扑用节点公钥指纹标识成员，分别授予 Bob 发布请求、Alice 发布回执的权限。记下 `pwd` 输出的目录，第二个终端会用到。
 
 ```sh
-alice_id=$("$lab/nebula-pki" inspect -fingerprint -in "$lab/alice.pem")
-bob_id=$("$lab/nebula-pki" inspect -fingerprint -in "$lab/bob.pem")
-cat > "$lab/topology.json" <<JSON
+go build -o "$lab/peer" ./examples/peer
+cd "$lab"
+pwd
+alice_id=$(./nebula-pki inspect -fingerprint -in alice.pem)
+bob_id=$(./nebula-pki inspect -fingerprint -in bob.pem)
+cat > topology.json <<JSON
 {
   "network": "demo",
   "members": [
@@ -33,31 +36,24 @@ cat > "$lab/topology.json" <<JSON
   ]
 }
 JSON
-echo "$lab"
 ```
 
-在第一个终端从仓库根目录启动 Alice，等待输出 `listening on 127.0.0.1:4242`。
+在这个目录启动 Alice，等待输出 `listening on 127.0.0.1:4242`。程序默认从当前目录读取 `root.pem`、`ca.pem` 和 `topology.json`。
 
 ```sh
-go run ./examples/peer -listen 127.0.0.1:4242 -peer fd13::2 \
-  -root "$lab/root.pem" -cluster-ca "$lab/ca.pem" -cert "$lab/alice.pem" -grant "$lab/alice.grant" \
-  -key "$lab/alice.key" -topology "$lab/topology.json"
+./peer -listen 127.0.0.1:4242 -peer fd13::2 -cert alice.pem -grant alice.grant -key alice.key
 ```
 
-在第二个终端进入同一仓库根目录，将 `lab` 设为前面输出的目录。用 Bob 的凭据接入并查询 Alice 的 IPv6 地址，成功时会输出 `fd13::1 via <Alice 的 PeerID> (fd13::1/128)`。
+在第二个终端进入前面输出的凭据目录。用 Bob 的凭据连接 Alice 的物理 UDP 端点，再查询她的虚拟 IPv6 地址。成功时会输出 `fd13::1 via <Alice 的 PeerID> (fd13::1/128)`。
 
 ```sh
-go run ./examples/peer -connect 127.0.0.1:4242 -resolve fd13::1 \
-  -root "$lab/root.pem" -cluster-ca "$lab/ca.pem" -cert "$lab/bob.pem" -grant "$lab/bob.grant" \
-  -key "$lab/bob.key" -topology "$lab/topology.json"
+./peer -connect 127.0.0.1:4242 -resolve fd13::1 -cert bob.pem -grant bob.grant -key bob.key
 ```
 
 随后发送请求并等待回执。
 
 ```sh
-go run ./examples/peer -connect 127.0.0.1:4242 -peer 10.13.0.1 -send hello \
-  -root "$lab/root.pem" -cluster-ca "$lab/ca.pem" -cert "$lab/bob.pem" -grant "$lab/bob.grant" \
-  -key "$lab/bob.key" -topology "$lab/topology.json"
+./peer -connect 127.0.0.1:4242 -peer 10.13.0.1 -send hello -cert bob.pem -grant bob.grant -key bob.key
 ```
 
 Alice 输出 `request from <Bob 的 PeerID>: "hello"`。Bob 核对回执的发布者和原请求 ID，输出 `receipt from <Alice 的 PeerID> for …` 后退出。用 Ctrl-C 停止 Alice。请求和回执都可传播给已连接的邻居。示例只处理预期成员签发的消息。

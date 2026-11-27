@@ -1,6 +1,7 @@
 package nebula
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -17,6 +18,28 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestPublicationExpiresWithoutNeighbors(t *testing.T) {
+	f := newFixture(t, "")
+	// Only object signatures get the short authorization window.
+	f.opts[0].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
+		if c.Usage == x509.ExtKeyUsageCodeSigning {
+			return time.Now().Add(200 * time.Millisecond), nil
+		}
+		return time.Time{}, nil
+	}
+	f.opts[0].MaintenanceInterval = 20 * time.Millisecond
+	f.start()
+	n := f.nodes[0]
+	id, err := n.Publish(t.Context(), "app/test", []byte("short-lived"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		_, exists := n.publications[id]
+		return !exists
+	}, 2*time.Second, 10*time.Millisecond)
+}
 
 func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")

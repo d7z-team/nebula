@@ -22,6 +22,7 @@ import (
 const (
 	meshCIDLen           = 20
 	nonceLen             = 12
+	branchQueueSize      = 256 // Datagrams per logical socket.
 	maxPendingDatagrams  = 48
 	maxPendingBytes      = 96 << 10
 	maxInitialRoutes     = 4096
@@ -76,7 +77,7 @@ func NewUDP(socket net.PacketConn) *UDP {
 	p.readMAC = hmac.New(sha256.New, p.secret[:])
 	branch := func() *packetConn {
 		return &packetConn{
-			parent: p, in: make(chan datagram, 128), done: make(chan struct{}),
+			parent: p, in: make(chan datagram, branchQueueSize), done: make(chan struct{}),
 			read: deadline{changed: make(chan struct{})}, write: deadline{changed: make(chan struct{})},
 		}
 	}

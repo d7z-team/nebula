@@ -4,11 +4,11 @@
 
 ```sh
 go run ./examples/portshare
-# 本机的两个 443 端口可绑定时
+# 指定回环监听端口
 go run ./examples/portshare -port 443
 ```
 
-示例先完成 mesh 对端认证，再分别从两个虚拟主机取回 HTTP/2 和 HTTP/3 响应，并核对响应协议和正文。
+示例先完成 mesh 对端认证，再分别从两个虚拟主机取回 HTTP/2 和 HTTP/3 响应。需要调整节点的入站建链名额时，可另传 `-max-inbound-handshakes`。
 
 ## 接入与关闭
 
@@ -69,10 +69,18 @@ socket.ConfigureMeshQUIC(transport, config)
 | 单字节 UDP 数据报 `00` | 保留给 mesh 单向 NAT 打洞。入站时消费，发送仍从同一物理套接字出站。 |
 | 其他 UDP 流量 | 交给 `Other()`，包括普通数据报、HTTP/3 的 QUIC v2 和宿主自己连接的后续数据报。零长度数据报也保留边界和源地址。 |
 
-分流器选择接收分支后，mesh 节点执行双向 TLS、集群授权及逐包校验。即使网站与 mesh 客户端使用完全相同的 UDP 源和目标端口，切换 `RelayOnly`、`Blocked` 或拓扑邻接限制也只约束 mesh 流量。宿主可以给网站配置独立的 TLS、QUIC 版本和客户端认证。[同源策略与三站点测试](../portshare_test.go) · [TLS ALPN](https://www.rfc-editor.org/rfc/rfc7301) · [QUIC Initial 保护](https://www.rfc-editor.org/rfc/rfc9001#section-5.2)
+分流后，mesh 节点执行双向 TLS、集群授权及逐包校验。即使网站与 mesh 客户端使用相同的 UDP 源和目标端口，`RelayOnly`、`Blocked` 和拓扑邻接限制也只作用于 mesh 分支。网站可独立配置 TLS、QUIC 版本和客户端认证。[同源流量与多站点测试](../portshare_test.go) · [TLS ALPN](https://www.rfc-editor.org/rfc/rfc7301) · [QUIC Initial 保护](https://www.rfc-editor.org/rfc/rfc9001#section-5.2)
 
 ## 容量和部署边界
 
-TCP 分流适用于客户端先发数据的服务。每个 TCP 监听器最多同时等待 128 个连接，分类及交给分支的时限为 2 秒。TCP 和 UDP 都接受最多 64 KiB 的 ClientHello；TCP 预留额外 4 KiB 容纳 TLS record 封装。每个 UDP 套接字同时暂存最多 128 个待识别握手，每个最多保留 48 个数据报、96 KiB 的原始数据。待识别状态在 2 秒后过期，已分类的初始 CID 归属最多缓存 4096 条、各 5 秒。每个 UDP 分支独立排队 128 个数据报。超限、超时或分支排满会关闭待分类的 TCP 连接或丢弃对应的 UDP 数据报；QUIC 的可靠数据由端点重传。
+TCP 分流适用于客户端先发数据的服务。每个 TCP 监听器最多同时等待 128 个连接，分类及交给分支的时限为 2 秒。TCP 和 UDP 都接受最多 64 KiB 的 ClientHello。TCP 预留额外 4 KiB 容纳 TLS record 封装。
+
+同一个物理 UDP 端点承载两个分支，容量按处理阶段计算。
+
+| 阶段 | 容量和行为 |
+| --- | --- |
+| 等待识别新 QUIC v1 连接 | 每个物理套接字最多同时重组 128 个 ClientHello，按源地址及初始目标 CID 区分。每个握手最多保留 48 个数据报、96 KiB 原始数据，2 秒后过期。名额占满时丢弃新出现的源地址与 CID 组合的 Initial。分类完成即释放名额，初始 CID 的分支归属另缓存最多 4096 条、各 5 秒。 |
+| 已分类数据报等待读取 | `Mesh()` 和 `Other()` 各排队 256 个数据报，同一分支的连接共享队列。队满时丢弃该分支新到的数据报，关闭分支时释放其积压，另一分支仍可收发。QUIC 可靠流可重传，DATAGRAM 的补发由应用决定。 |
+| 分流后接入 | `Mesh()` 交给节点处理，建链并发量由 `Options.MaxInboundHandshakes` 控制。`Other()` 的接收方自行管理 HTTP/3 连接。[节点容量设置](integration.md#选择直连或中继) |
 
 UDP 分支提供标准 `net.PacketConn` 的载荷、报文边界和源地址接口。内核收发缓冲区在物理套接字上设置。需要按入站目的 IP 选择回包源地址的多地址主机，应分别绑定相应的本地 IP；通配绑定的逐包目的地址、ECN 和批量收发等辅助信息不经逻辑接口传递。共享模式还需复制数据报、校验 CID 并处理 QUIC 连接事件，可按测试指南在目标环境测量。[性能对照](testing.md#性能对照) · [QUIC CID 和复位](https://www.rfc-editor.org/rfc/rfc9000#section-10.3)

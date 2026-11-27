@@ -16,6 +16,7 @@ type packetConn struct {
 	parent      *UDP
 	in          chan datagram
 	done        chan struct{}
+	inMu        sync.Mutex // Serializes delivery with closing the queue.
 	once        sync.Once
 	err         error // Published by closing done.
 	read, write deadline
@@ -61,6 +62,7 @@ func waitFor[T any](ready <-chan T, c *packetConn, d *deadline) (T, error) {
 			alarm = timer.C
 		}
 		var value T
+		var open bool
 		var err error
 		retry := false
 		select {
@@ -71,7 +73,10 @@ func waitFor[T any](ready <-chan T, c *packetConn, d *deadline) (T, error) {
 			retry = true
 		case <-changed:
 			retry = true
-		case value = <-ready:
+		case value, open = <-ready:
+			if !open {
+				err = c.err
+			}
 		}
 		if timer != nil {
 			timer.Stop()
@@ -97,8 +102,13 @@ func (c *packetConn) Close() error {
 
 func (c *packetConn) shutdown(err error) {
 	c.once.Do(func() {
+		c.inMu.Lock()
 		c.err = err
 		close(c.done)
+		close(c.in)
+		c.inMu.Unlock()
+		for range c.in {
+		}
 		p := c.parent
 		p.writeMu.Lock()
 		defer p.writeMu.Unlock()
@@ -176,10 +186,10 @@ func (c *packetConn) WriteTo(b []byte, to net.Addr) (int, error) {
 }
 
 func (c *packetConn) deliver(pkt datagram) {
-	select {
-	case <-c.done:
+	c.inMu.Lock()
+	defer c.inMu.Unlock()
+	if c.err != nil {
 		return
-	default:
 	}
 	// Queue pressure on one branch must not stall the physical reader.
 	select {

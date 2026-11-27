@@ -129,43 +129,74 @@ func (n *Node) directEndpointLocked(peer PeerID, ep Endpoint) (*session, int) {
 	return nil, 0
 }
 
+// Return the first neighbor to reconsider when a dial slot becomes available.
+func (n *Node) dialNeighborsLocked(next int) int {
+	p := n.policy.Load()
+	if n.state != running || !n.ready(p) {
+		return next
+	}
+	targets := p.members[n.id].Links
+	for range targets {
+		next %= len(targets)
+		peer := targets[next]
+		if n.attempts[peer] == nil && n.modeLocked(peer) != Blocked && n.preferredSessionLocked(n.peers[peer], false, nil) == nil {
+			select {
+			case n.neighborDialSlots <- struct{}{}:
+				n.startDialLocked(peer, n.neighborDialSlots)
+			default:
+				return next
+			}
+		}
+		next++
+	}
+	return next
+}
+
 func (n *Node) maintain() {
 	tick := time.NewTicker(n.o.MaintenanceInterval)
 	defer tick.Stop()
 	next := 0
+	// Workers take the next due path from the same round, including when a
+	// slow peer occupies one of the other probe slots. Node.mu guards pending.
+	var pending []*session
+	interval := n.o.MaintenanceInterval - n.o.MaintenanceInterval/4
+	due := func(s *session, now time.Time) bool {
+		return !s.probing && now.Sub(s.lastProbe) >= interval
+	}
+	probe := func() {
+		for {
+			n.mu.Lock()
+			if len(pending) == 0 || n.state != running {
+				n.mu.Unlock()
+				return
+			}
+			s := pending[0]
+			pending[0] = nil
+			pending = pending[1:]
+			now := time.Now()
+			if !due(s, now) || !n.usableLocked(s) {
+				n.mu.Unlock()
+				continue
+			}
+			s.lastProbe, s.probing = now, true
+			n.mu.Unlock()
+			n.probeSession(s)
+		}
+	}
 	for {
 		n.prunePaths()
 		n.mu.Lock()
-		ss := n.sessionListLocked()
-		p := n.policy.Load()
-		if n.state == running && n.ready(p) {
-			targets := p.members[n.id].Links
-		schedule:
-			for range targets {
-				next %= len(targets)
-				peer := targets[next]
-				if n.modeLocked(peer) != Blocked && n.attempts[peer] == nil && n.preferredSessionLocked(n.peers[peer], false, nil) == nil {
-					select {
-					case n.neighborDialSlots <- struct{}{}:
-						n.startDialLocked(peer, n.neighborDialSlots)
-					default:
-						break schedule
-					}
-				}
-				next++
-			}
-		}
-		slices.SortFunc(ss, func(a, b *session) int { return a.lastProbe.Compare(b.lastProbe) })
 		now := time.Now()
-		for _, s := range ss {
-			if s.probing || now.Sub(s.lastProbe) < n.o.MaintenanceInterval*3/4 {
-				continue
-			}
-			if !n.tryTaskLocked(n.probeSlots, func() { n.probeSession(s) }) {
+		n.expirePublicationsLocked(now)
+		next = n.dialNeighborsLocked(next)
+		if len(pending) == 0 {
+			pending = slices.DeleteFunc(n.sessionListLocked(), func(s *session) bool { return !due(s, now) })
+			slices.SortFunc(pending, func(a, b *session) int { return a.lastProbe.Compare(b.lastProbe) })
+		}
+		for range min(len(pending), cap(n.probeSlots)) {
+			if !n.tryTaskLocked(n.probeSlots, probe) {
 				break
 			}
-			s.probing = true
-			s.lastProbe = now
 		}
 		n.mu.Unlock()
 		select {
@@ -182,7 +213,7 @@ func (n *Node) probeSession(s *session) {
 	var nonce [8]byte
 	rand.Read(nonce[:])
 	at := time.Now()
-	b, err := s.request(n.ctx, opPing, nonce[:], 8)
+	b, err := s.request(s.ctx, opPing, nonce[:], 8)
 	rtt := time.Since(at)
 	s.healthMu.Lock()
 	if s.q != nil {
@@ -225,7 +256,7 @@ func (n *Node) probeSession(s *session) {
 		n.mu.Unlock()
 		ad := n.advert(s)
 		body, _ := json.Marshal(ad)
-		b, err = s.request(n.ctx, opHello, body, maxControlFrame)
+		b, err = s.request(s.ctx, opHello, body, maxControlFrame)
 		var remote advert
 		if err == nil && json.Unmarshal(b, &remote) == nil {
 			n.receiveAdvert(s, remote)
@@ -254,10 +285,23 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 		eps = n.endpointsLocked(s.peer)
 	}
 	n.mu.Unlock()
+	// A healthy inbound TCP connection already reaches this address. A
+	// reverse dial to the sole listener in its family adds no alternate IP.
+	tcpCandidates := 0
+	if failures == 0 && s.kind == "tcp" && !s.outgoing {
+		for _, ep := range eps {
+			if ep.Network == "tcp" && ep.Address.Addr().BitLen() == s.endpoint.Addr().BitLen() {
+				tcpCandidates++
+			}
+		}
+	}
 	var hadCandidate bool
 	for i := range eps {
 		index := (start + i) % len(eps)
 		ep := eps[index]
+		if tcpCandidates == 1 && ep.Network == "tcp" && ep.Address.Addr() == s.endpoint.Addr() {
+			continue
+		}
 		if ep.Network == "udp" && n.transports[ep.Address.Addr().Is6()] == nil {
 			continue
 		}
