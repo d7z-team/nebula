@@ -94,7 +94,7 @@ func TestIngressVIPAndGroupAuthority(t *testing.T) {
 	// A signed identity carrying a default route still cannot inject an unauthorized VIP.
 	stream, err := n.preferredSession(remote.id, false).open(t.Context())
 	require.NoError(t, err)
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	_, err = stream.Write([]byte{opIP})
 	require.NoError(t, err)
 	for _, packet := range [][]byte{testIPv4(vip, b, "source"), testIPv4(a, vip, "destination"), testIPv4(netip.MustParseAddr("10.13.0.255"), b, "broadcast source")} {

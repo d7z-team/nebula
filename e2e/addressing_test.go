@@ -67,12 +67,12 @@ func TestGroupDatagrams(t *testing.T) {
 			port := uint16(7000 + i)
 			sink, err := gonet.DialUDP(receiver, &tcpip.FullAddress{NIC: 1, Port: port}, nil, proto)
 			require.NoError(t, err)
-			defer sink.Close()
+			defer func() { _ = sink.Close() }()
 			var wq waiter.Queue
 			ep, e := sender.NewEndpoint(udp.ProtocolNumber, proto, &wq)
 			require.Nil(t, e)
 			conn := gonet.NewUDPConn(&wq, ep)
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			ep.SocketOptions().SetBroadcast(true)
 			require.Nil(t, ep.Bind(tcpip.FullAddress{NIC: 1, Addr: gvisorAddr(src)}))
 			_, err = conn.WriteTo([]byte(dst), net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, port)))
@@ -114,12 +114,12 @@ func TestAnycastService(t *testing.T) {
 		service := tcpip.FullAddress{Addr: gvisorAddr(vip), Port: uint16(8000 + i)}
 		conn, err := gonet.DialUDP(clientStack, nil, &service, proto)
 		require.NoError(t, err)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		sockets := make([]*gonet.UDPConn, len(backends))
 		for j, backend := range backends {
 			socket, err := gonet.DialUDP(backend, &service, nil, proto)
 			require.NoError(t, err)
-			defer socket.Close()
+			defer func() { _ = socket.Close() }()
 			sockets[j] = socket
 		}
 		for j, socket := range sockets {
@@ -202,7 +202,7 @@ func TestRelayTCPWithDuplicateInstance(t *testing.T) {
 	var err error
 	duplicate.node, err = nebula.New(t.Context(), duplicate.options)
 	require.NoError(t, err)
-	t.Cleanup(func() { duplicate.node.Close() })
+	t.Cleanup(func() { _ = duplicate.node.Close() })
 	var misdelivered atomic.Int32
 	_, err = duplicate.node.OpenIPPort(nebula.IPPortOptions{Deliver: func(nebula.PeerID, []byte) { misdelivered.Add(1) }})
 	require.NoError(t, err)

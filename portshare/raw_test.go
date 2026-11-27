@@ -23,7 +23,7 @@ func listenUDP(t *testing.T) net.PacketConn {
 	t.Helper()
 	p, e := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, e)
-	t.Cleanup(func() { p.Close() })
+	t.Cleanup(func() { _ = p.Close() })
 	return p
 }
 
@@ -38,9 +38,10 @@ func readDatagram(t *testing.T, c net.PacketConn) ([]byte, net.Addr) {
 
 func fragmentedClientHello(t *testing.T, protos []string) []byte {
 	l, r := net.Pipe()
-	defer r.Close()
-	defer l.Close()
-	go tls.Client(l, &tls.Config{ServerName: "example.test", NextProtos: protos}).Handshake()
+	defer func() { _ = r.Close() }()
+	defer func() { _ = l.Close() }()
+	client := tls.Client(l, &tls.Config{ServerName: "example.test", NextProtos: protos})
+	go func() { _ = client.Handshake() }() // Only the ClientHello is consumed.
 	var h [5]byte
 	_, e := io.ReadFull(r, h[:])
 	require.NoError(t, e)
@@ -64,7 +65,7 @@ func TestTCPByteReplay(t *testing.T) {
 	require.NoError(t, e)
 	p, e := NewTCPWithALPN(raw, alpn)
 	require.NoError(t, e)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	for _, protos := range [][]string{nil, {meshwire.ALPN}, {"h2", alpn}, {alpn}} {
 		b := fragmentedClientHello(t, protos)
 		c, e := net.Dial("tcp4", raw.Addr().String())
@@ -82,24 +83,24 @@ func TestTCPByteReplay(t *testing.T) {
 		require.Equal(t, c.LocalAddr().String(), peer.RemoteAddr().String())
 		require.Equal(t, c.RemoteAddr().String(), peer.LocalAddr().String())
 		got := make([]byte, len(b))
-		peer.SetReadDeadline(time.Now().Add(time.Second))
+		require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
 		_, e = io.ReadFull(peer, got)
 		require.NoError(t, e)
 		require.Equal(t, b, got)
-		peer.Close()
-		c.Close()
+		_ = peer.Close()
+		_ = c.Close()
 	}
 	for _, b := range [][]byte{{}, []byte("GET /plain HTTP/1.0\r\n\r\n"), {22, 255, 255, 0, 1, 0xff}, {22, 3}, {22, 3, 1, 0, 4, 42}} {
 		c, e := net.Dial("tcp4", raw.Addr().String())
 		require.NoError(t, e)
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 
 		_, e = c.Write(b)
 		require.NoError(t, e)
 		require.NoError(t, c.(*net.TCPConn).CloseWrite())
 		peer, e := p.Other().Accept()
 		require.NoError(t, e)
-		defer peer.Close()
+		defer func() { _ = peer.Close() }()
 		got := make([]byte, len(b))
 		_, e = io.ReadFull(peer, got)
 		require.NoError(t, e)
@@ -136,17 +137,17 @@ func TestUDPInitialExpiryAndRetransmission(t *testing.T) {
 	packets := captureInitialFlight(t, []string{meshwire.ALPN})
 	raw, src := listenUDP(t), listenUDP(t)
 	p := NewUDP(raw)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	send := func(b []byte) { _, err := src.WriteTo(b, raw.LocalAddr()); require.NoError(t, err) }
 	send(packets[0])
 	// Wait until the incomplete flight expires at the classifier.
-	p.Mesh().SetReadDeadline(time.Now().Add(classifyTimeout + 100*time.Millisecond))
+	require.NoError(t, p.Mesh().SetReadDeadline(time.Now().Add(classifyTimeout+100*time.Millisecond)))
 	_, _, err := p.Mesh().ReadFrom(make([]byte, 2048))
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	for _, pkt := range packets[1:] {
 		send(pkt)
 	}
-	p.Mesh().SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	require.NoError(t, p.Mesh().SetReadDeadline(time.Now().Add(50*time.Millisecond)))
 	_, _, err = p.Mesh().ReadFrom(make([]byte, 2048))
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	// Preserve the complete datagram, including trailing coalesced bytes.
@@ -174,11 +175,11 @@ func (s *blockingSocket) SetWriteDeadline(t time.Time) error { return s.write.Se
 
 func TestUDPBranchDeadlines(t *testing.T) {
 	w, r := net.Pipe()
-	defer r.Close()
-	defer w.Close()
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
 	s := &blockingSocket{PacketConn: listenUDP(t), write: w, started: make(chan struct{}, 1)}
 	p := NewUDP(s)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	write := func(pc net.PacketConn) <-chan error {
 		done := make(chan error, 1)
 		go func() { _, err := pc.WriteTo([]byte{42}, s.LocalAddr()); done <- err }()
@@ -221,7 +222,7 @@ func TestUDPBranchDeadlines(t *testing.T) {
 func TestUDPByteReplay(t *testing.T) {
 	raw, src := listenUDP(t), listenUDP(t)
 	p := NewUDP(raw)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	for _, b := range [][]byte{nil, {0, 1}, {1}, {0xff, 2}, {0x40, 2, 3}, bytes.Repeat([]byte{0x88}, 1300)} {
 		_, e := src.WriteTo(b, raw.LocalAddr())
 		require.NoError(t, e)
@@ -232,7 +233,7 @@ func TestUDPByteReplay(t *testing.T) {
 	}
 	_, e := src.WriteTo([]byte{0}, raw.LocalAddr())
 	require.NoError(t, e)
-	p.Other().SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	require.NoError(t, p.Other().SetReadDeadline(time.Now().Add(50*time.Millisecond)))
 	_, _, e = p.Other().ReadFrom(make([]byte, 100))
 	require.Error(t, e)
 }
@@ -240,7 +241,7 @@ func TestUDPByteReplay(t *testing.T) {
 func TestUDPBranchCloseWithBacklog(t *testing.T) {
 	raw, src := listenUDP(t), listenUDP(t)
 	p := NewUDP(raw)
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 	// Fill the logical queue independently of the kernel receive buffer.
 	for i := range 256 {
 		p.other.deliver(datagram{data: []byte{'x', byte(i)}, from: src.LocalAddr()})
@@ -269,10 +270,12 @@ func captureInitialFlight(t *testing.T, protos []string) [][]byte {
 	t.Helper()
 	server, client := listenUDP(t), listenUDP(t)
 	tr := &quic.Transport{Conn: client}
-	defer tr.Close()
+	defer func() { _ = tr.Close() }()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	go tr.Dial(ctx, server.LocalAddr(), &tls.Config{ServerName: "test.example", NextProtos: protos, MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768}}, &quic.Config{InitialPacketSize: 1200, Versions: []quic.Version{quic.Version1}})
+	tlsCfg := &tls.Config{ServerName: "test.example", NextProtos: protos, MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768}}
+	quicCfg := &quic.Config{InitialPacketSize: 1200, Versions: []quic.Version{quic.Version1}}
+	go func() { _, _ = tr.Dial(ctx, server.LocalAddr(), tlsCfg, quicCfg) }() // Only the Initial flight is consumed.
 	var ds [][]byte
 	present := make([]bool, helloLimit)
 	first := make([]byte, 4)
@@ -313,7 +316,7 @@ func TestUDPReorderedInitialReplay(t *testing.T) {
 			slices.Reverse(flight)
 			raw, source := listenUDP(t), listenUDP(t)
 			u := NewUDP(raw)
-			defer u.Close()
+			defer func() { _ = u.Close() }()
 			target := u.Other()
 			if tt.name == "mesh" {
 				target = u.Mesh()
@@ -321,7 +324,7 @@ func TestUDPReorderedInitialReplay(t *testing.T) {
 			_, e := source.WriteTo(flight[0], raw.LocalAddr())
 			require.NoError(t, e)
 			for _, p := range []net.PacketConn{u.Mesh(), u.Other()} {
-				p.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+				require.NoError(t, p.SetReadDeadline(time.Now().Add(30*time.Millisecond)))
 				_, _, e = p.ReadFrom(make([]byte, 2048))
 				require.Error(t, e)
 			}

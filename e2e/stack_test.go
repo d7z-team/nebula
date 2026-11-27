@@ -64,7 +64,7 @@ func tcpPair(t *testing.T, client, server *stack.Stack, destination string, prot
 	t.Helper()
 	l, err := gonet.ListenTCP(server, tcpip.FullAddress{Addr: addr(destination)}, proto)
 	require.NoError(t, err)
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
 	c, err := gonet.DialContextTCP(ctx, client, tcpip.FullAddress{Addr: addr(destination), Port: uint16(l.Addr().(*net.TCPAddr).Port)}, proto)

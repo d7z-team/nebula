@@ -74,7 +74,7 @@ func NodeOptions(hosts ...Host) ([]nebula.Options, error) {
 		}
 		o.Topology = nebula.Topology{Network: "demo", Members: make([]nebula.Member, len(hosts))}
 		for j, h := range hosts {
-			o.Topology.Members[j] = h.Member.Clone()
+			o.Topology.Members[j] = h.Clone()
 		}
 	}
 	return options, nil
@@ -97,7 +97,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 	defer func() {
 		if err != nil {
 			for _, owner := range owners {
-				owner.Close()
+				_ = owner.Close()
 			}
 		}
 	}()

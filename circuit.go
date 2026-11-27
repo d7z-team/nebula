@@ -119,8 +119,8 @@ func (l *circuitLease) close() {
 	n.mu.Unlock()
 	for _, c := range ends {
 		// A yamux stream may keep reading after a local FIN.
-		c.SetDeadline(time.Now())
-		c.Close()
+		_ = c.SetDeadline(time.Now())
+		_ = c.Close()
 	}
 
 	n.mu.Lock()
@@ -203,12 +203,15 @@ func (l *circuitLease) openNextLeg(ctx context.Context, next PeerID) (net.Conn, 
 		return nil, err
 	}
 	deadline, _ := ctx.Deadline() // Both callers budget for the remaining hops.
-	c.SetDeadline(deadline)
+	if err := c.SetDeadline(deadline); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	// Own the stream before requesting the route so withdrawal interrupts the ready wait.
 	n.mu.Lock()
 	if !l.allowedLocked() {
 		n.mu.Unlock()
-		c.Close()
+		_ = c.Close()
 		return nil, ErrPathPolicy
 	}
 	l.ends = append(l.ends, c)
@@ -276,9 +279,10 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 		// The upstream ready reply waits for all remaining cold legs.
 		ctx, cancel := context.WithTimeout(l.ctx, n.o.DialTimeout*time.Duration(len(req.Path)-pos))
 		deadline, _ := ctx.Deadline()
-		c.SetDeadline(deadline)
-		var err error
-		next, err = l.openNextLeg(ctx, req.Path[pos+1])
+		err := c.SetDeadline(deadline)
+		if err == nil {
+			next, err = l.openNextLeg(ctx, req.Path[pos+1])
+		}
 		cancel()
 		if err != nil {
 			l.close()
@@ -290,11 +294,13 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 		return true
 	}
 	if !l.transit {
-		l.attachEndpoint(l.ctx, c, false)
+		_ = l.attachEndpoint(l.ctx, c, false)
 		return true
 	}
-	c.SetDeadline(time.Time{})
-	next.SetDeadline(time.Time{})
+	if c.SetDeadline(time.Time{}) != nil || next.SetDeadline(time.Time{}) != nil {
+		l.close()
+		return true
+	}
 	// The lease owns both streams. Release the incoming request slot once ready.
 	n.wg.Go(func() { l.forward(next, c, relayDirection{s.peer, req.Path[pos+1]}) })
 	n.wg.Go(func() { l.forward(c, next, relayDirection{req.Path[pos+1], s.peer}) })

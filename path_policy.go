@@ -101,8 +101,8 @@ func (n *Node) PeerPathPolicy(peer PeerID) (configured, effective PathMode) {
 
 func (n *Node) enforcePathPolicy() {
 	n.prunePaths()
-	// Wait for physical writes admitted under the previous policy.
 	n.udpWrites.Lock()
+	//nolint:staticcheck // This barrier waits for UDP writes admitted under the previous policy.
 	n.udpWrites.Unlock()
 }
 

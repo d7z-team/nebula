@@ -45,7 +45,7 @@ func run() error {
 		return err
 	}
 	for _, n := range nodes {
-		defer n.Close()
+		defer func() { _ = n.Close() }()
 	}
 	service := tcpip.FullAddress{Addr: tcpip.AddrFromSlice(vip.AsSlice()), Port: 8080}
 	local := tcpip.AddrFromSlice(client.IPv4.AsSlice())
@@ -95,7 +95,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			defer listener.Close()
+			defer func() { _ = listener.Close() }()
 			stop := context.AfterFunc(ctx, listener.Shutdown)
 			defer stop()
 			services = append(services, listener)
@@ -113,19 +113,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer old.Close()
+	defer func() { _ = old.Close() }()
 	first, err := services[0].Accept()
 	if err != nil {
 		return err
 	}
-	defer first.Close()
+	defer func() { _ = first.Close() }()
 	if err := exchange(old, first, 'A'); err != nil {
 		return err
 	}
-	services[0].Close()
+	if err := services[0].Close(); err != nil {
+		return err
+	}
 	probe, err := dial(41002, nodes[1].ID())
 	if err == nil {
-		probe.Close()
+		_ = probe.Close()
 		return fmt.Errorf("draining instance accepted a new connection")
 	}
 	var dialErr *net.OpError
@@ -136,12 +138,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer fresh.Close()
+	defer func() { _ = fresh.Close() }()
 	second, err := services[1].Accept()
 	if err != nil {
 		return err
 	}
-	defer second.Close()
+	defer func() { _ = second.Close() }()
 	if err := exchange(fresh, second, 'B'); err != nil {
 		return err
 	}
@@ -156,11 +158,13 @@ func run() error {
 	}
 	// The old binding still names A. Its service socket remains open.
 	if _, err := old.Write([]byte{'x'}); err == nil {
-		first.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if err := first.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			return err
+		}
 		var buf [1]byte
 		_, err := first.Read(buf[:])
 		if err == nil {
-			return fmt.Errorf("A received data after VIP withdrawal")
+			return errors.New("instance A received data after VIP withdrawal")
 		}
 		var timeout net.Error
 		if !errors.As(err, &timeout) || !timeout.Timeout() {
@@ -176,8 +180,12 @@ func run() error {
 
 func exchange(client, server net.Conn, instance byte) error {
 	deadline := time.Now().Add(3 * time.Second)
-	client.SetDeadline(deadline)
-	server.SetDeadline(deadline)
+	if err := client.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if err := server.SetDeadline(deadline); err != nil {
+		return err
+	}
 	if _, err := client.Write([]byte{'?'}); err != nil {
 		return err
 	}

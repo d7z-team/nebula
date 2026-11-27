@@ -200,7 +200,7 @@ func checkDelegatedRanges(child *x509.Certificate, parents []*x509.Certificate, 
 			return err
 		}
 	}
-	if belowCluster && !(v4 && v6) {
+	if belowCluster && (!v4 || !v6) {
 		return errors.New("member issuer requires explicit IPv4 and IPv6 ranges")
 	}
 	return nil

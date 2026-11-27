@@ -133,7 +133,7 @@ func (n *Node) punch(peer PeerID) {
 	}
 	for _, ep := range eps {
 		if transport := n.outboundUDP(ep); transport != nil {
-			transport.WriteTo([]byte{0}, net.UDPAddrFromAddrPort(ep.Address))
+			_, _ = transport.WriteTo([]byte{0}, net.UDPAddrFromAddrPort(ep.Address))
 		}
 	}
 }

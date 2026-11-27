@@ -153,9 +153,9 @@ func (s *session) close() {
 		s.cancel()
 	}
 	if s.q != nil {
-		s.q.CloseWithError(0, "session closed")
+		_ = s.q.CloseWithError(0, "session closed")
 	} else {
-		s.mux.Close()
+		_ = s.mux.Close()
 	}
 	if s.lease != nil {
 		s.lease.close()
@@ -165,7 +165,7 @@ func (s *session) close() {
 func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, outgoing bool, snapshot *credentials) (*session, error) {
 	st := q.ConnectionState()
 	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
-		q.CloseWithError(1, "datagrams required")
+		_ = q.CloseWithError(1, "datagrams required")
 		return nil, ErrPathPolicy
 	}
 	s := &session{n: n, q: q, kind: "udp", endpoint: addrPort(q.RemoteAddr()), state: st.TLS, outgoing: outgoing, peer: peer}
@@ -181,11 +181,12 @@ func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, out
 	if err == nil {
 		c := &qStream{Stream: stream, q: q}
 		deadline, _ := ctx.Deadline()
-		c.SetDeadline(deadline)
-		stop := context.AfterFunc(ctx, func() { c.Close() })
-		err = s.exchangeGrants(ctx, c, snapshot)
+		stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+		if err = c.SetDeadline(deadline); err == nil {
+			err = s.exchangeGrants(ctx, c, snapshot)
+		}
 		stop()
-		c.Close()
+		_ = c.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			err = ctxErr
 		}
@@ -208,8 +209,11 @@ func (n *Node) exchangeDeadline(ctx context.Context) time.Time {
 }
 
 func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []PeerID, out bool, lease *circuitLease) (*session, error) {
-	raw.SetDeadline(n.exchangeDeadline(ctx))
-	stop := context.AfterFunc(ctx, func() { raw.Close() })
+	if err := raw.SetDeadline(n.exchangeDeadline(ctx)); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
 	defer stop()
 	snapshot := n.cred.Load()
 	cfg := n.tlsConfig(peer, out, snapshot)
@@ -220,17 +224,19 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 		t = tls.Server(raw, cfg)
 	}
 	if err := t.HandshakeContext(ctx); err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	s := &session{n: n, kind: "tcp", state: t.ConnectionState(), endpoint: addrPort(raw.RemoteAddr()), path: path, peer: peer, outgoing: out, lease: lease}
 	s.localEndpoint = addrPort(raw.LocalAddr())
 	err := s.exchangeGrants(ctx, t, snapshot)
+	if err == nil {
+		err = raw.SetDeadline(time.Time{})
+	}
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, err
 	}
-	raw.SetDeadline(time.Time{})
 	cfgMux := yamux.DefaultConfig()
 	cfgMux.LogOutput = io.Discard
 	cfgMux.EnableKeepAlive = false
@@ -249,7 +255,7 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 		s.mux, err = yamux.Server(t, cfgMux)
 	}
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	if len(path) > 0 {
@@ -397,7 +403,7 @@ func (n *Node) serveSession(s *session) {
 			return
 		}
 		if !n.tryTask(slots, func() { n.handleStream(s, c) }) {
-			c.Close()
+			_ = c.Close()
 		}
 	}
 }
@@ -433,7 +439,7 @@ func (s *session) request(ctx context.Context, op byte, body []byte, limit int) 
 	if err != nil {
 		return nil, err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	return readFrame(c, limit)
 }
 
@@ -442,15 +448,16 @@ func (s *session) openRequest(ctx context.Context, op byte, body []byte) (net.Co
 	if err != nil {
 		return nil, err
 	}
-	c.SetDeadline(s.n.exchangeDeadline(ctx))
 	// Opening a stream may block while a policy update withdraws the session.
 	if !s.n.usable(s) {
 		err = ErrPathPolicy
-	} else if _, err = c.Write([]byte{op}); err == nil {
-		err = writeFrame(c, body)
+	} else if err = c.SetDeadline(s.n.exchangeDeadline(ctx)); err == nil {
+		if _, err = c.Write([]byte{op}); err == nil {
+			err = writeFrame(c, body)
+		}
 	}
 	if err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, err
 	}
 	return c, nil
@@ -460,11 +467,13 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 	owned := true
 	defer func() {
 		if owned {
-			c.Close()
+			_ = c.Close()
 		}
 	}()
 	deadline := time.Now().Add(n.o.DialTimeout)
-	c.SetDeadline(deadline)
+	if err := c.SetDeadline(deadline); err != nil {
+		return
+	}
 	var op [1]byte
 	if _, err := io.ReadFull(c, op[:]); err != nil {
 		return
@@ -473,7 +482,9 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 		return
 	}
 	if op[0] == opIP {
-		c.SetDeadline(time.Time{})
+		if err := c.SetDeadline(time.Time{}); err != nil {
+			return
+		}
 		for {
 			b, err := readFrame(c, n.o.MaxIPSize)
 			if err != nil {
@@ -507,17 +518,17 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 		reply, _ := n.advert(s)
 		out, _ := json.Marshal(reply)
 		if n.usable(s) {
-			writeFrame(c, out)
+			_ = writeFrame(c, out)
 		}
 	case opPing:
 		if len(b) <= 32 {
-			writeFrame(c, b)
+			_ = writeFrame(c, b)
 		}
 	case opLookup:
 		n.handleLookup(s, c, b)
 	case opPushPublication:
 		if _, err := n.acceptPublication(s.ctx, s, b, ""); err == nil {
-			writeFrame(c, nil)
+			_ = writeFrame(c, nil)
 		}
 	case opGetPublication:
 		id := string(b)
@@ -528,7 +539,7 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 			ctx, cancel := context.WithDeadline(s.ctx, earlierDeadline(pub.expires, deadline))
 			defer cancel()
 			if n.pacePublication(ctx, s, id, pub.record) {
-				writeFrame(c, pub.record)
+				_ = writeFrame(c, pub.record)
 			}
 		}
 	case opCircuit:

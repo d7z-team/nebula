@@ -15,6 +15,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type deadlineFailConn struct {
+	net.Conn
+	onClear bool
+}
+
+func (c deadlineFailConn) SetDeadline(t time.Time) error {
+	if t.IsZero() == c.onClear {
+		return errors.ErrUnsupported
+	}
+	return c.Conn.SetDeadline(t)
+}
+
+func TestConnectEndpointRequiresTCPDeadlines(t *testing.T) {
+	for name, onClear := range map[string]bool{"set": false, "clear": true} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, "", "tcp")
+			f.opts[0].Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+				c, err := (&net.Dialer{}).DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				return deadlineFailConn{c, onClear}, nil
+			}
+			f.start()
+			n := f.nodes[0]
+			_, err := n.ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+			require.ErrorIs(t, err, errors.ErrUnsupported)
+			require.Empty(t, n.Paths())
+		})
+	}
+}
+
 func TestConnectPeerAfterSuccessfulPathIsWithdrawn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newFixture(t, "", "")
@@ -401,7 +433,7 @@ func TestConfiguredPhysicalEndpoints(t *testing.T) {
 			opts.Transport.AdvertiseEndpoints = []Endpoint{ep}
 			n, advertiseErr := New(t.Context(), opts)
 			if n != nil {
-				t.Cleanup(func() { n.Close() })
+				t.Cleanup(func() { _ = n.Close() })
 			}
 			cfg := f.cfg
 			cfg.Members = slices.Clone(cfg.Members)

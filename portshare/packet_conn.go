@@ -113,7 +113,7 @@ func (c *packetConn) shutdown(err error) {
 		p.writeMu.Lock()
 		defer p.writeMu.Unlock()
 		if p.writer == c {
-			p.raw.SetWriteDeadline(time.Now())
+			_ = p.raw.SetWriteDeadline(time.Now())
 		}
 	})
 }

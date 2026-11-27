@@ -211,7 +211,7 @@ func (n *Node) acceptPublication(ctx context.Context, from *session, record stat
 			ctx, cancel := context.WithDeadline(s.ctx, until)
 			defer cancel()
 			if n.pacePublication(ctx, s, id, record) {
-				s.request(ctx, opPushPublication, record, 0)
+				_, _ = s.request(ctx, opPushPublication, record, 0)
 			}
 		})
 	}
@@ -273,7 +273,7 @@ func (n *Node) fetchMissingPublications(s *session, ids []string) {
 			n.tryTask(n.backgroundSlots, func() {
 				record, err := s.request(s.ctx, opGetPublication, []byte(id), pki.MaxDocument)
 				if err == nil {
-					n.acceptPublication(s.ctx, s, record, id)
+					_, _ = n.acceptPublication(s.ctx, s, record, id)
 				}
 			})
 		}

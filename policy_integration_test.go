@@ -253,7 +253,7 @@ func TestChainDeadlineAndTopologyAdmission(t *testing.T) {
 		n, err := New(t.Context(), o)
 		require.NoError(t, err)
 		f.nodes = append(f.nodes, n)
-		t.Cleanup(func() { n.Close() })
+		t.Cleanup(func() { _ = n.Close() })
 		status := n.ControlStatus()
 		require.True(t, status.Ready)
 		require.False(t, status.Started)
@@ -301,7 +301,7 @@ func TestRestrictedEndpointUpdates(t *testing.T) {
 	o.Topology = f.cfg
 	n, err := New(t.Context(), o)
 	require.NoError(t, err)
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 
 	m := &f.cfg.Members[1]
 	// A TCP client can use any source port on its configured host.
@@ -428,7 +428,7 @@ func TestGatewaySessionCertificateCeiling(t *testing.T) {
 	// Use the authenticated stream directly to independently exercise ingress authorization.
 	stream, err := a.preferredSession(id, false).open(t.Context())
 	require.NoError(t, err)
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	_, err = stream.Write([]byte{opIP})
 	require.NoError(t, err)
 	require.NoError(t, writeFrame(stream, denied))

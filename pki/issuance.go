@@ -226,7 +226,7 @@ func (ca Issuer) IssueGrant(csr *x509.CertificateRequest, e Enrollment) (*x509.C
 	if err := cluster.validateIdentity(Identity{Addresses: Addresses{e.IPv4, e.IPv6}, Scope: e.Scope}); err != nil {
 		return nil, err
 	}
-	ext, err := e.Scope.extension()
+	ext, err := e.extension()
 	if err != nil {
 		return nil, err
 	}

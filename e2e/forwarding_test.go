@@ -104,10 +104,10 @@ func TestNodeGVisorForwardingAndDetach(t *testing.T) {
 		// Also originate a new flow on the independent downstream host.
 		server, err := gonet.DialUDP(a, &tcpip.FullAddress{Addr: addr(tc.client), Port: 7010}, nil, tc.proto)
 		require.NoError(t, err)
-		defer server.Close()
+		defer func() { _ = server.Close() }()
 		downstream, err := gonet.DialUDP(h, nil, &tcpip.FullAddress{Addr: addr(tc.client), Port: 7010}, tc.proto)
 		require.NoError(t, err)
-		defer downstream.Close()
+		defer func() { _ = downstream.Close() }()
 		deadline := time.Now().Add(3 * time.Second)
 		require.NoError(t, server.SetDeadline(deadline))
 		require.NoError(t, downstream.SetDeadline(deadline))

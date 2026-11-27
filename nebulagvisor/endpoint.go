@@ -136,6 +136,6 @@ func (e *Endpoint) Stats() nebula.PortStats { return e.port.Stats() }
 
 func (e *Endpoint) Close() {
 	e.port.Close()
-	e.networkLink.Attach(nil)
+	e.Attach(nil)
 	e.networkLink.Close()
 }

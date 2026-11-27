@@ -39,7 +39,7 @@ func run() error {
 		return err
 	}
 	for _, node := range nodes {
-		defer node.Close()
+		defer func() { _ = node.Close() }()
 	}
 	if err := nodes[0].SetPeerPathPolicy(circuit[2], nebula.RelayOnly); err != nil {
 		return err

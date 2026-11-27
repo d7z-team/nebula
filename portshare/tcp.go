@@ -65,7 +65,7 @@ func newTCP(l net.Listener, alpn string) *TCP {
 					t.dispatch(c)
 				})
 			default:
-				c.Close()
+				_ = c.Close()
 			}
 		}
 	})
@@ -83,8 +83,8 @@ func (t *TCP) Close() error {
 	t.once.Do(func() {
 		close(t.done)
 		t.err = t.raw.Close()
-		t.mesh.Close()
-		t.other.Close()
+		t.mesh.shutdown(net.ErrClosed)
+		t.other.shutdown(net.ErrClosed)
 		t.workers.Wait()
 	})
 	return t.err
@@ -117,7 +117,7 @@ func (t *TCP) dispatch(c net.Conn) {
 	timer := time.NewTimer(classifyTimeout)
 	defer timer.Stop()
 	if err := c.SetReadDeadline(time.Now().Add(classifyTimeout)); err != nil {
-		c.Close()
+		_ = c.Close()
 		return
 	}
 	r := bufio.NewReader(c)
@@ -131,7 +131,7 @@ func (t *TCP) dispatch(c net.Conn) {
 			if err == io.EOF {
 				break
 			}
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		if first[0] != 22 {
@@ -143,7 +143,7 @@ func (t *TCP) dispatch(c net.Conn) {
 			if err == io.ErrUnexpectedEOF {
 				break
 			}
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		length := int(binary.BigEndian.Uint16(header[3:]))
@@ -151,7 +151,7 @@ func (t *TCP) dispatch(c net.Conn) {
 			break
 		}
 		if original.Len()+length > helloLimit+4096 {
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		start := len(hello)
@@ -161,7 +161,7 @@ func (t *TCP) dispatch(c net.Conn) {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		if len(hello) == 0 {
@@ -175,7 +175,7 @@ func (t *TCP) dispatch(c net.Conn) {
 		}
 		size := helloSize(hello)
 		if size > helloLimit {
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		if len(hello) >= size {
@@ -186,14 +186,14 @@ func (t *TCP) dispatch(c net.Conn) {
 		}
 	}
 	if err := c.SetReadDeadline(time.Time{}); err != nil {
-		c.Close()
+		_ = c.Close()
 		return
 	}
 	select {
 	case branch.in <- &replayConn{c, io.MultiReader(&original, r)}:
 	case <-branch.done:
-		c.Close()
+		_ = c.Close()
 	case <-timer.C:
-		c.Close()
+		_ = c.Close()
 	}
 }

@@ -81,7 +81,7 @@ opts.Transport.CurvePreferences = []tls.CurveID{tls.X25519MLKEM768}
 
 此设置同时用于入站和出站 TCP、QUIC 及中继端到端握手。Go 在双方都支持的组中按内部顺序选择，交集为空时握手失败。中继相邻节点的连接逐跳协商，电路两端单独协商端到端组。用 `node.Paths()` 中各路径的 `TLSGroup` 查看实际结果。[可运行示例](quickstart.md)
 
-`Options.Transport.UDP4`、`UDP6` 用于对应地址族的 QUIC 监听、拨号和打洞。`TCP4`、`TCP6` 接收入站 TCP。只需出站 TCP 时可将传输配置留空，节点使用 `net.Dialer`；自有网络栈可提供 `DialTCP`。UDP 和 TCP 可绑定相同端口号，与网站共用这些端口时，将 `portshare` 的 mesh 分支交给节点。[与网站共享监听端口](portshare.md#接入与关闭)
+`Options.Transport.UDP4`、`UDP6` 用于对应地址族的 QUIC 监听、拨号和打洞。`TCP4`、`TCP6` 接收入站 TCP。只需出站 TCP 时可将传输配置留空，节点使用 `net.Dialer`；自有网络栈可提供 `DialTCP`，返回的连接须支持设置和清除读写截止时间。UDP 和 TCP 可绑定相同端口号，与网站共用这些端口时，将 `portshare` 的 mesh 分支交给节点。[与网站共享监听端口](portshare.md#接入与关闭)
 
 | 已知信息 | 连接方式 |
 | --- | --- |

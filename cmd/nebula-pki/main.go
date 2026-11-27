@@ -33,7 +33,7 @@ func input(path string, in io.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		in = f
 	}
 	b, err := io.ReadAll(io.LimitReader(in, (4<<20)+1))
@@ -55,7 +55,7 @@ func save(path string, b []byte, out io.Writer) error {
 	_, err = f.Write(b)
 	err = errors.Join(err, f.Close())
 	if err != nil {
-		os.Remove(path)
+		return errors.Join(err, os.Remove(path))
 	}
 	return err
 }

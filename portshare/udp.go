@@ -116,8 +116,8 @@ func (p *UDP) Other() net.PacketConn { return p.other }
 // Close closes the physical socket and releases both branches.
 func (p *UDP) Close() error {
 	p.once.Do(func() {
-		p.mesh.Close()
-		p.other.Close()
+		p.mesh.shutdown(net.ErrClosed)
+		p.other.shutdown(net.ErrClosed)
 		p.err = p.raw.Close()
 		<-p.stopped
 	})

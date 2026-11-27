@@ -144,7 +144,7 @@ func TestNATCalibration(t *testing.T) {
 			socket := func(s *stack.Stack, ip string, port uint16) *gonet.UDPConn {
 				conn, err := gonet.DialUDP(s, &tcpip.FullAddress{Addr: addr(ip), Port: port}, nil, ipv4.ProtocolNumber)
 				require.NoError(t, err)
-				t.Cleanup(func() { conn.Close() })
+				t.Cleanup(func() { _ = conn.Close() })
 				return conn
 			}
 			host := func(seg, ip, via string) *stack.Stack {

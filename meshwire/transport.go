@@ -41,6 +41,7 @@ func AcceptTCP(l net.Listener, done <-chan struct{}) (net.Conn, error) {
 			return conn, nil
 		}
 		netErr, ok := errors.AsType[net.Error](err)
+		//nolint:staticcheck // Like net/http, honor listeners that mark an Accept error as retryable.
 		if !ok || (!netErr.Timeout() && !netErr.Temporary()) {
 			return nil, err
 		}

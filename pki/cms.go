@@ -149,15 +149,19 @@ func (a cmsAlgorithm) digestID() algorithm {
 	return algorithm{Algorithm: asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}}
 }
 
-func (a cmsAlgorithm) attributes(payload []byte) ([]byte, asn1.RawValue) {
+func (a cmsAlgorithm) attributes(payload []byte) (signed, tagged []byte, err error) {
 	h := a.digest.New()
 	h.Write(payload)
 	d, _ := asn1.Marshal(h.Sum(nil))
 	ct, _ := asn1.Marshal(oidData)
-	set, _ := asn1.MarshalWithParams([]attribute{{oidContentType, []asn1.RawValue{raw(ct)}}, {oidMessageDigest, []asn1.RawValue{raw(d)}}}, "set")
-	var v asn1.RawValue
-	asn1.Unmarshal(set, &v)
-	return set, explicit(v.Bytes)
+	signed, err = asn1.MarshalWithParams([]attribute{{oidContentType, []asn1.RawValue{raw(ct)}}, {oidMessageDigest, []asn1.RawValue{raw(d)}}}, "set")
+	if err != nil {
+		return nil, nil, err
+	}
+	// RFC 5652 section 5.4 signs the DER SET OF and carries it with an implicit [0] tag.
+	tagged = bytes.Clone(signed)
+	tagged[0] = 0xa0
+	return signed, tagged, nil
 }
 
 type signedContent struct {
@@ -217,7 +221,10 @@ func encodeObject(network, kind string, body []byte, cert tls.Certificate, sign 
 	if err != nil {
 		return nil, err
 	}
-	attrs, tag := a.attributes(payload)
+	attrs, tagged, err := a.attributes(payload)
+	if err != nil {
+		return nil, err
+	}
 	var sig []byte
 	if sign {
 		sig, err = crypto.SignMessage(cert.PrivateKey.(crypto.Signer), rand.Reader, attrs, a.prehash)
@@ -243,7 +250,7 @@ func encodeObject(network, kind string, body []byte, cert tls.Certificate, sign 
 	if a.signature == x509.SHA256WithRSA {
 		sigAlg.Parameters = asn1.NullRawValue
 	}
-	si := signerInfo{1, issuerSerial{raw(leaf.RawIssuer), leaf.SerialNumber}, a.digestID(), tag, sigAlg, sig}
+	si := signerInfo{1, issuerSerial{raw(leaf.RawIssuer), leaf.SerialNumber}, a.digestID(), raw(tagged), sigAlg, sig}
 	sd := signedData{Version: 1, Digests: []algorithm{a.digestID()}, Content: contentInfo{oidData, explicit(octets)}, Certificates: certs, Signers: []signerInfo{si}}
 	return wrapCMS(sd)
 }
@@ -295,8 +302,10 @@ func VerifyObjectSignature(der []byte, network, kind string) ([]byte, []*x509.Ce
 	if err != nil {
 		return nil, nil, err
 	}
-	attrs, tag := a.attributes(payload)
-	expected, _ := asn1.Marshal(tag)
+	attrs, tagged, err := a.attributes(payload)
+	if err != nil {
+		return nil, nil, err
+	}
 	digest := a.digestID().Algorithm
 	if !validAlg(si.Digest, digest) || !validAlg(s.Digests[0], digest) {
 		return nil, nil, errors.New("invalid CMS digest")
@@ -306,7 +315,7 @@ func VerifyObjectSignature(der []byte, network, kind string) ([]byte, []*x509.Ce
 	if !si.Algorithm.Algorithm.Equal(a.oid) || len(params) != 0 && !nullRSA {
 		return nil, nil, errors.New("invalid CMS signature algorithm")
 	}
-	if !bytes.Equal(si.Attrs.FullBytes, expected) {
+	if !bytes.Equal(si.Attrs.FullBytes, tagged) {
 		return nil, nil, errors.New("invalid signed attributes")
 	}
 	if err := leaf.CheckSignature(a.signature, attrs, si.Signature); err != nil {

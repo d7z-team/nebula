@@ -190,9 +190,11 @@ func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 		if err != nil {
 			return err
 		}
-		c.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout))
-		if _, err = c.Write([]byte{opIP}); err != nil {
-			c.Close()
+		if err = c.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout)); err == nil {
+			_, err = c.Write([]byte{opIP})
+		}
+		if err != nil {
+			_ = c.Close()
 			return err
 		}
 		s.data = c
@@ -200,13 +202,15 @@ func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 	if err := s.checkIPSubmission(ctx, packet); err != nil {
 		return err
 	}
-	s.data.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout))
-	if err := writeFrame(s.data, packet.data); err != nil {
-		s.data.Close()
-		s.data = nil
-		return err
+	err := s.data.SetWriteDeadline(time.Now().Add(s.n.o.DialTimeout))
+	if err == nil {
+		err = writeFrame(s.data, packet.data)
 	}
-	return nil
+	if err != nil {
+		_ = s.data.Close()
+		s.data = nil
+	}
+	return err
 }
 
 func (p *IPPort) revalidateQueues(expiredPeers map[PeerID]bool) {
