@@ -486,28 +486,6 @@ func TestRelayOnlyEnforcesUnderlayPolicy(t *testing.T) {
 	require.Zero(t, f.sockets[0].count(f.cfg.Members[1].Endpoints[0].Address))
 }
 
-func TestHealthSwitchesTransportAndRecovers(t *testing.T) {
-	f := newFixture(t, "both", "both")
-	f.start()
-	a, b := f.nodes[0], f.nodes[1]
-	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
-	active := func() string {
-		for _, p := range a.Paths() {
-			if p.Peer == b.id && p.Active {
-				return p.Transport
-			}
-		}
-		return ""
-	}
-	require.Equal(t, "udp", active())
-	f.sockets[0].drop.Store(true)
-	f.sockets[1].drop.Store(true)
-	require.Eventually(t, func() bool { return active() == "tcp" }, 6*time.Second, 20*time.Millisecond)
-	f.sockets[0].drop.Store(false)
-	f.sockets[1].drop.Store(false)
-	require.Eventually(t, func() bool { return active() == "udp" }, 12*time.Second, 20*time.Millisecond)
-}
-
 func TestParallelCircuitFailover(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp", "tcp")
 	for _, i := range []int{1, 2} {

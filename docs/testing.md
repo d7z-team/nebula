@@ -21,6 +21,7 @@ quic-go 的 `failed to sufficiently increase receive buffer size` 表示物理�
 | 现象 | 从哪里开始 |
 | --- | --- |
 | 有端点但连不上 | 用 `TestTCPFallbackOnInitialDial` 检查 UDP 黑洞后的 TCP 回退，用 `TestOutboundEndpointPolicyWithRelay` 核对出站策略和中继路径。[传输回退](../mesh_test.go) · [端点拨号](../dial_test.go) |
+| 已建连接在 UDP 中断或恢复时断流 | `TestHealthSwitchesTransportAndRecovers` 在同一条业务 TCP 连接上核对三次回执，覆盖 UDP 直连、双向 UDP 中断后的 TCP 回退，以及 UDP 恢复且延迟更低时的回切。[传输切换](../e2e/chaos_test.go) |
 | 共享端口集中接入时拒连或丢包 | `TestSharedListenersInboundHandshakes` 检查 TCP 与 QUIC 共用名额时的拒绝计数和后续重连。`TestUDPBranchCloseWithBacklog` 检查分支满时的报文保留顺序、关闭时释放积压，以及另一分支的收发。[节点接入](../portshare_test.go) · [分支收发](../portshare/raw_test.go) |
 | 大量邻居探活滞后或 TCP 路径翻倍 | `TestMaintenanceProbesWholeHub` 验证四个探活名额在同一轮持续处理邻居。`TestInboundTCPCanaryAndExplicitDial` 核对唯一 TCP 候选的后台探测和显式拨号。[邻接测试](../interconnect_test.go) |
 | 调长探活间隔后发现记录过期、断线或误摘路径 | `TestSlowProbeRenewsIntroductionAndReconnects` 检查签名介绍提前续期和常驻邻居重连。`TestProbeFailureThresholdAfterRecovery` 在 QUIC 上先恢复短暂丢包，再验证连续失败达到阈值时摘除路径。[探活测试](../interconnect_test.go) |

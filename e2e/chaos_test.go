@@ -113,6 +113,35 @@ func TestLossAndNarrowPath(t *testing.T) {
 	require.Positive(t, delayed.Load())
 }
 
+// A recovered UDP path must earn preference over a working TCP fallback.
+func slowerTCP(d datagram) disturbance {
+	if d.protocol == 6 {
+		return disturbance{delay: 50 * time.Millisecond}
+	}
+	return disturbance{}
+}
+
+func TestHealthSwitchesTransportAndRecovers(t *testing.T) {
+	l := newLab(t)
+	a := l.host("wan", "192.0.2.1", "", "both", true)
+	b := l.host("wan", "192.0.2.2", "", "both", true)
+	l.net.disturb(slowerTCP)
+	l.start()
+	l.connect(a, b, "udp")
+	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
+	receipt(t, c, d, 0)
+
+	l.net.disturb(func(d datagram) disturbance { return disturbance{drop: d.protocol == 17} })
+	waitPath(t, a, b, "tcp")
+	receipt(t, c, d, 1)
+	l.net.disturb(slowerTCP)
+	waitPath(t, a, b, "udp")
+	receipt(t, c, d, 2)
+	require.True(t, slices.ContainsFunc(a.node.Paths(), func(p nebula.PathStatus) bool {
+		return p.Peer == b.node.ID() && p.Transport == "tcp" && p.Failures == 0
+	}), "TCP fallback should still be healthy after UDP becomes preferred")
+}
+
 func TestChaosFailoverAndRenewal(t *testing.T) {
 	extended(t)
 	l := newLab(t)
@@ -141,7 +170,7 @@ func TestChaosFailoverAndRenewal(t *testing.T) {
 	require.Equal(t, fresh.Node.Leaf.SerialNumber.String(), path.NodeSerial)
 	require.Positive(t, lost.Load())
 	receipt(t, c, d, 2)
-	l.net.disturb(nil)
+	l.net.disturb(slowerTCP)
 	waitPath(t, a, b, "udp")
 	receipt(t, c, d, 3)
 }
@@ -426,7 +455,10 @@ func TestChaosHiddenTransit(t *testing.T) {
 	l.connect(b, right, "udp")
 	l.connect(h, left, "udp")
 	l.connect(h, right, "udp")
+	// H dials out. Each relay must register its inbound leg before it can forward to H.
+	require.Equal(t, mapped, waitPath(t, left, h, "udp").Endpoint)
 	require.Equal(t, mapped, waitPath(t, right, h, "udp").Endpoint)
+	waitPath(t, right, b, "udp")
 
 	circuit := []nebula.PeerID{a.node.ID(), left.node.ID(), h.node.ID(), right.node.ID(), b.node.ID()}
 	path := l.connect(a, b, "relay")
@@ -693,7 +725,7 @@ func TestSeededChaos(t *testing.T) {
 		if action == 0 || action == 4 {
 			require.Positive(t, affected.Load())
 		}
-		l.net.disturb(nil)
+		l.net.disturb(slowerTCP)
 		waitPath(t, a, b, "udp")
 	}
 }
