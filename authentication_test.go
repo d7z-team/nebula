@@ -3,7 +3,6 @@ package nebula
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -146,19 +145,6 @@ func TestRevalidateDuringGrantWrite(t *testing.T) {
 	})
 }
 
-// pausingSigner lets a real TLS handshake select its certificate before renewal.
-type pausingSigner struct {
-	crypto.Signer
-	entered chan struct{}
-	resume  chan struct{}
-	once    sync.Once
-}
-
-func (s *pausingSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	s.once.Do(func() { close(s.entered); <-s.resume })
-	return s.Signer.Sign(r, digest, opts)
-}
-
 func TestReloadDuringTLSHandshake(t *testing.T) {
 	for _, kind := range []string{"udp", "tcp", "relay"} {
 		t.Run(kind, func(t *testing.T) {
@@ -167,18 +153,29 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 				f = newFixture(t, "tcp", "tcp", "tcp")
 				f.link(0, 1)
 				f.link(1, 2)
-				m := f.cfg.Members[1]
-				m.Transit = true
-				f.cfg.Members[1] = m
+				f.cfg.Members[1].Transit = true
 			} else {
 				f = newFixture(t, kind, kind)
 			}
 			last := len(f.opts) - 1
 			addr := f.ips[last]
 			id := f.cfg.Members[last].ID
-			cert := f.opts[last].Auth.Certificates.Node
-			old, err := x509.ParseCertificate(cert.Certificate[0])
-			require.NoError(t, err)
+			old := f.opts[last].Auth.Certificates.Node.Leaf
+			// Pause the dialer after it receives the target's old TLS leaf.
+			// Neighbor introductions use the same signing key as TLS.
+			entered := make(chan struct{})
+			paused, resume := context.WithCancel(t.Context())
+			defer resume()
+			pause := sync.OnceFunc(func() {
+				close(entered)
+				<-paused.Done()
+			})
+			f.opts[0].Auth.CheckChain = func(ctx context.Context, c ChainCheck) (time.Time, error) {
+				if c.Usage == x509.ExtKeyUsageServerAuth && c.Chain[0].Equal(old) {
+					pause()
+				}
+				return time.Time{}, ctx.Err()
+			}
 			var denied atomic.Bool
 			f.opts[last].Auth.CheckChain = func(_ context.Context, c ChainCheck) (time.Time, error) {
 				if denied.Load() && c.Local && c.Chain[0].Equal(old) {
@@ -190,32 +187,19 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 				f.opts[i].MaintenanceInterval = time.Hour
 				f.opts[i].DialTimeout = 4 * time.Second
 			}
-			signer := &pausingSigner{Signer: cert.PrivateKey.(crypto.Signer), entered: make(chan struct{}), resume: make(chan struct{})}
-			release := sync.OnceFunc(func() { close(signer.resume) })
-			// For relay, first establish outer legs with the original credential, so
-			// the paused signature belongs to the end-to-end TLS handshake.
-			if kind != "relay" {
-				cert.PrivateKey = signer
-				f.opts[last].Auth.Certificates.Node = cert
-			}
 			f.start()
 			a, b := f.nodes[0], f.nodes[last]
-			defer release()
 			if kind == "relay" {
-				require.NoError(t, a.ConnectPeer(t.Context(), f.ips[1]))
-				require.NoError(t, f.nodes[1].ConnectPeer(t.Context(), addr))
 				require.NoError(t, a.SetPeerPathPolicy(id, RelayOnly))
-				cert.PrivateKey = signer
-				creds := f.opts[last].Auth.Certificates
-				creds.Node = cert
-				require.NoError(t, b.ReloadCertificates(t.Context(), creds))
 			}
 			dial := make(chan error, 1)
 			go func() { dial <- a.ConnectPeer(t.Context(), addr) }()
 			select {
-			case <-signer.entered:
+			case <-entered:
+			case err := <-dial:
+				t.Fatalf("dial completed before checking the target's TLS certificate: %v", err)
 			case <-time.After(4 * time.Second):
-				t.Fatal("TLS signer was not selected")
+				t.Fatal("dialer did not receive the target's TLS certificate")
 			}
 			replacement := f.issue(addr, pki.Scope{})
 			replacement.Grant = f.opts[last].Auth.Certificates.Grant
@@ -223,9 +207,8 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			wrong.Node.PrivateKey = f.key
 			require.Error(t, b.ReloadCertificates(t.Context(), wrong))
 			require.NoError(t, b.ReloadCertificates(t.Context(), replacement))
-			release()
+			resume()
 			require.NoError(t, <-dial)
-			require.Eventually(t, func() bool { return b.preferredSession(a.id, false) != nil }, time.Second, 5*time.Millisecond)
 			s := a.preferredSession(id, false)
 			require.NotNil(t, s)
 			require.Equal(t, kind, s.kind)
@@ -233,10 +216,21 @@ func TestReloadDuringTLSHandshake(t *testing.T) {
 			response, err := s.request(t.Context(), opPing, []byte("old session"), 16)
 			require.NoError(t, err)
 			require.Equal(t, "old session", string(response))
+			path, ok := b.PreferredPath(a.id)
+			require.True(t, ok)
+			require.Equal(t, old.SerialNumber.String(), path.LocalNodeSerial)
 			denied.Store(true)
 			require.NoError(t, b.Revalidate(t.Context()))
 			require.True(t, b.ControlStatus().Ready)
-			require.Eventually(t, func() bool { return a.preferredSession(id, false) == nil }, 2*time.Second, 5*time.Millisecond)
+			// Withdrawal also closes the relay's physical connection to the target.
+			// Each observer sees its own connection close before it can redial.
+			for _, observer := range f.nodes[:last] {
+				require.Eventually(t, func() bool {
+					return !slices.ContainsFunc(observer.Paths(), func(p PathStatus) bool {
+						return p.Peer == id && p.NodeSerial == old.SerialNumber.String()
+					})
+				}, 2*time.Second, 5*time.Millisecond, "old path at %s", observer.ID())
+			}
 			require.NoError(t, a.ConnectPeer(t.Context(), addr))
 			require.True(t, a.preferredSession(id, false).state.PeerCertificates[0].Equal(replacement.Node.Leaf))
 		})
