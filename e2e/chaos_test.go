@@ -88,10 +88,10 @@ func TestLossAndNarrowPath(t *testing.T) {
 	dest := tcpip.FullAddress{Addr: addr("fd42::2"), Port: 7001}
 	server, err := gonet.DialUDP(right, &dest, nil, ipv6.ProtocolNumber)
 	require.NoError(t, err)
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 	client, err := gonet.DialUDP(left, nil, &dest, ipv6.ProtocolNumber)
 	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
+	defer client.Close()
 	data := bytes.Repeat([]byte{0xc5}, 1232) // IPv6 + UDP + payload is exactly 1280 bytes.
 	_, err = client.Write(data)
 	require.NoError(t, err)
@@ -175,10 +175,10 @@ func TestChaosNATRebindAndWithdrawal(t *testing.T) {
 	dest := tcpip.FullAddress{Addr: gvisorAddr(b.ip), Port: 7011}
 	rx, err := gonet.DialUDP(right, &dest, nil, ipv4.ProtocolNumber)
 	require.NoError(t, err)
-	defer func() { _ = rx.Close() }()
+	defer rx.Close()
 	tx, err := gonet.DialUDP(left, nil, &dest, ipv4.ProtocolNumber)
 	require.NoError(t, err)
-	defer func() { _ = tx.Close() }()
+	defer tx.Close()
 	// UDP may report the policy rejection at write time or drop the packet.
 	_, _ = tx.Write([]byte("withdrawn"))
 	var msg [64]byte
@@ -567,7 +567,7 @@ func TestMemberWithdrawalIsolation(t *testing.T) {
 	o.Auth.TrustedEntrypoints = []nebula.PeerID{b.node.ID(), withdrawnID}
 	restarted, err := nebula.New(t.Context(), o)
 	require.NoError(t, err)
-	defer func() { _ = restarted.Close() }()
+	defer restarted.Close()
 	require.NoError(t, restarted.Start())
 	id, err := restarted.ConnectEndpoint(t.Context(), l.top.Members[b.index].Endpoints[0])
 	require.NoError(t, err)

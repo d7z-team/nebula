@@ -150,7 +150,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 				if e == nil {
 					break
 				}
-				_ = pc.Close()
+				pc.Close()
 				if attempt == 8 {
 					t.Fatal(e)
 				}
@@ -158,7 +158,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 			sock = &meteredSocket{UDPConn: pc, sent: map[netip.AddrPort]int{}, limit: 1200}
 			o.Transport.UDP4 = sock
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "udp", Address: addrPort(pc.LocalAddr())})
-			t.Cleanup(func() { _ = pc.Close() })
+			t.Cleanup(func() { pc.Close() })
 		}
 		if kind == "tcp" {
 			o.Transport.TCP4, e = net.Listen("tcp4", loopback)
@@ -166,7 +166,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 		}
 		if l := o.Transport.TCP4; l != nil {
 			m.Endpoints = append(m.Endpoints, Endpoint{Network: "tcp", Address: addrPort(l.Addr())})
-			t.Cleanup(func() { _ = l.Close() })
+			t.Cleanup(func() { l.Close() })
 		}
 		f.ips = append(f.ips, a)
 		f.opts = append(f.opts, o)
@@ -204,7 +204,7 @@ func (f *fixture) start() {
 		n, e := New(f.t.Context(), o)
 		require.NoError(f.t, e)
 		f.nodes = append(f.nodes, n)
-		f.t.Cleanup(func() { _ = n.Close() })
+		f.t.Cleanup(func() { n.Close() })
 	}
 	for _, n := range f.nodes {
 		require.NoError(f.t, n.Start())
@@ -549,7 +549,7 @@ func BenchmarkMeshIP(b *testing.B) {
 			if shared {
 				for i := range f.opts {
 					mux := portshare.NewUDP(f.opts[i].Transport.UDP4)
-					b.Cleanup(func() { _ = mux.Close() })
+					b.Cleanup(func() { mux.Close() })
 					f.opts[i].Transport.UDP4 = mux.Mesh()
 				}
 			}
@@ -609,7 +609,7 @@ func TestNodeOptionLimits(t *testing.T) {
 	opts := Options{Auth: f.opts[0].Auth, Topology: f.cfg}
 	n, err := New(t.Context(), opts)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = n.Close() })
+	t.Cleanup(func() { n.Close() })
 	require.Equal(t, 2*time.Second, n.o.MaintenanceInterval)
 	require.Equal(t, ProbeOptions{Interval: n.o.MaintenanceInterval, FailureThreshold: 3}, n.o.Probe)
 	require.Equal(t, 4*time.Second, n.o.DialTimeout)
@@ -643,7 +643,7 @@ func TestNodeLifecycle(t *testing.T) {
 	o.Topology = f.cfg
 	n, err := New(t.Context(), o)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = n.Close() })
+	t.Cleanup(func() { n.Close() })
 	peer := f.cfg.Members[1]
 	port, err := n.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)

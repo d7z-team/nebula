@@ -190,7 +190,7 @@ func TestCanaryAndTransmitHysteresis(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp")
 	backup, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = backup.Close() })
+	t.Cleanup(func() { backup.Close() })
 	vip := netip.MustParseAddr("10.13.0.200")
 	f.cfg.Members[1].AnycastIPs = []netip.Addr{vip}
 	ep := Endpoint{"tcp", addrPort(backup.Addr())}
@@ -339,7 +339,7 @@ func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
 		o.DialTimeout = 150 * time.Millisecond
 		n, err := New(t.Context(), o)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = n.Close() })
+		t.Cleanup(func() { n.Close() })
 		require.NoError(t, n.Start())
 		live = append(live, n)
 	}
@@ -472,7 +472,7 @@ func TestTCPListenerRecoveryAndFailure(t *testing.T) {
 			var shared *portshare.TCP
 			if kind == "shared" {
 				shared = portshare.NewTCP(l)
-				t.Cleanup(func() { _ = shared.Close() })
+				t.Cleanup(func() { shared.Close() })
 				f.opts[1].Transport.TCP4 = shared.Mesh()
 			}
 			f.start()
@@ -497,7 +497,7 @@ func TestCloseDuringReceiveLimitExchange(t *testing.T) {
 	d := tls.Dialer{Config: a.tlsConfig(b.id, true, a.cred.Load())}
 	c, err := d.DialContext(t.Context(), "tcp", f.opts[1].Transport.TCP4.Addr().String())
 	require.NoError(t, err)
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	// Send only the first byte of the two-byte client preface.
 	_, err = c.Write([]byte{5})
 	require.NoError(t, err)
@@ -538,7 +538,7 @@ func TestColdCircuitAcrossSlowHops(t *testing.T) {
 		for range cap(n.neighborDialSlots) {
 			n.neighborDialSlots <- struct{}{}
 		}
-		t.Cleanup(func() { _ = n.Close() })
+		t.Cleanup(func() { n.Close() })
 		require.NoError(t, n.Start())
 		f.nodes = append(f.nodes, n)
 	}
@@ -621,7 +621,7 @@ func TestUDPListenerFailure(t *testing.T) {
 			var other net.PacketConn
 			if kind == "shared" {
 				shared := portshare.NewUDP(socket)
-				t.Cleanup(func() { _ = shared.Close() })
+				t.Cleanup(func() { shared.Close() })
 				f.opts[0].Transport.UDP4 = shared.Mesh()
 				other = shared.Other()
 			}

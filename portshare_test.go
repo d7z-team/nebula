@@ -46,7 +46,10 @@ func TestSharedListenersInboundHandshakes(t *testing.T) {
 			opts.MaxInboundHandshakes = 1
 			udp := portshare.NewUDP(opts.Transport.UDP4)
 			tcp := portshare.NewTCP(opts.Transport.TCP4)
-			t.Cleanup(func() { _ = udp.Close(); _ = tcp.Close() })
+			t.Cleanup(func() {
+				udp.Close()
+				tcp.Close()
+			})
 			opts.Transport.UDP4, opts.Transport.TCP4 = udp.Mesh(), tcp.Mesh()
 			for i := range f.opts {
 				f.opts[i].DialTimeout = 5 * time.Second
@@ -106,10 +109,10 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		var err error
 		socks[i], err = portshare.NewUDPWithALPN(opts.UDP4, alpn)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = socks[i].Close() })
+		t.Cleanup(func() { socks[i].Close() })
 		tcp[i], err = portshare.NewTCPWithALPN(opts.TCP4, alpn)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = tcp[i].Close() })
+		t.Cleanup(func() { tcp[i].Close() })
 		opts.UDP4, opts.TCP4 = socks[i].Mesh(), tcp[i].Mesh()
 	}
 	meter := &countingMeshSocket{SharedSocket: socks[1].Mesh()}
@@ -148,10 +151,10 @@ func TestShareSitesAndPolicy(t *testing.T) {
 				return
 			case <-streamEnd:
 			}
-			_, _ = io.WriteString(w, "after\n")
+			io.WriteString(w, "after\n")
 			return
 		}
-		_, _ = fmt.Fprintf(w, "%s|%s|%s|%s", r.Host, r.Proto, r.TLS.ServerName, r.RemoteAddr)
+		fmt.Fprintf(w, "%s|%s|%s|%s", r.Host, r.Proto, r.TLS.ServerName, r.RemoteAddr)
 	})
 	h2 := &http.Server{TLSConfig: cfg.Clone(), Handler: webHandler}
 	h3 := &http3.Server{TLSConfig: cfg.Clone(), Handler: webHandler}
@@ -159,8 +162,8 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	go func() { served <- h2.ServeTLS(tcp[1].Other(), "", "") }()
 	go func() { served <- h3.Serve(socks[1].Other()) }()
 	t.Cleanup(func() {
-		_ = h2.Close()
-		_ = h3.Close()
+		h2.Close()
+		h3.Close()
 		for range 2 {
 			if err := <-served; !errors.Is(err, http.ErrServerClosed) {
 				t.Errorf("shared web server: %v", err)
@@ -169,7 +172,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	})
 	remote := f.sockets[1].LocalAddr().String()
 	siteTr := &quic.Transport{Conn: socks[0].Other()}
-	t.Cleanup(func() { _ = siteTr.Close() })
+	t.Cleanup(func() { siteTr.Close() })
 	mkH3 := func(versions ...quic.Version) *http3.Transport {
 		if len(versions) == 0 {
 			versions = []quic.Version{quic.Version1}
@@ -177,7 +180,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		tr := &http3.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}, QUICConfig: &quic.Config{Versions: versions}, Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
 			return siteTr.Dial(ctx, f.sockets[1].LocalAddr(), tlsCfg, qcfg)
 		}}
-		t.Cleanup(func() { _ = tr.Close() })
+		t.Cleanup(func() { tr.Close() })
 		return tr
 	}
 	web3 := mkH3()
@@ -189,7 +192,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		require.NoError(t, e)
 		resp, e := tr.RoundTrip(req)
 		require.NoError(t, e)
-		defer func() { _ = resp.Body.Close() }()
+		defer resp.Body.Close()
 		data, e := io.ReadAll(resp.Body)
 		require.NoError(t, e)
 		require.Equal(t, proto, resp.Proto)
@@ -271,7 +274,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		defer cancel()
 		q, err := a.transports[false].Dial(ctx, f.sockets[1].LocalAddr(), a.tlsConfig(b.id, true, a.cred.Load()), a.transports[false].config)
 		if q != nil {
-			_ = q.CloseWithError(0, "test")
+			q.CloseWithError(0, "test")
 		}
 		require.Error(t, err)
 	}
@@ -281,7 +284,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	require.NoError(t, e)
 	ongoing, e := web3.RoundTrip(request)
 	require.NoError(t, e)
-	defer func() { _ = ongoing.Body.Close() }()
+	defer ongoing.Body.Close()
 	first := make([]byte, 7)
 	_, e = io.ReadFull(ongoing.Body, first)
 	require.NoError(t, e)
@@ -312,7 +315,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	b.punch(a.id)
 	get(mkH3(), names[2], "HTTP/3.0")
 	require.Equal(t, before, meter.writes.Load())
-	_ = b.Close()
+	b.Close()
 	get(mkH3(), names[2], "HTTP/3.0")
 	get(ht(true), names[0], "HTTP/2.0")
 }
@@ -324,12 +327,12 @@ func TestShareCloseOther(t *testing.T) {
 			var closeOther func() error
 			if network == "udp" {
 				u := portshare.NewUDP(f.opts[1].Transport.UDP4)
-				t.Cleanup(func() { _ = u.Close() })
+				t.Cleanup(func() { u.Close() })
 				f.opts[1].Transport.UDP4 = u.Mesh()
 				closeOther = u.Other().Close
 			} else {
 				u := portshare.NewTCP(f.opts[1].Transport.TCP4)
-				t.Cleanup(func() { _ = u.Close() })
+				t.Cleanup(func() { u.Close() })
 				f.opts[1].Transport.TCP4 = u.Mesh()
 				closeOther = u.Other().Close
 			}
@@ -371,7 +374,7 @@ func TestShareShutdownDuringWebsiteWrite(t *testing.T) {
 	f := newFixture(t, "udp", "udp")
 	raw := &stalledSiteSocket{f.opts[1].Transport.UDP4, make(chan struct{}), make(chan struct{})}
 	share := portshare.NewUDP(raw)
-	t.Cleanup(func() { _ = share.Close() })
+	t.Cleanup(func() { share.Close() })
 	f.opts[1].Transport.UDP4 = share.Mesh()
 	f.start()
 	resume := sync.OnceFunc(func() { close(raw.resume) })

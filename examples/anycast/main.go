@@ -45,7 +45,7 @@ func run() error {
 		return err
 	}
 	for _, n := range nodes {
-		defer func() { _ = n.Close() }()
+		defer n.Close()
 	}
 	service := tcpip.FullAddress{Addr: tcpip.AddrFromSlice(vip.AsSlice()), Port: 8080}
 	local := tcpip.AddrFromSlice(client.IPv4.AsSlice())
@@ -95,7 +95,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			defer func() { _ = listener.Close() }()
+			defer listener.Close()
 			stop := context.AfterFunc(ctx, listener.Shutdown)
 			defer stop()
 			services = append(services, listener)
@@ -113,12 +113,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = old.Close() }()
+	defer old.Close()
 	first, err := services[0].Accept()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = first.Close() }()
+	defer first.Close()
 	if err := exchange(old, first, 'A'); err != nil {
 		return err
 	}
@@ -127,7 +127,7 @@ func run() error {
 	}
 	probe, err := dial(41002, nodes[1].ID())
 	if err == nil {
-		_ = probe.Close()
+		probe.Close()
 		return fmt.Errorf("draining instance accepted a new connection")
 	}
 	var dialErr *net.OpError
@@ -138,12 +138,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = fresh.Close() }()
+	defer fresh.Close()
 	second, err := services[1].Accept()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = second.Close() }()
+	defer second.Close()
 	if err := exchange(fresh, second, 'B'); err != nil {
 		return err
 	}

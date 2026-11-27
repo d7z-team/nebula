@@ -194,7 +194,7 @@ func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 			_, err = c.Write([]byte{opIP})
 		}
 		if err != nil {
-			_ = c.Close()
+			c.Close()
 			return err
 		}
 		s.data = c
@@ -207,7 +207,7 @@ func (s *session) sendIP(ctx context.Context, packet *outboundPacket) error {
 		err = writeFrame(s.data, packet.data)
 	}
 	if err != nil {
-		_ = s.data.Close()
+		s.data.Close()
 		s.data = nil
 	}
 	return err

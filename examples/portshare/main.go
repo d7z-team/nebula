@@ -41,10 +41,10 @@ func run(port uint, maxHandshakes int, alpn string) error {
 	}
 	tcp, err := portshare.NewTCPWithALPN(listener, alpn)
 	if err != nil {
-		_ = listener.Close()
+		listener.Close()
 		return err
 	}
-	defer func() { _ = tcp.Close() }()
+	defer tcp.Close()
 	addr := listener.Addr().(*net.TCPAddr).AddrPort()
 	socket, err := net.ListenPacket("udp4", addr.String())
 	if err != nil {
@@ -52,10 +52,10 @@ func run(port uint, maxHandshakes int, alpn string) error {
 	}
 	udp, err := portshare.NewUDPWithALPN(socket, alpn)
 	if err != nil {
-		_ = socket.Close()
+		socket.Close()
 		return err
 	}
-	defer func() { _ = udp.Close() }()
+	defer udp.Close()
 
 	server, client := demo.NewHost(1), demo.NewHost(2)
 	server.Endpoints = []nebula.Endpoint{{Network: "udp", Address: addr}, {Network: "tcp", Address: addr}}
@@ -69,21 +69,20 @@ func run(port uint, maxHandshakes int, alpn string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = options[1].Transport.UDP4.Close() }()
+	defer options[1].Transport.UDP4.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var peer *nebula.Node
 	for _, o := range options {
 		o.Transport.ALPN = alpn
-		node, err := nebula.New(ctx, o)
+		peer, err = nebula.New(ctx, o)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = node.Close() }()
-		if err := node.Start(); err != nil {
+		defer peer.Close()
+		if err := peer.Start(); err != nil {
 			return err
 		}
-		peer = node
 	}
 
 	names := []string{"shop.example", "api.example"}
@@ -93,13 +92,13 @@ func run(port uint, maxHandshakes int, alpn string) error {
 	}
 	handler := http.NewServeMux()
 	for _, name := range names {
-		handler.HandleFunc(name+"/", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, name) })
+		handler.HandleFunc(name+"/", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, name) })
 	}
 	webTLS := &tls.Config{Certificates: []tls.Certificate{cert}}
 	https := &http.Server{TLSConfig: webTLS.Clone(), Handler: handler}
 	h3 := &http3.Server{TLSConfig: webTLS.Clone(), Handler: handler}
-	defer func() { _ = https.Close() }()
-	defer func() { _ = h3.Close() }()
+	defer https.Close()
+	defer h3.Close()
 	ctx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
 	go func() { stop(https.ServeTLS(tcp.Other(), "", "")) }()
@@ -116,7 +115,7 @@ func run(port uint, maxHandshakes int, alpn string) error {
 	h2Client := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: names[0]}, ForceAttemptHTTP2: true}
 	defer h2Client.CloseIdleConnections()
 	h3Client := &http3.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: names[1]}}
-	defer func() { _ = h3Client.Close() }()
+	defer h3Client.Close()
 	for i, tr := range []http.RoundTripper{h2Client, h3Client} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr.String()+"/", nil)
 		if err != nil {
@@ -128,7 +127,7 @@ func run(port uint, maxHandshakes int, alpn string) error {
 			return errors.Join(err, context.Cause(ctx))
 		}
 		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		resp.Body.Close()
 		if err != nil {
 			return err
 		}

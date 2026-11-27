@@ -119,10 +119,10 @@ func exchange(ctx context.Context, opts nebula.Options, listen, endpoint netip.A
 	}
 	node, err := nebula.New(ctx, opts)
 	if err != nil {
-		_ = socket.Close()
+		socket.Close()
 		return err
 	}
-	defer func() { _ = node.Close() }()
+	defer node.Close()
 	const request, receipt = "app/peer/request", "app/peer/receipt"
 	topic := request
 	if message != "" {

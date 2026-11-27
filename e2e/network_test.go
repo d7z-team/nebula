@@ -253,7 +253,7 @@ func TestLinkDeliveryOrder(t *testing.T) {
 		s.SetRouteTable([]tcpip.Route{route("192.0.2.0/24", "", 1)})
 		pc, err := gonet.DialUDP(s, &tcpip.FullAddress{Addr: addr(ip), Port: 4242}, nil, ipv4.ProtocolNumber)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = pc.Close() })
+		t.Cleanup(func() { pc.Close() })
 		sockets = append(sockets, pc)
 	}
 	left, right := sockets[0], sockets[1]

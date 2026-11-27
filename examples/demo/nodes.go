@@ -97,7 +97,7 @@ func Listen(ctx context.Context, transport string, options []nebula.Options) (no
 	defer func() {
 		if err != nil {
 			for _, owner := range owners {
-				_ = owner.Close()
+				owner.Close()
 			}
 		}
 	}()

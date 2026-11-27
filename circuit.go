@@ -120,7 +120,7 @@ func (l *circuitLease) close() {
 	for _, c := range ends {
 		// A yamux stream may keep reading after a local FIN.
 		_ = c.SetDeadline(time.Now())
-		_ = c.Close()
+		c.Close()
 	}
 
 	n.mu.Lock()
@@ -204,14 +204,14 @@ func (l *circuitLease) openNextLeg(ctx context.Context, next PeerID) (net.Conn, 
 	}
 	deadline, _ := ctx.Deadline() // Both callers budget for the remaining hops.
 	if err := c.SetDeadline(deadline); err != nil {
-		_ = c.Close()
+		c.Close()
 		return nil, err
 	}
 	// Own the stream before requesting the route so withdrawal interrupts the ready wait.
 	n.mu.Lock()
 	if !l.allowedLocked() {
 		n.mu.Unlock()
-		_ = c.Close()
+		c.Close()
 		return nil, ErrPathPolicy
 	}
 	l.ends = append(l.ends, c)

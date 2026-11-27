@@ -433,7 +433,7 @@ func TestConfiguredPhysicalEndpoints(t *testing.T) {
 			opts.Transport.AdvertiseEndpoints = []Endpoint{ep}
 			n, advertiseErr := New(t.Context(), opts)
 			if n != nil {
-				t.Cleanup(func() { _ = n.Close() })
+				t.Cleanup(func() { n.Close() })
 			}
 			cfg := f.cfg
 			cfg.Members = slices.Clone(cfg.Members)

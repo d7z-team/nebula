@@ -33,7 +33,7 @@ func input(path string, in io.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer func() { _ = f.Close() }()
+		defer f.Close() //nolint:errcheck // The input file is read-only.
 		in = f
 	}
 	b, err := io.ReadAll(io.LimitReader(in, (4<<20)+1))

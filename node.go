@@ -454,7 +454,7 @@ func (n *Node) Start() error {
 		listener, err := transport.Listen(n.tlsConfig(PeerID{}, false, nil), transport.config)
 		if err != nil {
 			n.mu.Unlock()
-			_ = n.Close()
+			n.Close()
 			return err
 		}
 		listeners[family] = listener
@@ -470,7 +470,7 @@ func (n *Node) Start() error {
 				if !n.tryInboundHandshake(func() {
 					_, _ = n.attachQUIC(n.ctx, q, PeerID{}, false, q.Context().Value(credentialContextKey{}).(*credentials))
 				}) {
-					_ = q.CloseWithError(0, "closing")
+					q.CloseWithError(0, "closing")
 				}
 			}
 		})
@@ -488,18 +488,18 @@ func (n *Node) Start() error {
 				}
 				ep := addrPort(c.RemoteAddr())
 				if !n.endpointAllowed("tcp", ep, true) {
-					_ = c.Close()
+					c.Close()
 					continue
 				}
 				if !n.tryInboundHandshake(func() { _, _ = n.attachTLS(n.ctx, c, PeerID{}, nil, false, nil) }) {
-					_ = c.Close()
+					c.Close()
 				}
 			}
 		})
 	}
 	n.wg.Go(n.maintain)
 	n.mu.Unlock()
-	go func() { <-n.ctx.Done(); _ = n.Close() }()
+	go func() { <-n.ctx.Done(); n.Close() }()
 	return nil
 }
 
@@ -541,7 +541,7 @@ func (n *Node) Close() error {
 	deadline := time.Now().Add(n.o.DialTimeout)
 	for i, pc := range sockets {
 		if pc != nil && pc.SetWriteDeadline(deadline) != nil {
-			_ = pc.Close()
+			pc.Close()
 			sockets[i] = nil
 		}
 	}
@@ -550,16 +550,16 @@ func (n *Node) Close() error {
 	}
 	for _, l := range []net.Listener{n.o.Transport.TCP4, n.o.Transport.TCP6} {
 		if l != nil {
-			_ = l.Close()
+			l.Close()
 		}
 	}
 	for _, t := range n.transports {
 		// Closing a QUIC transport also releases its listener.
-		_ = t.Close()
+		t.Close()
 	}
 	for _, pc := range sockets {
 		if pc != nil {
-			_ = pc.Close()
+			pc.Close()
 		}
 	}
 	if p != nil {

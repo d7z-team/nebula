@@ -27,7 +27,7 @@ func TestListenWithIndependentViews(t *testing.T) {
 	nodes, err := demo.Listen(ctx, "tcp", opts)
 	require.NoError(t, err)
 	for _, n := range nodes {
-		t.Cleanup(func() { _ = n.Close() })
+		t.Cleanup(func() { n.Close() })
 		require.NoError(t, n.Start())
 	}
 	require.NoError(t, nodes[0].ConnectPeer(ctx, b.IPv6))
@@ -51,7 +51,7 @@ func TestListenClosesNodesOnConstructionError(t *testing.T) {
 	require.NoError(t, err)
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
-	defer func() { _ = listener.Close() }()
+	defer listener.Close()
 	opts[0].Transport.TCP4 = listener
 	opts[1].Topology.Network = "different"
 	_, err = demo.Listen(t.Context(), "udp", opts)

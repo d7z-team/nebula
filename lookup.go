@@ -379,7 +379,7 @@ func (n *Node) queryNeighbor(ctx context.Context, s *session, q query, results c
 	if err != nil {
 		return
 	}
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	stop := context.AfterFunc(ctx, func() { _ = c.SetDeadline(time.Now()) })
 	defer stop()
 	for range maxLookupAnswers {

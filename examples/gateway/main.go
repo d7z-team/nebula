@@ -58,7 +58,7 @@ func run() error {
 		return err
 	}
 	for _, n := range nodes {
-		defer func() { _ = n.Close() }()
+		defer n.Close()
 	}
 	for _, n := range nodes {
 		if err := n.Start(); err != nil {
@@ -195,12 +195,12 @@ func echo(client, host *stack.Stack, src, dst netip.Addr, deadline time.Time) er
 	if err != nil {
 		return err
 	}
-	defer func() { _ = server.Close() }()
+	defer server.Close()
 	conn, err := gonet.DialUDP(client, nil, &service, family)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
+	defer conn.Close()
 	if err := server.SetDeadline(deadline); err != nil {
 		return err
 	}

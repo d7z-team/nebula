@@ -103,8 +103,8 @@ func TestRevalidateDuringGrantWrite(t *testing.T) {
 		f.start()
 		n, peer := f.nodes[0], f.nodes[1]
 		w, r := net.Pipe()
-		defer func() { _ = w.Close() }()
-		defer func() { _ = r.Close() }()
+		defer w.Close()
+		defer r.Close()
 		first := startGrantWrite(n, peer, w)
 		synctest.Wait()
 
@@ -121,8 +121,8 @@ func TestRevalidateDuringGrantWrite(t *testing.T) {
 
 		// A later handshake to the same peer belongs to neither snapshot.
 		later, reader := net.Pipe()
-		defer func() { _ = later.Close() }()
-		defer func() { _ = reader.Close() }()
+		defer later.Close()
+		defer reader.Close()
 		require.NoError(t, later.SetWriteDeadline(time.Now().Add(time.Second)))
 		second := startGrantWrite(n, peer, later)
 		synctest.Wait()
@@ -316,7 +316,7 @@ func TestGrantDisclosure(t *testing.T) {
 			opts.Topology = Topology{Network: "lab", Members: []Member{{ID: b.ID(), IPv4: addresses.IPv4, IPv6: addresses.IPv6}}}
 			other, err := New(t.Context(), opts)
 			require.NoError(t, err)
-			defer func() { _ = other.Close() }()
+			defer other.Close()
 			require.NoError(t, other.Start())
 
 			for _, tc := range []struct {
@@ -343,11 +343,11 @@ func TestGrantDisclosure(t *testing.T) {
 					o.Transport = TransportOptions{}
 					local, err := New(t.Context(), o)
 					require.NoError(t, err)
-					defer func() { _ = local.Close() }()
+					defer local.Close()
 					require.NoError(t, local.Start())
 					left, right := net.Pipe()
-					defer func() { _ = left.Close() }()
-					defer func() { _ = right.Close() }()
+					defer left.Close()
+					defer right.Close()
 					deadline := time.Now().Add(2 * time.Second)
 					require.NoError(t, left.SetDeadline(deadline))
 					require.NoError(t, right.SetDeadline(deadline))
@@ -360,7 +360,7 @@ func TestGrantDisclosure(t *testing.T) {
 					in := &session{n: tc.server, state: serverState}
 					done := make(chan error, 1)
 					go func() {
-						defer func() { _ = right.Close() }()
+						defer right.Close()
 						done <- in.exchangeGrants(t.Context(), stream{right, io.MultiWriter(&replied, right)}, tc.server.cred.Load())
 					}()
 					creds := *local.cred.Load()
@@ -368,7 +368,7 @@ func TestGrantDisclosure(t *testing.T) {
 						creds.Grant = tc.clientGrant
 					}
 					clientErr := out.exchangeGrants(t.Context(), stream{left, io.MultiWriter(&sent, left)}, &creds)
-					_ = left.Close()
+					left.Close()
 					serverErr := <-done
 					require.Equal(t, tc.wantClient, bytes.Contains(sent.Bytes(), creds.Grant[0]))
 					require.Equal(t, tc.wantServer, bytes.Contains(replied.Bytes(), tc.server.cred.Load().Grant[0]))

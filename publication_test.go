@@ -110,7 +110,7 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	// Push the same DER over the opposite stream and observe local delivery.
 	c, err := n.preferredSession(other.id, false).openRequest(t.Context(), 0x06, wire)
 	require.NoError(t, err)
-	defer func() { _ = c.Close() }()
+	defer c.Close()
 	ack, err := io.ReadAll(c)
 	require.NoError(t, err)
 	require.Equal(t, []byte{0, 0, 0, 0}, ack)

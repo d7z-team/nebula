@@ -64,15 +64,15 @@ func tcpPair(t *testing.T, client, server *stack.Stack, destination string, prot
 	t.Helper()
 	l, err := gonet.ListenTCP(server, tcpip.FullAddress{Addr: addr(destination)}, proto)
 	require.NoError(t, err)
-	defer func() { _ = l.Close() }()
+	defer l.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
 	c, err := gonet.DialContextTCP(ctx, client, tcpip.FullAddress{Addr: addr(destination), Port: uint16(l.Addr().(*net.TCPAddr).Port)}, proto)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = c.Close() })
+	t.Cleanup(func() { c.Close() })
 	accepted, err := l.Accept()
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = accepted.Close() })
+	t.Cleanup(func() { accepted.Close() })
 	return c, accepted
 }
 

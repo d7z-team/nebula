@@ -27,7 +27,7 @@ func ExampleIPPort_WriteIP() {
 		panic(err)
 	}
 	for _, n := range nodes {
-		defer func() { _ = n.Close() }()
+		defer n.Close()
 	}
 	for _, n := range nodes {
 		if err := n.Start(); err != nil {
@@ -102,7 +102,7 @@ func ExampleNode_ResolveIP() {
 		panic(err)
 	}
 	for _, node := range nodes {
-		defer func() { _ = node.Close() }()
+		defer node.Close()
 	}
 	for _, node := range nodes {
 		if err := node.Start(); err != nil {

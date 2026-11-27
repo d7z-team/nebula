@@ -180,7 +180,11 @@ func TestRelaySlowExit(t *testing.T) {
 		require.True(t, l.reserve())
 		direction := relayDirection{l.inbound, f.nodes[to].id}
 		n.wg.Go(func() { l.forward(dst, src, direction) })
-		t.Cleanup(func() { _ = in.Close(); _ = out.Close(); l.close() })
+		t.Cleanup(func() {
+			in.Close()
+			out.Close()
+			l.close()
+		})
 		return in, out
 	}
 	for range peerWriteBlocks + 1 {

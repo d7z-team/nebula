@@ -23,7 +23,7 @@ func listenUDP(t *testing.T) net.PacketConn {
 	t.Helper()
 	p, e := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, e)
-	t.Cleanup(func() { _ = p.Close() })
+	t.Cleanup(func() { p.Close() })
 	return p
 }
 
@@ -38,10 +38,10 @@ func readDatagram(t *testing.T, c net.PacketConn) ([]byte, net.Addr) {
 
 func fragmentedClientHello(t *testing.T, protos []string) []byte {
 	l, r := net.Pipe()
-	defer func() { _ = r.Close() }()
-	defer func() { _ = l.Close() }()
+	defer r.Close()
+	defer l.Close()
 	client := tls.Client(l, &tls.Config{ServerName: "example.test", NextProtos: protos})
-	go func() { _ = client.Handshake() }() // Only the ClientHello is consumed.
+	go client.Handshake() //nolint:errcheck // Only the ClientHello is consumed.
 	var h [5]byte
 	_, e := io.ReadFull(r, h[:])
 	require.NoError(t, e)
@@ -65,7 +65,7 @@ func TestTCPByteReplay(t *testing.T) {
 	require.NoError(t, e)
 	p, e := NewTCPWithALPN(raw, alpn)
 	require.NoError(t, e)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	for _, protos := range [][]string{nil, {meshwire.ALPN}, {"h2", alpn}, {alpn}} {
 		b := fragmentedClientHello(t, protos)
 		c, e := net.Dial("tcp4", raw.Addr().String())
@@ -87,20 +87,20 @@ func TestTCPByteReplay(t *testing.T) {
 		_, e = io.ReadFull(peer, got)
 		require.NoError(t, e)
 		require.Equal(t, b, got)
-		_ = peer.Close()
-		_ = c.Close()
+		peer.Close()
+		c.Close()
 	}
 	for _, b := range [][]byte{{}, []byte("GET /plain HTTP/1.0\r\n\r\n"), {22, 255, 255, 0, 1, 0xff}, {22, 3}, {22, 3, 1, 0, 4, 42}} {
 		c, e := net.Dial("tcp4", raw.Addr().String())
 		require.NoError(t, e)
-		defer func() { _ = c.Close() }()
+		defer c.Close()
 
 		_, e = c.Write(b)
 		require.NoError(t, e)
 		require.NoError(t, c.(*net.TCPConn).CloseWrite())
 		peer, e := p.Other().Accept()
 		require.NoError(t, e)
-		defer func() { _ = peer.Close() }()
+		defer peer.Close()
 		got := make([]byte, len(b))
 		_, e = io.ReadFull(peer, got)
 		require.NoError(t, e)
@@ -137,7 +137,7 @@ func TestUDPInitialExpiryAndRetransmission(t *testing.T) {
 	packets := captureInitialFlight(t, []string{meshwire.ALPN})
 	raw, src := listenUDP(t), listenUDP(t)
 	p := NewUDP(raw)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	send := func(b []byte) { _, err := src.WriteTo(b, raw.LocalAddr()); require.NoError(t, err) }
 	send(packets[0])
 	// Wait until the incomplete flight expires at the classifier.
@@ -175,11 +175,11 @@ func (s *blockingSocket) SetWriteDeadline(t time.Time) error { return s.write.Se
 
 func TestUDPBranchDeadlines(t *testing.T) {
 	w, r := net.Pipe()
-	defer func() { _ = r.Close() }()
-	defer func() { _ = w.Close() }()
+	defer r.Close()
+	defer w.Close()
 	s := &blockingSocket{PacketConn: listenUDP(t), write: w, started: make(chan struct{}, 1)}
 	p := NewUDP(s)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	write := func(pc net.PacketConn) <-chan error {
 		done := make(chan error, 1)
 		go func() { _, err := pc.WriteTo([]byte{42}, s.LocalAddr()); done <- err }()
@@ -222,7 +222,7 @@ func TestUDPBranchDeadlines(t *testing.T) {
 func TestUDPByteReplay(t *testing.T) {
 	raw, src := listenUDP(t), listenUDP(t)
 	p := NewUDP(raw)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	for _, b := range [][]byte{nil, {0, 1}, {1}, {0xff, 2}, {0x40, 2, 3}, bytes.Repeat([]byte{0x88}, 1300)} {
 		_, e := src.WriteTo(b, raw.LocalAddr())
 		require.NoError(t, e)
@@ -241,7 +241,7 @@ func TestUDPByteReplay(t *testing.T) {
 func TestUDPBranchCloseWithBacklog(t *testing.T) {
 	raw, src := listenUDP(t), listenUDP(t)
 	p := NewUDP(raw)
-	defer func() { _ = p.Close() }()
+	defer p.Close()
 	// Fill the logical queue independently of the kernel receive buffer.
 	for i := range 256 {
 		p.other.deliver(datagram{data: []byte{'x', byte(i)}, from: src.LocalAddr()})
@@ -270,12 +270,12 @@ func captureInitialFlight(t *testing.T, protos []string) [][]byte {
 	t.Helper()
 	server, client := listenUDP(t), listenUDP(t)
 	tr := &quic.Transport{Conn: client}
-	defer func() { _ = tr.Close() }()
+	defer tr.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	tlsCfg := &tls.Config{ServerName: "test.example", NextProtos: protos, MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768}}
 	quicCfg := &quic.Config{InitialPacketSize: 1200, Versions: []quic.Version{quic.Version1}}
-	go func() { _, _ = tr.Dial(ctx, server.LocalAddr(), tlsCfg, quicCfg) }() // Only the Initial flight is consumed.
+	go tr.Dial(ctx, server.LocalAddr(), tlsCfg, quicCfg) //nolint:errcheck // Only the Initial flight is consumed.
 	var ds [][]byte
 	present := make([]bool, helloLimit)
 	first := make([]byte, 4)
@@ -316,7 +316,7 @@ func TestUDPReorderedInitialReplay(t *testing.T) {
 			slices.Reverse(flight)
 			raw, source := listenUDP(t), listenUDP(t)
 			u := NewUDP(raw)
-			defer func() { _ = u.Close() }()
+			defer u.Close()
 			target := u.Other()
 			if tt.name == "mesh" {
 				target = u.Mesh()

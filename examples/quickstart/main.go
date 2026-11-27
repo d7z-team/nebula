@@ -39,8 +39,8 @@ func run(hybrid bool) error {
 		return err
 	}
 	alice, bob := nodes[0], nodes[1]
-	defer func() { _ = alice.Close() }()
-	defer func() { _ = bob.Close() }()
+	defer alice.Close()
+	defer bob.Close()
 	for _, n := range nodes {
 		if err := n.Start(); err != nil {
 			return err

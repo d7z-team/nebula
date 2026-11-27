@@ -47,7 +47,7 @@ func run() error {
 		return err
 	}
 	for _, n := range nodes {
-		defer func() { _ = n.Close() }()
+		defer n.Close()
 	}
 	for _, n := range nodes {
 		if err := n.Start(); err != nil {

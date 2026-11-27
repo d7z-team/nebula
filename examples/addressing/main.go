@@ -39,7 +39,7 @@ func run() error {
 		return err
 	}
 	for _, n := range nodes {
-		defer func() { _ = n.Close() }()
+		defer n.Close()
 	}
 	type receipt struct{ member, destination netip.Addr }
 	received := make(chan receipt, 8)

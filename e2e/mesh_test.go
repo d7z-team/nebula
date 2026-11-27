@@ -143,10 +143,10 @@ func (l *lab) addUnderlay(h *host, segment, physical, via, transport string, pub
 		var input net.PacketConn = pc
 		if *sharedPorts {
 			share := portshare.NewUDP(pc)
-			l.t.Cleanup(func() { _ = share.Close() })
+			l.t.Cleanup(func() { share.Close() })
 			input = share.Mesh()
 		} else {
-			l.t.Cleanup(func() { _ = pc.Close() })
+			l.t.Cleanup(func() { pc.Close() })
 		}
 		if a.Is4() {
 			h.options.Transport.UDP4 = input
@@ -163,10 +163,10 @@ func (l *lab) addUnderlay(h *host, segment, physical, via, transport string, pub
 		var input net.Listener = listener
 		if *sharedPorts {
 			share := portshare.NewTCP(listener)
-			l.t.Cleanup(func() { _ = share.Close() })
+			l.t.Cleanup(func() { share.Close() })
 			input = share.Mesh()
 		} else {
-			l.t.Cleanup(func() { _ = listener.Close() })
+			l.t.Cleanup(func() { listener.Close() })
 		}
 		if a.Is4() {
 			h.options.Transport.TCP4 = input
@@ -210,7 +210,7 @@ func (l *lab) start() {
 		n, err := nebula.New(context.Background(), o)
 		require.NoError(l.t, err)
 		h.node = n
-		l.t.Cleanup(func() { _ = n.Close() })
+		l.t.Cleanup(func() { n.Close() })
 	}
 	for _, h := range l.hosts {
 		require.NoError(l.t, h.node.Start())

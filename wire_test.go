@@ -33,7 +33,7 @@ func TestWireStreams(t *testing.T) {
 		t.Helper()
 		c, err := session.open(t.Context())
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = c.Close() })
+		t.Cleanup(func() { c.Close() })
 		require.NoError(t, c.SetDeadline(time.Now().Add(4*time.Second)))
 		return c
 	}
@@ -135,7 +135,7 @@ func TestQUICStreamCloseDuringWrite(t *testing.T) {
 	payload := []byte("still connected")
 	ping, err := s.openRequest(t.Context(), opPing, payload)
 	require.NoError(t, err)
-	defer func() { _ = ping.Close() }()
+	defer ping.Close()
 	reply, err := io.ReadAll(ping)
 	require.NoError(t, err)
 	require.Equal(t, append(binary.BigEndian.AppendUint32(nil, uint32(len(payload))), payload...), reply)

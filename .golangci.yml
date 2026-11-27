@@ -1,5 +1,19 @@
 version: "2"
 
+linters:
+  settings:
+    errcheck:
+      verbose: true
+      exclude-functions:
+        - (io.Closer).Close
+        - fmt.Fprintf(net/http.ResponseWriter)
+        - io.WriteString(net/http.ResponseWriter)
+  exclusions:
+    rules:
+      # Match network teardown by receiver type, e.g. (net.Conn).Close.
+      - linters: [errcheck]
+        text: '\b(net|http|quic-go|http3|yamux|gonet|nebula|portshare)\.\w+\)\.Close(WithError)?`'
+
 formatters:
   enable:
     - gci
