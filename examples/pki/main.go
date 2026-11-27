@@ -25,7 +25,7 @@ func run() error {
 		return fmt.Errorf("create CA: %w", err)
 	}
 	clusterCA := issuer.Chain[0]
-	siteKey, err := pki.GenerateKey("ed25519")
+	siteKey, err := pki.GenerateKey("ml-dsa-44")
 	if err != nil {
 		return err
 	}
@@ -83,6 +83,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("verify cluster grant: %w", err)
 	}
-	fmt.Printf("verified %s on demo with its cluster grant\n", id)
+	fmt.Printf("site CA public key: %s, signed by cluster with %s\n", site.PublicKeyAlgorithm, site.SignatureAlgorithm)
+	fmt.Printf("verified %s on demo with a %s cluster grant\n", id, leaf.SignatureAlgorithm)
 	return nil
 }

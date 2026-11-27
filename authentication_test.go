@@ -32,15 +32,19 @@ func TestIntroductionAfterSignerReload(t *testing.T) {
 	f.start()
 	sender, receiver := f.nodes[0], f.nodes[1]
 	to := &session{peer: receiver.id}
-	_, ok := receiver.learnIntroduction(t.Context(), sender.advert(to).Record, nil)
+	ad, _ := sender.advert(to)
+	_, ok := receiver.learnIntroduction(t.Context(), ad.Record, nil)
 	require.True(t, ok)
 	set := f.opts[0].Auth.Certificates
 	renewed := f.issue(sender.Addresses().IPv4, pki.Scope{})
 	for _, next := range []LocalCertificates{{Node: renewed.Node, Grant: set.Grant}, renewed} {
-		to.acknowledgedIntro.Store(receiver.advert(&session{peer: sender.id}).Seen)
-		require.Empty(t, sender.advert(to).Record)
+		ack, _ := receiver.advert(&session{peer: sender.id})
+		to.acknowledgedIntro.Store(ack.Seen)
+		ad, _ = sender.advert(to)
+		require.Empty(t, ad.Record)
 		require.NoError(t, sender.ReloadCertificates(t.Context(), next))
-		record := sender.advert(to).Record
+		ad, _ = sender.advert(to)
+		record := ad.Record
 		_, chain, err := pki.VerifyObjectSignature(record, sender.Cluster().Network(), "introduction")
 		require.NoError(t, err)
 		require.True(t, grantLeaf(t, next).Equal(chain[0]))

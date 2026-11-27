@@ -1,10 +1,7 @@
 package portshare
 
 import (
-	"bytes"
 	"time"
-
-	"gopkg.d7z.net/nebula/meshwire"
 
 	"golang.org/x/crypto/cryptobyte"
 )
@@ -15,34 +12,31 @@ const (
 	maxPending      = 128
 )
 
-// meshHello inspects a complete TLS ClientHello, including its handshake header.
-// Classification selects a recipient; TLS still authenticates the original bytes.
-func meshHello(b []byte) bool {
-	msg := cryptobyte.String(b)
-	var body, field, extensions cryptobyte.String
-	var typ uint8
-	if !msg.ReadUint8(&typ) || typ != 1 || !msg.ReadUint24LengthPrefixed(&body) || !msg.Empty() ||
-		!body.Skip(34) || !body.ReadUint8LengthPrefixed(&field) ||
+// offersOnlyALPN inspects the body of one complete ClientHello.
+func offersOnlyALPN(body cryptobyte.String, alpn string) bool {
+	var field, extensions cryptobyte.String
+	if !body.Skip(34) || !body.ReadUint8LengthPrefixed(&field) ||
 		!body.ReadUint16LengthPrefixed(&field) || !body.ReadUint8LengthPrefixed(&field) ||
 		!body.ReadUint16LengthPrefixed(&extensions) || !body.Empty() {
 		return false
 	}
-	var mesh bool
+	var matched bool
 	for !extensions.Empty() {
 		var id uint16
 		if !extensions.ReadUint16(&id) || !extensions.ReadUint16LengthPrefixed(&field) {
 			return false
 		}
-		if id == 16 {
-			var list, name cryptobyte.String
-			if mesh || !field.ReadUint16LengthPrefixed(&list) || !field.Empty() ||
-				!list.ReadUint8LengthPrefixed(&name) || !list.Empty() || !bytes.Equal(name, []byte(meshwire.ALPN)) {
-				return false
-			}
-			mesh = true
+		if id != 16 { // application_layer_protocol_negotiation
+			continue
 		}
+		var list, name cryptobyte.String
+		if matched || !field.ReadUint16LengthPrefixed(&list) || !field.Empty() ||
+			!list.ReadUint8LengthPrefixed(&name) || !list.Empty() || string(name) != alpn {
+			return false
+		}
+		matched = true
 	}
-	return mesh
+	return matched
 }
 
 // helloSize includes the handshake type and its three-byte length.

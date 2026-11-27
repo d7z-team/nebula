@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -273,7 +274,7 @@ func TestChaosCanaryAfterNATRebind(t *testing.T) {
 	l.link(fixed, observer)
 	l.link(mobile, observer)
 	// The mobile peer answers rendezvous but leaves direct dialing to the fixed peer.
-	mobile.options.MaintenanceInterval = time.Minute
+	mobile.options.Probe.Interval = time.Minute
 	fixed.options.DialTimeout = 2 * time.Second
 	l.start()
 	l.top.Members[mobile.index].Endpoints = []nebula.Endpoint{{Network: "udp", Address: old}}
@@ -329,6 +330,7 @@ func TestChaosRelayPartition(t *testing.T) {
 	l := newLab(t)
 	a := l.host("wan", "192.0.2.1", "", "tcp", true)
 	b := l.host("wan", "192.0.2.2", "", "udp", true)
+	b.options.Transport.CurvePreferences = []tls.CurveID{tls.CurveP384}
 	last := l.host("wan", "192.0.2.5", "", "both", true)
 	l.top.Members[last.index].Transit = true
 	l.link(last, b)
@@ -350,6 +352,7 @@ func TestChaosRelayPartition(t *testing.T) {
 	}
 	l.connect(b, last, "udp")
 	path := l.connect(a, b, "relay")
+	require.Equal(t, tls.CurveP384, path.TLSGroup)
 	require.Len(t, path.Circuit, 4)
 	require.Equal(t, l.top.Members[last.index].ID, path.Circuit[2])
 	c, d := tcpPair(t, l.business(a), l.business(b), b.ip.String(), ipv4.ProtocolNumber)
@@ -366,6 +369,9 @@ func TestChaosRelayPartition(t *testing.T) {
 	l.net.disturb(func(d datagram) disturbance {
 		return disturbance{drop: d.from.Addr() == peerIP && d.to.Addr() == alternateIP || d.from.Addr() == alternateIP && d.to.Addr() == peerIP}
 	})
+	require.NoError(t, primary.node.SetTransitDraining(true))
+	receipt(t, c, d, 2)
+	require.Positive(t, primary.node.RelayStatus().TransitCircuits)
 	require.NoError(t, primary.node.Close())
 	require.Eventually(t, func() bool {
 		_, ok := a.node.PreferredPath(b.node.ID())
@@ -375,6 +381,7 @@ func TestChaosRelayPartition(t *testing.T) {
 	l.net.disturb(nil)
 	require.Eventually(t, func() bool { return a.node.ConnectPeer(t.Context(), b.ip) == nil }, 12*time.Second, 100*time.Millisecond)
 	path = waitPath(t, a, b, "relay")
+	require.Equal(t, tls.CurveP384, path.TLSGroup)
 	require.Equal(t, []nebula.PeerID{l.top.Members[a.index].ID, l.top.Members[alternate.index].ID, l.top.Members[last.index].ID, l.top.Members[b.index].ID}, path.Circuit)
 	receipt(t, c, d, 1)
 	l.net.mu.Lock()

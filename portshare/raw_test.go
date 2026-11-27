@@ -59,11 +59,13 @@ func fragmentedClientHello(t *testing.T, protos []string) []byte {
 }
 
 func TestTCPByteReplay(t *testing.T) {
+	const alpn = "lab-mesh"
 	raw, e := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, e)
-	p := NewTCP(raw)
+	p, e := NewTCPWithALPN(raw, alpn)
+	require.NoError(t, e)
 	defer p.Close()
-	for _, protos := range [][]string{nil, {"acme-tls/1"}, {"custom"}, {"h2", meshwire.ALPN}, {meshwire.ALPN}} {
+	for _, protos := range [][]string{nil, {meshwire.ALPN}, {"h2", alpn}, {alpn}} {
 		b := fragmentedClientHello(t, protos)
 		c, e := net.Dial("tcp4", raw.Addr().String())
 		require.NoError(t, e)
@@ -72,7 +74,7 @@ func TestTCPByteReplay(t *testing.T) {
 			require.NoError(t, e)
 		}
 		l := p.Other()
-		if slices.Equal(protos, []string{meshwire.ALPN}) {
+		if slices.Equal(protos, []string{alpn}) {
 			l = p.Mesh()
 		}
 		peer, e := l.Accept()

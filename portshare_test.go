@@ -12,7 +12,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -95,16 +94,22 @@ func TestSharedListenersInboundHandshakes(t *testing.T) {
 }
 
 func TestShareSitesAndPolicy(t *testing.T) {
+	const alpn = "lab-mesh"
 	f := newFixture(t, "both", "both")
 	socks := make([]*portshare.UDP, 2)
 	tcp := make([]*portshare.TCP, 2)
 	for i := range f.opts {
+		opts := &f.opts[i].Transport
+		opts.ALPN = alpn
 		f.sockets[i].limit = 0
-		socks[i] = portshare.NewUDP(f.opts[i].Transport.UDP4)
-		tcp[i] = portshare.NewTCP(f.opts[i].Transport.TCP4)
-		t.Cleanup(func() { socks[i].Close(); tcp[i].Close() })
-		f.opts[i].Transport.UDP4 = socks[i].Mesh()
-		f.opts[i].Transport.TCP4 = tcp[i].Mesh()
+		var err error
+		socks[i], err = portshare.NewUDPWithALPN(opts.UDP4, alpn)
+		require.NoError(t, err)
+		t.Cleanup(func() { socks[i].Close() })
+		tcp[i], err = portshare.NewTCPWithALPN(opts.TCP4, alpn)
+		require.NoError(t, err)
+		t.Cleanup(func() { tcp[i].Close() })
+		opts.UDP4, opts.TCP4 = socks[i].Mesh(), tcp[i].Mesh()
 	}
 	meter := &countingMeshSocket{SharedSocket: socks[1].Mesh()}
 	f.opts[1].Transport.UDP4 = meter
@@ -212,7 +217,10 @@ func TestShareSitesAndPolicy(t *testing.T) {
 			t.Fatal("inner IP delivery timeout")
 		}
 	}
-	require.NoError(t, a.ConnectPeer(t.Context(), f.ips[1]))
+	ep := addrPort(f.sockets[1].LocalAddr())
+	peer, err := a.ConnectEndpoint(t.Context(), Endpoint{"udp", ep})
+	require.NoError(t, err)
+	require.Equal(t, b.id, peer)
 	deliver()
 	for _, name := range names {
 		get(web3, name, "HTTP/3.0")
@@ -220,7 +228,7 @@ func TestShareSitesAndPolicy(t *testing.T) {
 		get(web1, name, "HTTP/1.1")
 	}
 	get(mkH3(quic.Version2), names[0], "HTTP/3.0")
-	bad := &tls.Config{NextProtos: []string{meshwire.ALPN}, MinVersion: tls.VersionTLS13, RootCAs: f.nodes[0].roots, ServerName: f.ips[1].String()}
+	bad := &tls.Config{NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13, RootCAs: f.nodes[0].roots, ServerName: f.ips[1].String()}
 	badCtx, stopBad := context.WithTimeout(t.Context(), 2*time.Second)
 	badConn, badErr := siteTr.Dial(badCtx, f.sockets[1].LocalAddr(), bad, &quic.Config{Versions: []quic.Version{quic.Version1}})
 	if badErr == nil {
@@ -234,12 +242,15 @@ func TestShareSitesAndPolicy(t *testing.T) {
 	stopBad()
 	require.ErrorContains(t, badErr, "certificate")
 	deliver()
-	p, e := a.dialEndpoint(t.Context(), f.cfg.Members[1].ID, Endpoint{"tcp", netip.MustParseAddrPort(remote)})
-	require.NoError(t, e)
-	require.Equal(t, "tcp", p.kind)
+	peer, err = a.ConnectEndpoint(t.Context(), Endpoint{"tcp", ep})
+	require.NoError(t, err)
+	require.Equal(t, b.id, peer)
+	require.True(t, slices.ContainsFunc(a.Paths(), func(p PathStatus) bool {
+		return p.Transport == "tcp" && p.ALPN == alpn
+	}))
 	require.Eventually(t, func() bool {
 		return slices.ContainsFunc(b.Paths(), func(p PathStatus) bool {
-			return p.Transport == "udp" && p.Endpoint == addrPort(f.sockets[0].LocalAddr())
+			return p.Transport == "udp" && p.ALPN == alpn && p.Endpoint == addrPort(f.sockets[0].LocalAddr())
 		})
 	}, time.Second, time.Millisecond)
 	t.Logf("two transports, three SNI certificates, H1/H2/H3 and mesh; H3 and mesh UDP share %s -> %s", f.sockets[0].LocalAddr(), remote)

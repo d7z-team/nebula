@@ -2,12 +2,15 @@
 package nebula
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"slices"
@@ -20,7 +23,6 @@ import (
 	"gopkg.d7z.net/nebula/pki"
 
 	quic "github.com/quic-go/quic-go"
-	"golang.org/x/time/rate"
 )
 
 var (
@@ -43,7 +45,8 @@ type Options struct {
 	Auth      AuthOptions
 	Transport TransportOptions
 	Topology  Topology
-	// MaintenanceInterval sets the cadence of neighbor and path maintenance. Zero selects two seconds.
+	Probe     ProbeOptions
+	// MaintenanceInterval sets the cadence of neighbor retries and expiry cleanup. Zero selects two seconds.
 	MaintenanceInterval time.Duration
 	// DialTimeout is the base timeout for dialing, handshakes, control exchanges
 	// and transport writes. Circuit setup budgets one timeout per remaining hop.
@@ -56,12 +59,27 @@ type Options struct {
 	// MaxCircuits limits concurrent relay circuits originating, terminating or
 	// forwarding at this node, including circuits under construction. Zero selects 512.
 	MaxCircuits int
+	// InboundCircuitLimits caps circuit reservations made by authenticated neighbors.
+	InboundCircuitLimits InboundCircuitLimits
+	// RelayWeights sets relative byte shares for backlogged relay traffic by
+	// authenticated ingress neighbor. All circuits from the neighbor share its
+	// weight. Missing or zero values use weight one.
+	RelayWeights map[PeerID]uint16
 	// MaxIPSize bounds a complete inner packet in bytes and is advertised to authenticated peers.
 	// The range is 1280 through 65535. Zero selects 65535.
 	MaxIPSize int
 	// InboundPolicy optionally filters authenticated, address-authorized IP packets.
 	// Calls run on receive tasks and may overlap.
 	InboundPolicy func(peer PeerID, source, destination netip.Addr) bool
+}
+
+// ProbeOptions configures authenticated health checks for each established path.
+type ProbeOptions struct {
+	// Interval sets the target time between probes. Zero inherits MaintenanceInterval.
+	Interval time.Duration
+	// FailureThreshold closes a path after this many consecutive failed probes.
+	// A successful probe resets the count. Zero selects three.
+	FailureThreshold int
 }
 
 // AuthOptions sets the node's trust anchors, local credentials and chain policy.
@@ -99,9 +117,16 @@ type EndpointCandidate struct {
 	Observer PeerID
 }
 
-// TransportOptions specifies physical listeners, outbound TCP dialing and
-// the endpoints this node publishes in its signed introductions.
+// TransportOptions configures mesh handshakes, physical transports and advertised endpoints.
 type TransportOptions struct {
+	// ALPN is the TLS application protocol for TCP, QUIC and end-to-end relay
+	// sessions. Empty selects meshwire.ALPN. Peers and port sharers must use
+	// the same identifier (1 to 255 bytes).
+	ALPN string
+	// CurvePreferences is the set of TLS key exchange groups allowed for inbound
+	// and outbound TCP, QUIC and end-to-end relay sessions. An empty set uses
+	// the crypto/tls defaults. Go chooses the group in its own preference order.
+	CurvePreferences []tls.CurveID
 	// UDP sockets carry QUIC and hole punches for their respective address families.
 	// Sockets implementing meshwire.SharedSocket configure the node's QUIC transport at startup.
 	UDP4, UDP6 net.PacketConn
@@ -172,12 +197,10 @@ type Node struct {
 	grantWrites            map[chan struct{}]struct{} // in-flight grant frames, protected by mu
 	sizeQuery              []byte
 	routeCursors           map[PeerID]*routeCursor
-	probeSlots             chan struct{}
+	probes                 probeBatch
 	circuits               map[*circuitLease]struct{}
-	limiter                *rate.Limiter
-	rateCtx                context.Context
-	rateCancel             context.CancelFunc
-	bytesScheduled         atomic.Uint64
+	relay                  RelayStatus
+	shaper                 fairShaper
 	dialFailures           atomic.Uint64
 	publications           map[string]cachedPublication
 	subscriptions          map[*Subscription]struct{}
@@ -202,6 +225,67 @@ func (s lifecycle) runningError() error {
 	default:
 		return nil
 	}
+}
+
+// prepareRuntime validates limits and takes ownership of the runtime option slices and maps.
+func (o *Options) prepareRuntime(view *topologyView) error {
+	if o.MaintenanceInterval < 0 {
+		return errors.New("negative MaintenanceInterval")
+	}
+	o.MaintenanceInterval = cmp.Or(o.MaintenanceInterval, 2*time.Second)
+	if o.Probe.Interval < 0 {
+		return errors.New("negative Probe.Interval")
+	}
+	o.Probe.Interval = cmp.Or(o.Probe.Interval, o.MaintenanceInterval)
+	if o.Probe.FailureThreshold < 0 {
+		return errors.New("negative Probe.FailureThreshold")
+	}
+	o.Probe.FailureThreshold = cmp.Or(o.Probe.FailureThreshold, 3)
+	if o.DialTimeout < 0 {
+		return errors.New("negative DialTimeout")
+	}
+	o.DialTimeout = cmp.Or(o.DialTimeout, 4*time.Second)
+	if o.MaxInboundHandshakes < 0 {
+		return errors.New("negative MaxInboundHandshakes")
+	}
+	o.MaxInboundHandshakes = cmp.Or(o.MaxInboundHandshakes, 256)
+	if o.MaxCircuits < 0 {
+		return errors.New("negative MaxCircuits")
+	}
+	o.MaxCircuits = cmp.Or(o.MaxCircuits, 512)
+	if o.InboundCircuitLimits.Default < 0 {
+		return errors.New("negative default inbound circuit limit")
+	}
+	for peer, limit := range o.InboundCircuitLimits.ByPeer {
+		if peer == (PeerID{}) || limit < 0 {
+			return errors.New("invalid inbound circuit limit for peer")
+		}
+	}
+	o.InboundCircuitLimits.ByPeer = maps.Clone(o.InboundCircuitLimits.ByPeer)
+	if _, ok := o.RelayWeights[PeerID{}]; ok {
+		return errors.New("invalid neighbor in RelayWeights")
+	}
+	o.RelayWeights = maps.Clone(o.RelayWeights)
+	o.MaxIPSize = cmp.Or(o.MaxIPSize, MaxIPPacketSize)
+	if o.MaxIPSize < 1280 || o.MaxIPSize > MaxIPPacketSize {
+		return errors.New("invalid IP size")
+	}
+	alpn, err := meshwire.ResolveALPN(o.Transport.ALPN)
+	if err != nil {
+		return err
+	}
+	o.Transport.ALPN = alpn
+	o.Transport.CurvePreferences = slices.Clone(o.Transport.CurvePreferences)
+	if o.Transport.DialTCP == nil {
+		o.Transport.DialTCP = (&net.Dialer{}).DialContext
+	}
+	for _, ep := range o.Transport.AdvertiseEndpoints {
+		if !view.physicalEndpoint(ep) {
+			return fmt.Errorf("invalid advertised physical endpoint %v", ep)
+		}
+	}
+	o.Transport.AdvertiseEndpoints = slices.Clone(o.Transport.AdvertiseEndpoints)
+	return nil
 }
 
 // New creates a node with the supplied credentials and topology. On success,
@@ -245,45 +329,9 @@ func New(parent context.Context, o Options) (*Node, error) {
 	}
 	o.Auth.TrustedEntrypoints = slices.Clone(o.Auth.TrustedEntrypoints)
 	o.Auth.Certificates = LocalCertificates{}
-	if o.MaintenanceInterval < 0 {
-		return nil, errors.New("negative MaintenanceInterval")
+	if err := o.prepareRuntime(view); err != nil {
+		return nil, err
 	}
-	if o.MaintenanceInterval == 0 {
-		o.MaintenanceInterval = 2 * time.Second
-	}
-	if o.DialTimeout < 0 {
-		return nil, errors.New("negative DialTimeout")
-	}
-	if o.DialTimeout == 0 {
-		o.DialTimeout = 4 * time.Second
-	}
-	if o.MaxInboundHandshakes < 0 {
-		return nil, errors.New("negative MaxInboundHandshakes")
-	}
-	if o.MaxInboundHandshakes == 0 {
-		o.MaxInboundHandshakes = 256
-	}
-	if o.MaxCircuits < 0 {
-		return nil, errors.New("negative MaxCircuits")
-	}
-	if o.MaxCircuits == 0 {
-		o.MaxCircuits = 512
-	}
-	if o.MaxIPSize == 0 {
-		o.MaxIPSize = MaxIPPacketSize
-	}
-	if o.MaxIPSize < 1280 || o.MaxIPSize > MaxIPPacketSize {
-		return nil, errors.New("invalid IP size")
-	}
-	if o.Transport.DialTCP == nil {
-		o.Transport.DialTCP = (&net.Dialer{}).DialContext
-	}
-	for _, ep := range o.Transport.AdvertiseEndpoints {
-		if !view.physicalEndpoint(ep) {
-			return nil, fmt.Errorf("invalid advertised physical endpoint %v", ep)
-		}
-	}
-	o.Transport.AdvertiseEndpoints = slices.Clone(o.Transport.AdvertiseEndpoints)
 	ctx, cancel := context.WithCancel(parent)
 	n := &Node{
 		roots: roots, clusterFingerprint: fingerprint,
@@ -298,8 +346,9 @@ func New(parent context.Context, o Options) (*Node, error) {
 		attempts:               make(map[PeerID]*peerAttempt),
 		directDials:            make(map[endpointDialKey]*endpointAttempt),
 		deniedUDP:              make(map[netip.AddrPort]deniedEndpoint),
+		shaper:                 fairShaper{weights: o.RelayWeights},
+		relay:                  RelayStatus{InboundCircuits: make(map[PeerID]int)},
 		routeCursors:           make(map[PeerID]*routeCursor),
-		probeSlots:             make(chan struct{}, 4),
 		circuits:               make(map[*circuitLease]struct{}),
 		discovered:             make(map[PeerID]learnedIntroduction),
 		discoveredOwners:       make(map[netip.Addr]PeerID),
@@ -337,7 +386,7 @@ func New(parent context.Context, o Options) (*Node, error) {
 	}
 	n.cred.Store(c)
 	n.policy.Store(view)
-	n.setShapingRate(view.members[n.id].BytesPerSecond)
+	n.shaper.setRate(n.ctx, view.members[n.id].BytesPerSecond)
 	return n, nil
 }
 
@@ -478,6 +527,7 @@ func (n *Node) Close() error {
 	n.cancel()
 	sessions := n.sessionListLocked()
 	clear(n.peers)
+	n.probes.pending = nil
 	p := n.port
 	for sub := range n.subscriptions {
 		close(sub.publications)

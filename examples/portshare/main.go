@@ -26,26 +26,35 @@ import (
 
 func main() {
 	port := flag.Uint("port", 0, "loopback TCP and UDP port (0 selects an available port)")
+	alpn := flag.String("alpn", "", "mesh ALPN (empty uses the node default)")
 	maxHandshakes := flag.Int("max-inbound-handshakes", 0, "mesh node concurrent inbound handshakes (0 uses the node default)")
 	flag.Parse()
-	if err := run(*port, *maxHandshakes); err != nil {
+	if err := run(*port, *maxHandshakes, *alpn); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(port uint, maxHandshakes int) error {
+func run(port uint, maxHandshakes int, alpn string) error {
 	listener, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return err
 	}
-	tcp := portshare.NewTCP(listener)
+	tcp, err := portshare.NewTCPWithALPN(listener, alpn)
+	if err != nil {
+		listener.Close()
+		return err
+	}
 	defer tcp.Close()
 	addr := listener.Addr().(*net.TCPAddr).AddrPort()
 	socket, err := net.ListenPacket("udp4", addr.String())
 	if err != nil {
 		return err
 	}
-	udp := portshare.NewUDP(socket)
+	udp, err := portshare.NewUDPWithALPN(socket, alpn)
+	if err != nil {
+		socket.Close()
+		return err
+	}
 	defer udp.Close()
 
 	server, client := demo.NewHost(1), demo.NewHost(2)
@@ -65,6 +74,7 @@ func run(port uint, maxHandshakes int) error {
 	defer cancel()
 	var peer *nebula.Node
 	for _, o := range options {
+		o.Transport.ALPN = alpn
 		peer, err = nebula.New(ctx, o)
 		if err != nil {
 			return err
@@ -97,7 +107,11 @@ func run(port uint, maxHandshakes int) error {
 	if err := peer.ConnectPeer(ctx, server.IPv4); err != nil {
 		return errors.Join(err, context.Cause(ctx))
 	}
-	fmt.Printf("mesh peer %s connected on %s\n", server.IPv4, addr)
+	path, ok := peer.PreferredPath(server.ID)
+	if !ok {
+		return errors.New("mesh path unavailable after connect")
+	}
+	fmt.Printf("mesh peer %s connected on %s with ALPN %q\n", server.IPv4, addr, path.ALPN)
 	h2Client := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: names[0]}, ForceAttemptHTTP2: true}
 	defer h2Client.CloseIdleConnections()
 	h3Client := &http3.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: names[1]}}

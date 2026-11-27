@@ -40,14 +40,50 @@ const (
 
 type qStream struct {
 	*quic.Stream
-	q *quic.Conn
+	q       *quic.Conn
+	mu      sync.Mutex
+	writers int
+	closed  bool
 }
 
-func (s qStream) LocalAddr() net.Addr  { return s.q.LocalAddr() }
-func (s qStream) RemoteAddr() net.Addr { return s.q.RemoteAddr() }
+func (s *qStream) LocalAddr() net.Addr  { return s.q.LocalAddr() }
+func (s *qStream) RemoteAddr() net.Addr { return s.q.RemoteAddr() }
 
-// A request owns both directions of a stream; closing also releases an unread response.
-func (s qStream) Close() error { s.CancelRead(0); return s.Stream.Close() }
+func (s *qStream) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	s.writers++
+	s.mu.Unlock()
+
+	n, err := s.Stream.Write(p)
+	s.mu.Lock()
+	s.writers--
+	s.mu.Unlock()
+	return n, err
+}
+
+func (s *qStream) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	writing := s.writers > 0
+	s.mu.Unlock()
+
+	s.CancelRead(0)
+	// QUIC FIN preserves completed writes. A concurrent Write needs a reset
+	// to unblock locally, even when the peer has stopped reading.
+	if writing {
+		s.CancelWrite(0)
+		return nil
+	}
+	return s.Stream.Close()
+}
 
 type session struct {
 	acknowledgedIntro             atomic.Int64
@@ -55,7 +91,6 @@ type session struct {
 	localGrant, remoteGrant       []*x509.Certificate
 	localNode                     *x509.Certificate
 	until                         time.Time // protected by n.mu
-	probing                       bool      // protected by n.mu
 	n                             *Node
 	ctx                           context.Context
 	cancel                        context.CancelFunc
@@ -79,7 +114,10 @@ type session struct {
 	failures                      int
 	loss                          float64
 	sent, lost                    uint64
+	probing                       bool      // protected by n.mu
+	confirmProbe                  bool      // a collision requires a fresh ping; protected by n.mu
 	lastProbe                     time.Time // protected by n.mu
+	nextHello                     time.Time // local introduction refresh or retry; protected by n.mu
 	dataMu                        sync.Mutex
 	data                          net.Conn
 	budget                        atomic.Int64
@@ -102,7 +140,7 @@ func (s *session) open(ctx context.Context) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return qStream{st, s.q}, nil
+		return &qStream{Stream: st, q: s.q}, nil
 	}
 	return s.mux.OpenStream()
 }
@@ -141,13 +179,16 @@ func (n *Node) attachQUIC(parent context.Context, q *quic.Conn, peer PeerID, out
 		stream, err = q.AcceptStream(ctx)
 	}
 	if err == nil {
+		c := &qStream{Stream: stream, q: q}
 		deadline, _ := ctx.Deadline()
-		stream.SetDeadline(deadline)
-		stop := context.AfterFunc(ctx, func() { stream.CancelRead(0); stream.CancelWrite(0) })
-		err = s.exchangeGrants(ctx, stream, snapshot)
+		c.SetDeadline(deadline)
+		stop := context.AfterFunc(ctx, func() { c.Close() })
+		err = s.exchangeGrants(ctx, c, snapshot)
 		stop()
-		// Release any unread bytes on the reserved stream.
-		qStream{stream, q}.Close()
+		c.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
 	}
 	if err != nil {
 		s.close()
@@ -194,7 +235,13 @@ func (n *Node) attachTLS(ctx context.Context, raw net.Conn, peer PeerID, path []
 	cfgMux.LogOutput = io.Discard
 	cfgMux.EnableKeepAlive = false
 	cfgMux.AcceptBacklog = maxSessionStreams
-	cfgMux.StreamOpenTimeout = n.o.DialTimeout
+	// An unacknowledged yamux SYN closes the entire multiplexed session.
+	// On a relay, individual requests can time out while other streams progress.
+	if len(path) == 0 {
+		cfgMux.StreamOpenTimeout = n.o.DialTimeout
+	} else {
+		cfgMux.StreamOpenTimeout = max(cfgMux.StreamOpenTimeout, n.o.DialTimeout)
+	}
 	cfgMux.ConnectionWriteTimeout = n.o.DialTimeout
 	if out {
 		s.mux, err = yamux.Client(t, cfgMux)
@@ -246,6 +293,7 @@ func (n *Node) register(s *session) (*session, error) {
 	}
 	s.registeredAt = time.Now()
 	s.lastAlive = s.registeredAt
+	s.lastProbe = s.registeredAt
 	paths := n.peers[s.peer]
 	firstPath := paths == nil
 	if firstPath {
@@ -308,6 +356,7 @@ func (n *Node) register(s *session) (*session, error) {
 			}
 		})
 	}
+	n.requestProbeLocked(s)
 	port := n.port
 	n.mu.Unlock()
 	if firstPath && port != nil {
@@ -339,7 +388,7 @@ func (n *Node) serveSession(s *session) {
 			var st *quic.Stream
 			st, err = s.q.AcceptStream(s.ctx)
 			if err == nil {
-				c = qStream{st, s.q}
+				c = &qStream{Stream: st, q: s.q}
 			}
 		} else {
 			c, err = s.mux.AcceptStreamWithContext(s.ctx)
@@ -455,7 +504,8 @@ func (n *Node) handleStream(s *session, c net.Conn) {
 			return
 		}
 		n.receiveAdvert(s, a)
-		out, _ := json.Marshal(n.advert(s))
+		reply, _ := n.advert(s)
+		out, _ := json.Marshal(reply)
 		if n.usable(s) {
 			writeFrame(c, out)
 		}

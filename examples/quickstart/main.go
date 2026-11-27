@@ -4,6 +4,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"flag"
 	"fmt"
 	"log"
 	"time"
@@ -13,15 +15,26 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	hybrid := flag.Bool("hybrid", false, "require X25519MLKEM768 on both nodes")
+	flag.Parse()
+	if err := run(*hybrid); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run() error {
+func run(hybrid bool) error {
 	a, b := demo.NewHost(1), demo.NewHost(2)
 	b.PublishTopics = []string{"app/demo"}
-	nodes, err := demo.NewNodes(context.Background(), "udp", a, b)
+	options, err := demo.NodeOptions(a, b)
+	if err != nil {
+		return err
+	}
+	if hybrid {
+		for i := range options {
+			options[i].Transport.CurvePreferences = []tls.CurveID{tls.X25519MLKEM768}
+		}
+	}
+	nodes, err := demo.Listen(context.Background(), "udp", options)
 	if err != nil {
 		return err
 	}
@@ -40,9 +53,14 @@ func run() error {
 		return err
 	}
 	defer sub.Close()
-	if err := bob.ConnectPeer(ctx, a.IPv6); err != nil {
+	if err := bob.ConnectPeerID(ctx, a.ID); err != nil {
 		return err
 	}
+	path, ok := bob.PreferredPath(a.ID)
+	if !ok || path.Transport != "udp" {
+		return fmt.Errorf("expected a direct UDP path to Alice, got %q", path.Transport)
+	}
+	fmt.Printf("connected to Alice over %s with %s\n", path.Transport, path.TLSGroup)
 	id, err := bob.Publish(ctx, "app/demo/hello", []byte("hello"))
 	if err != nil {
 		return err

@@ -27,6 +27,10 @@ type CAProfile struct {
 	NotBefore, NotAfter time.Time
 	MaxPathLen          int
 	Scope               *Scope
+	// SignatureAlgorithm selects how the issuer signs this CA certificate.
+	// Zero lets crypto/x509 choose the signature algorithm for that key.
+	// An explicit signature must pass x509.Certificate.CheckSignatureFrom.
+	SignatureAlgorithm x509.SignatureAlgorithm
 	// PermittedIPs defines one prefix per family on a cluster CA. Issuers
 	// below it must explicitly delegate member addresses in both families.
 	PermittedIPs []netip.Prefix
@@ -58,26 +62,41 @@ func (ca Issuer) authority(at time.Time) (*x509.Certificate, error) {
 	return ca.Chain[0], nil
 }
 
-func issue(template, parent *x509.Certificate, pub crypto.PublicKey, key crypto.Signer) (*x509.Certificate, error) {
+func signCertificate(template, issuer *x509.Certificate, subjectKey crypto.PublicKey, signer crypto.Signer) (*x509.Certificate, error) {
 	// DER encodes certificate validity to whole seconds. Validate the interval
 	// that relying parties will actually see.
 	template.NotBefore = template.NotBefore.Truncate(time.Second)
 	template.NotAfter = template.NotAfter.Truncate(time.Second)
-	if !template.NotAfter.After(template.NotBefore) || template.NotBefore.Before(parent.NotBefore) || template.NotAfter.After(parent.NotAfter) {
+	if !template.NotAfter.After(template.NotBefore) || template.NotBefore.Before(issuer.NotBefore) || template.NotAfter.After(issuer.NotAfter) {
 		return nil, errors.New("invalid certificate interval")
 	}
-	der, err := x509.CreateCertificate(rand.Reader, template, parent, pub, key)
+	der, err := x509.CreateCertificate(rand.Reader, template, issuer, subjectKey, signer)
 	if err != nil {
 		return nil, err
 	}
-	return x509.ParseCertificate(der)
+	cert, err := x509.ParseCertificate(der)
+	if err != nil || template.SignatureAlgorithm == x509.UnknownSignatureAlgorithm {
+		return cert, err
+	}
+	// crypto/x509 can sign with legacy algorithms it rejects for certification.
+	if issuer == template {
+		issuer = cert
+	}
+	if err := cert.CheckSignatureFrom(issuer); err != nil {
+		return nil, err
+	}
+	return cert, nil
 }
 
 func caTemplate(p CAProfile) (*x509.Certificate, error) {
 	if p.Subject.String() == "" || p.MaxPathLen < -1 {
 		return nil, errors.New("invalid CA profile")
 	}
-	c := &x509.Certificate{Subject: p.Subject, NotBefore: p.NotBefore, NotAfter: p.NotAfter, IsCA: true, BasicConstraintsValid: true, MaxPathLen: p.MaxPathLen, MaxPathLenZero: p.MaxPathLen == 0, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+	c := &x509.Certificate{
+		Subject: p.Subject, NotBefore: p.NotBefore, NotAfter: p.NotAfter,
+		IsCA: true, BasicConstraintsValid: true, MaxPathLen: p.MaxPathLen, MaxPathLenZero: p.MaxPathLen == 0,
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, SignatureAlgorithm: p.SignatureAlgorithm,
+	}
 	if p.Scope != nil {
 		if len(p.Scope.AnycastIPs) > 0 {
 			return nil, errors.New("CA cannot hold service addresses")
@@ -115,7 +134,7 @@ func CreateRoot(key crypto.Signer, p CAProfile) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	return issue(c, c, key.Public(), key)
+	return signCertificate(c, c, key.Public(), key)
 }
 
 // CreateCSR signs a PKCS#10 request with the applicant's key.
@@ -182,7 +201,7 @@ func (ca Issuer) IssueCA(csr *x509.CertificateRequest, p CAProfile, approvedKeyH
 	if err := checkDelegatedRanges(c, ca.Chain, cluster != nil); err != nil {
 		return nil, err
 	}
-	return issue(c, parent, csr.PublicKey, ca.Signer)
+	return signCertificate(c, parent, csr.PublicKey, ca.Signer)
 }
 
 // IssueGrant checks the CSR signature and approved public key hash, then issues
@@ -218,7 +237,7 @@ func (ca Issuer) IssueGrant(csr *x509.CertificateRequest, e Enrollment) (*x509.C
 			return nil, err
 		}
 	}
-	leaf, err := issue(t, parent, csr.PublicKey, ca.Signer)
+	leaf, err := signCertificate(t, parent, csr.PublicKey, ca.Signer)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +278,7 @@ func (ca Issuer) IssueNode(csr *x509.CertificateRequest, approved [32]byte, star
 		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		UnknownExtKeyUsage: []asn1.ObjectIdentifier{nodeUsage},
 	}
-	node, err := issue(template, root, csr.PublicKey, ca.Signer)
+	node, err := signCertificate(template, root, csr.PublicKey, ca.Signer)
 	if err != nil {
 		return nil, err
 	}

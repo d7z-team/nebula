@@ -9,8 +9,20 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// ALPN is the TLS application protocol identifier for mesh connections over TCP and QUIC.
+// ALPN is the default TLS application protocol identifier for mesh connections.
 const ALPN = "nebula-mesh"
+
+// ResolveALPN returns ALPN for an empty identifier. A custom identifier may
+// contain up to 255 bytes, as specified by RFC 7301.
+func ResolveALPN(id string) (string, error) {
+	if id == "" {
+		return ALPN, nil
+	}
+	if len(id) > 255 {
+		return "", errors.New("ALPN identifier exceeds 255 bytes")
+	}
+	return id, nil
+}
 
 // SharedSocket is the mesh branch of a shared UDP socket.
 type SharedSocket interface {

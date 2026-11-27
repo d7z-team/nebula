@@ -3,82 +3,139 @@ package nebula
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
+	"maps"
 	"net"
 	"slices"
-	"sync"
 	"time"
 )
 
 const (
 	circuitReady byte = 0x01
 
-	maxCircuitNodes    = 16
-	maxCircuitAttempts = 8
-	maxSearchEdges     = 4096
+	maxCircuitNodes = 16
 )
+
+// InboundCircuitLimits applies to both terminating and forwarding circuits.
+type InboundCircuitLimits struct {
+	// Default is the per-neighbor ceiling. Zero uses the node's total capacity.
+	Default int
+	// ByPeer overrides Default by authenticated neighbor, including across sessions.
+	ByPeer map[PeerID]int
+}
+
+// RelayStatus is a snapshot of local circuit admission and maintenance.
+type RelayStatus struct {
+	Draining bool
+	// TransitCircuits includes forwarding circuits under construction.
+	TransitCircuits int
+	// InboundCircuits counts live inbound reservations by the requesting neighbor.
+	InboundCircuits map[PeerID]int
+	// Rejections are cumulative over this Node's lifetime.
+	RejectedCapacity, RejectedPeerLimit, RejectedDraining uint64
+}
+
+// RelayStatus reports current reservations and cumulative admission rejections.
+func (n *Node) RelayStatus() RelayStatus {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	status := n.relay
+	status.InboundCircuits = maps.Clone(status.InboundCircuits)
+	return status
+}
+
+// SetTransitDraining controls admission of new forwarding circuits at this node.
+// Existing reservations continue until closed or their authorization is withdrawn.
+func (n *Node) SetTransitDraining(draining bool) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state == closed || n.ctx.Err() != nil {
+		return ErrNodeClosed
+	}
+	n.relay.Draining = draining
+	return nil
+}
 
 type circuitRequest struct {
 	Path []PeerID `json:"path"`
 }
 
 type circuitLease struct {
-	n      *Node
-	ctx    context.Context
-	cancel context.CancelFunc
-	path   []PeerID
-	mu     sync.Mutex
-	legs   []*session // adjacent direct sessions, protected by n.mu
-	ends   []net.Conn
-	closed bool
+	n       *Node
+	ctx     context.Context
+	cancel  context.CancelFunc
+	path    []PeerID
+	legs    []*session // adjacent direct sessions, protected by n.mu
+	ends    []net.Conn // streams owned by this reservation, protected by n.mu
+	inbound PeerID
+	transit bool
 }
 
 func (l *circuitLease) reserve() bool {
 	n := l.n
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if len(n.circuits) >= n.o.MaxCircuits {
+	l.ctx = n.ctx
+	if !l.allowedLocked() {
 		return false
+	}
+	if l.transit && n.relay.Draining {
+		n.relay.RejectedDraining++
+		return false
+	}
+	if len(n.circuits) >= n.o.MaxCircuits {
+		n.relay.RejectedCapacity++
+		return false
+	}
+	if l.inbound != (PeerID{}) {
+		limit, ok := n.o.InboundCircuitLimits.ByPeer[l.inbound]
+		if !ok {
+			limit = n.o.InboundCircuitLimits.Default
+		}
+		if limit > 0 && n.relay.InboundCircuits[l.inbound] >= limit {
+			n.relay.RejectedPeerLimit++
+			return false
+		}
+		n.relay.InboundCircuits[l.inbound]++
+	}
+	if l.transit {
+		n.relay.TransitCircuits++
 	}
 	l.ctx, l.cancel = context.WithCancel(n.ctx)
-	if !l.allowedLocked() {
-		l.cancel()
-		return false
-	}
 	n.circuits[l] = struct{}{}
 	return true
 }
 
-func (l *circuitLease) bind(c net.Conn) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
-		c.Close()
-		return false
-	}
-	l.ends = append(l.ends, c)
-	return true
-}
-
 func (l *circuitLease) close() {
-	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
+	n := l.n
+	n.mu.Lock()
+	if l.cancel == nil {
+		n.mu.Unlock()
 		return
 	}
-	l.closed = true
 	l.cancel()
+	l.cancel = nil
 	ends := l.ends
-	l.mu.Unlock()
+	n.mu.Unlock()
 	for _, c := range ends {
 		// A yamux stream may keep reading after a local FIN.
-		c.SetReadDeadline(time.Now())
+		c.SetDeadline(time.Now())
 		c.Close()
 	}
-	l.n.mu.Lock()
-	delete(l.n.circuits, l)
-	l.n.mu.Unlock()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.circuits, l)
+	if l.transit {
+		n.relay.TransitCircuits--
+	}
+	if l.inbound != (PeerID{}) {
+		counts := n.relay.InboundCircuits
+		counts[l.inbound]--
+		if counts[l.inbound] == 0 {
+			delete(counts, l.inbound)
+		}
+	}
 }
 
 func (l *circuitLease) allowedLocked() bool {
@@ -124,148 +181,8 @@ func (n *Node) circuitAllowedLocked(path []PeerID) bool {
 	return true
 }
 
-// routeCursor enumerates simple paths in increasing hop count. Only the bounded
-// traversal stack survives between attempts; the topology owns the adjacency lists.
-type routeCursor struct {
-	mu    sync.Mutex
-	depth int
-	path  []PeerID
-	edge  [maxCircuitNodes]int
-}
-
-// next resumes after the last examined edge, even when a work budget expires.
-func (r *routeCursor) next(p *topologyView, source, target PeerID, distance map[PeerID]int, work *int) []PeerID {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.depth == 0 {
-		r.depth = 3
-	}
-	for r.depth <= min(maxCircuitNodes, len(p.members)) {
-		if len(r.path) == 0 {
-			r.path = append(r.path, source)
-		}
-		for len(r.path) > 0 {
-			i := len(r.path) - 1
-			links := p.members[r.path[i]].Links
-			if r.edge[i] >= len(links) {
-				r.edge[i] = 0
-				r.path = r.path[:i]
-				continue
-			}
-			if *work == 0 {
-				return nil
-			}
-			(*work)--
-			next := links[r.edge[i]]
-			r.edge[i]++
-			left := r.depth - i - 2
-			if next == target {
-				if left == 0 {
-					return append(slices.Clone(r.path), next)
-				}
-				continue
-			}
-			hops, reachable := distance[next]
-			if reachable && hops <= left && p.members[next].Transit && !slices.Contains(r.path, next) {
-				r.path = append(r.path, next)
-			}
-		}
-		r.depth++
-	}
-	r.depth = 0
-	return nil
-}
-
-func (n *Node) dialRelay(ctx context.Context, target PeerID, attempts int) error {
-	n.mu.Lock()
-	p := n.policy.Load()
-	if !n.memberOf(p) || !n.modeLocked(target).allowsRelay() {
-		n.mu.Unlock()
-		return ErrPathPolicy
-	}
-	n.mu.Unlock()
-	if len(p.members[n.id].Links) == 0 || len(p.members[target].Links) == 0 {
-		return ErrPeerUnavailable
-	}
-
-	// Reverse distances prune branches that cannot reach the destination
-	// within the remaining depth. Never route back through the origin.
-	distance := map[PeerID]int{target: 0}
-	queue := []PeerID{target}
-	for len(queue) > 0 {
-		peer := queue[0]
-		queue = queue[1:]
-		if distance[peer] >= maxCircuitNodes-2 {
-			continue
-		}
-		for _, id := range p.members[peer].Links {
-			if _, seen := distance[id]; !seen && id != n.id && p.members[id].Transit {
-				distance[id] = distance[peer] + 1
-				queue = append(queue, id)
-			}
-		}
-	}
-	// A relay route must start with a transit neighbor that can reach target.
-	if !slices.ContainsFunc(p.members[n.id].Links, func(id PeerID) bool { return distance[id] > 0 }) {
-		return ErrPeerUnavailable
-	}
-	n.mu.Lock()
-	if n.policy.Load() != p {
-		n.mu.Unlock()
-		return ErrPathPolicy
-	}
-	cursor, resumed := n.routeCursors[target]
-	if !resumed {
-		cursor = &routeCursor{}
-		n.routeCursors[target] = cursor
-	}
-	n.mu.Unlock()
-	work := maxSearchEdges
-	var last error
-	for attempts > 0 && work > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		path := cursor.next(p, n.id, target, distance, &work)
-		if n.policy.Load() != p {
-			return ErrPathPolicy
-		}
-		if path == nil {
-			// A previous call may have spent its last attempt on the last
-			// candidate. Start a fresh pass within this call's remaining budget.
-			if resumed && work > 0 {
-				resumed = false
-				continue
-			}
-			break
-		}
-		resumed = false
-		n.mu.Lock()
-		paths := n.peers[target]
-		established := paths != nil && slices.ContainsFunc(paths.sessions, func(s *session) bool {
-			return slices.Equal(s.path, path) && !s.closed.Load() && n.sessionAllowedLocked(s)
-		})
-		n.mu.Unlock()
-		if established {
-			continue
-		}
-		attempts--
-		dialCtx, cancel := context.WithTimeout(ctx, n.o.DialTimeout*time.Duration(len(path)))
-		last = n.startCircuit(dialCtx, path)
-		cancel()
-		if last == nil {
-			n.mu.Lock()
-			if n.routeCursors[target] == cursor {
-				delete(n.routeCursors, target)
-			}
-			n.mu.Unlock()
-			return nil
-		}
-	}
-	return errors.Join(ErrPeerUnavailable, last)
-}
-
-func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.Conn, error) {
+func (l *circuitLease) openNextLeg(ctx context.Context, next PeerID) (net.Conn, error) {
+	n := l.n
 	s := n.preferredSession(next, true)
 	if s == nil {
 		var err error
@@ -285,17 +202,17 @@ func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.C
 	if err != nil {
 		return nil, err
 	}
-	ok := false
-	defer func() {
-		if !ok {
-			c.Close()
-		}
-	}()
-	deadline := time.Now().Add(n.o.DialTimeout)
-	if t, yes := ctx.Deadline(); yes {
-		deadline = t
-	}
+	deadline, _ := ctx.Deadline() // Both callers budget for the remaining hops.
 	c.SetDeadline(deadline)
+	// Own the stream before requesting the route so withdrawal interrupts the ready wait.
+	n.mu.Lock()
+	if !l.allowedLocked() {
+		n.mu.Unlock()
+		c.Close()
+		return nil, ErrPathPolicy
+	}
+	l.ends = append(l.ends, c)
+	n.mu.Unlock()
 	if _, err = c.Write([]byte{opCircuit}); err != nil {
 		return nil, err
 	}
@@ -310,33 +227,31 @@ func (n *Node) openLeg(ctx context.Context, next PeerID, l *circuitLease) (net.C
 	if ack[0] != circuitReady {
 		return nil, ErrPathPolicy
 	}
-	c.SetDeadline(time.Time{})
-	ok = true
 	return c, nil
 }
 
-func (n *Node) startCircuit(ctx context.Context, path []PeerID) error {
+func (n *Node) startCircuit(path []PeerID) error {
 	l := &circuitLease{n: n, path: path}
 	if len(path) == 0 || path[0] != n.id || !l.reserve() {
 		return ErrPathPolicy
 	}
-	c, err := n.openLeg(ctx, path[1], l)
+	ctx, cancel := context.WithTimeout(l.ctx, n.o.DialTimeout*time.Duration(len(path)))
+	defer cancel()
+	c, err := l.openNextLeg(ctx, path[1])
 	if err != nil {
 		l.close()
 		return err
 	}
-	if !l.bind(c) {
-		return ErrPathPolicy
-	}
-	return n.attachCircuit(ctx, c, l, true)
+	return l.attachEndpoint(ctx, c, true)
 }
 
-func (n *Node) attachCircuit(ctx context.Context, c net.Conn, l *circuitLease, out bool) error {
-	path := slices.Clone(l.path)
+func (l *circuitLease) attachEndpoint(ctx context.Context, c net.Conn, out bool) error {
+	path := l.path
 	if !out {
+		path = slices.Clone(path)
 		slices.Reverse(path)
 	}
-	s, err := n.attachTLS(ctx, c, path[len(path)-1], path, out, l)
+	s, err := l.n.attachTLS(ctx, c, path[len(path)-1], path, out, l)
 	if err != nil || s.lease != l {
 		l.close()
 	}
@@ -352,61 +267,71 @@ func (n *Node) forwardCircuit(s *session, c net.Conn, b []byte) bool {
 	if pos <= 0 || s.peer != req.Path[pos-1] {
 		return false
 	}
-	l := &circuitLease{n: n, path: req.Path, ends: []net.Conn{c}, legs: []*session{s}}
+	l := &circuitLease{n: n, path: req.Path, inbound: s.peer, transit: pos < len(req.Path)-1, ends: []net.Conn{c}, legs: []*session{s}}
 	if !l.reserve() {
 		return false
 	}
-	if pos == len(req.Path)-1 {
-		if _, err := c.Write([]byte{circuitReady}); err != nil {
+	var next net.Conn
+	if l.transit {
+		// The upstream ready reply waits for all remaining cold legs.
+		ctx, cancel := context.WithTimeout(l.ctx, n.o.DialTimeout*time.Duration(len(req.Path)-pos))
+		deadline, _ := ctx.Deadline()
+		c.SetDeadline(deadline)
+		var err error
+		next, err = l.openNextLeg(ctx, req.Path[pos+1])
+		cancel()
+		if err != nil {
 			l.close()
 			return true
 		}
-		n.attachCircuit(n.ctx, c, l, false)
-		return true
 	}
-	// The upstream ready reply waits for all remaining cold legs.
-	ctx, cancel := context.WithTimeout(l.ctx, n.o.DialTimeout*time.Duration(len(req.Path)-pos))
-	deadline, _ := ctx.Deadline()
-	c.SetDeadline(deadline)
-	next, err := n.openLeg(ctx, req.Path[pos+1], l)
-	cancel()
-	if err != nil {
+	if _, err := c.Write([]byte{circuitReady}); err != nil {
 		l.close()
 		return true
 	}
-	if !l.bind(next) {
-		return true
-	}
-	if _, err = c.Write([]byte{circuitReady}); err != nil {
-		l.close()
+	if !l.transit {
+		l.attachEndpoint(l.ctx, c, false)
 		return true
 	}
 	c.SetDeadline(time.Time{})
+	next.SetDeadline(time.Time{})
 	// The lease owns both streams. Release the incoming request slot once ready.
-	n.wg.Go(func() { l.forward(next, c) })
-	n.wg.Go(func() { l.forward(c, next) })
+	n.wg.Go(func() { l.forward(next, c, relayDirection{s.peer, req.Path[pos+1]}) })
+	n.wg.Go(func() { l.forward(c, next, relayDirection{req.Path[pos+1], s.peer}) })
 	return true
 }
 
-func (l *circuitLease) forward(dst, src net.Conn) {
+func (l *circuitLease) forward(dst, src net.Conn, direction relayDirection) {
 	defer l.close()
 	n := l.n
-	buf := make([]byte, 16<<10)
+	window := n.shaper.openWindow(direction)
+	defer n.shaper.closeWindow(direction)
+	buf := make([]byte, relayBlockSize)
 	for l.ctx.Err() == nil {
 		count, err := src.Read(buf)
-		if count > 0 {
-			if n.shape(l.ctx, count) != nil {
+		for data := buf[:count]; len(data) > 0; {
+			select {
+			case window.slots <- struct{}{}:
+			case <-l.ctx.Done():
+				return
+			}
+			size, err := n.shaper.schedule(l.ctx, direction.from, len(data))
+			if err != nil {
+				<-window.slots
 				return
 			}
 			n.mu.Lock()
 			permit := l.allowedLocked()
 			n.mu.Unlock()
-			if !permit {
+			if permit {
+				_, err = dst.Write(data[:size])
+			}
+			n.shaper.finishWrite(direction.from)
+			<-window.slots
+			if !permit || err != nil {
 				return
 			}
-			if _, err := dst.Write(buf[:count]); err != nil {
-				return
-			}
+			data = data[size:]
 		}
 		if err != nil {
 			return

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,6 +89,56 @@ func TestWireStreams(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, byte(0x01), ack[0])
 	})
+}
+
+func TestQUICStreamCloseDuringWrite(t *testing.T) {
+	f := newFixture(t, "udp", "udp")
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.ID()))
+	s := a.preferredSession(b.ID(), true)
+
+	received, resume := make(chan struct{}), make(chan struct{})
+	defer close(resume)
+	pause := sync.OnceFunc(func() {
+		close(received)
+		<-resume
+	})
+	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) { pause() }})
+	require.NoError(t, err)
+	c, err := s.open(t.Context())
+	require.NoError(t, err)
+	// The receiver stops reading after the first frame of this single write.
+	// The remaining bytes exceed the initial QUIC stream window.
+	var frame bytes.Buffer
+	require.NoError(t, writeFrame(&frame, testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "state")))
+	batch := append([]byte{opIP}, bytes.Repeat(frame.Bytes(), (1<<20)/frame.Len())...)
+	written := make(chan error, 1)
+	go func() {
+		_, err := c.Write(batch)
+		written <- err
+	}()
+	select {
+	case <-received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer did not receive the first frame")
+	}
+	require.NoError(t, c.Close())
+	select {
+	case err := <-written:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("stream close left the writer blocked")
+	}
+
+	// A sibling stream on the same connection delivers its final response and FIN.
+	payload := []byte("still connected")
+	ping, err := s.openRequest(t.Context(), opPing, payload)
+	require.NoError(t, err)
+	defer ping.Close()
+	reply, err := io.ReadAll(ping)
+	require.NoError(t, err)
+	require.Equal(t, append(binary.BigEndian.AppendUint32(nil, uint32(len(payload))), payload...), reply)
 }
 
 func TestWireJSON(t *testing.T) {

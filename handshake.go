@@ -11,7 +11,6 @@ import (
 	"slices"
 	"time"
 
-	"gopkg.d7z.net/nebula/meshwire"
 	"gopkg.d7z.net/nebula/pki"
 )
 
@@ -33,7 +32,7 @@ func (n *Node) tlsConfig(peer PeerID, outgoing bool, c *credentials) *tls.Config
 	cfg := &tls.Config{
 		RootCAs: n.roots, ClientCAs: n.roots, ClientAuth: tls.RequireAndVerifyClientCert,
 		MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13,
-		NextProtos: []string{meshwire.ALPN}, CurvePreferences: []tls.CurveID{tls.X25519MLKEM768},
+		NextProtos: []string{n.o.Transport.ALPN}, CurvePreferences: n.o.Transport.CurvePreferences,
 		SessionTicketsDisabled: true,
 	}
 	if c != nil {
@@ -50,7 +49,7 @@ func (n *Node) tlsConfig(peer PeerID, outgoing bool, c *credentials) *tls.Config
 	// The node profile uses an explicit root and public key rather than a DNS name.
 	cfg.InsecureSkipVerify = outgoing
 	cfg.VerifyConnection = func(st tls.ConnectionState) error {
-		if st.NegotiatedProtocol != meshwire.ALPN || len(st.PeerCertificates) != 1 || !n.ready(n.policy.Load()) {
+		if st.NegotiatedProtocol != n.o.Transport.ALPN || len(st.PeerCertificates) != 1 || !n.ready(n.policy.Load()) {
 			return ErrPathPolicy
 		}
 		_, usage := handshakeUsages(outgoing)

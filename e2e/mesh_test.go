@@ -306,13 +306,21 @@ func publicationReceipt(t *testing.T, a, b *host, payload string) {
 }
 
 func TestMixedTLSCredentials(t *testing.T) {
-	for _, tc := range []struct{ transport, client, server string }{{"udp", "ed25519", "ml-dsa-44"}, {"tcp", "rsa", "p256"}} {
+	for _, tc := range []struct {
+		transport    string
+		keys         [2]string // client, server
+		serverGroups []tls.CurveID
+	}{
+		{"udp", [2]string{"ed25519", "ml-dsa-44"}, []tls.CurveID{tls.CurveP256}},
+		{"tcp", [2]string{"rsa", "p256"}, nil},
+	} {
 		t.Run(tc.transport, func(t *testing.T) {
 			l := newLab(t)
 			a := l.host("wan", "192.0.2.1", "", tc.transport, true)
 			b := l.host("wan", "192.0.2.2", "", tc.transport, true)
+			b.options.Transport.CurvePreferences = tc.serverGroups
 			for i, h := range []*host{a, b} {
-				key, err := pki.GenerateKey([]string{tc.client, tc.server}[i])
+				key, err := pki.GenerateKey(tc.keys[i])
 				require.NoError(t, err)
 				h.key = key
 				l.top.Members[h.index].ID, err = pki.NewPeerID(key.Public())
@@ -322,9 +330,14 @@ func TestMixedTLSCredentials(t *testing.T) {
 			p := l.connect(a, b, tc.transport)
 			require.EqualValues(t, tls.VersionTLS13, p.TLSVersion)
 			require.Equal(t, meshwire.ALPN, p.ALPN)
-			require.Equal(t, tls.X25519MLKEM768, p.TLSGroup)
+			remote := waitPath(t, b, a, tc.transport)
+			require.NotZero(t, p.TLSGroup)
+			require.Equal(t, p.TLSGroup, remote.TLSGroup)
+			if len(tc.serverGroups) > 0 {
+				require.Contains(t, tc.serverGroups, p.TLSGroup)
+			}
 			require.Equal(t, b.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), p.NodeSerial)
-			require.Equal(t, a.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), waitPath(t, b, a, tc.transport).NodeSerial)
+			require.Equal(t, a.options.Auth.Certificates.Node.Leaf.SerialNumber.String(), remote.NodeSerial)
 			publicationReceipt(t, a, b, "client publication")
 			publicationReceipt(t, b, a, "server publication")
 		})

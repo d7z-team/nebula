@@ -33,6 +33,7 @@ const (
 // and preserve each datagram's payload, boundary and source. A terminal read
 // error on the physical socket is reported on both open branches.
 type UDP struct {
+	alpn      string
 	raw       net.PacketConn
 	mesh      *meshSocket
 	other     *packetConn
@@ -66,10 +67,24 @@ type flight struct {
 	until                   time.Time
 }
 
-// NewUDP takes ownership of socket and starts reading datagrams.
+// NewUDP takes ownership of socket and classifies new QUIC clients using meshwire.ALPN.
 func NewUDP(socket net.PacketConn) *UDP {
+	return newUDP(socket, meshwire.ALPN)
+}
+
+// NewUDPWithALPN takes ownership of socket on success. New QUIC v1 clients
+// offering only alpn go to Mesh. An empty alpn selects meshwire.ALPN.
+func NewUDPWithALPN(socket net.PacketConn, alpn string) (*UDP, error) {
+	alpn, err := meshwire.ResolveALPN(alpn)
+	if err != nil {
+		return nil, err
+	}
+	return newUDP(socket, alpn), nil
+}
+
+func newUDP(socket net.PacketConn, alpn string) *UDP {
 	p := &UDP{
-		raw: socket, writeSlot: make(chan struct{}, 1), stopped: make(chan struct{}),
+		alpn: alpn, raw: socket, writeSlot: make(chan struct{}, 1), stopped: make(chan struct{}),
 		pending: make(map[initialFlow]*flight), routes: make(map[initialFlow]initialRoute),
 	}
 	p.writeSlot <- struct{}{}
@@ -247,13 +262,15 @@ func (p *UDP) routeInitial(pkt datagram, cid []byte, now time.Time) {
 		delete(p.pending, key)
 		return
 	}
-	if f.data[0] == 1 && f.contiguous < size {
-		p.pending[key] = f
-		return
-	}
 	branch := p.other
-	if f.data[0] == 1 && meshHello(f.data[:size]) {
-		branch = p.mesh.packetConn
+	if f.data[0] == 1 {
+		if f.contiguous < size {
+			p.pending[key] = f
+			return
+		}
+		if offersOnlyALPN(f.data[4:size], p.alpn) {
+			branch = p.mesh.packetConn
+		}
 	}
 	if len(p.routes) < maxInitialRoutes {
 		p.routes[key] = initialRoute{branch, now.Add(initialRouteLifetime)}

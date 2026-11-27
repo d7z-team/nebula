@@ -31,6 +31,9 @@ func run() error {
 		return err
 	}
 	options[1].Transport.HideEndpoints = true
+	options[1].InboundCircuitLimits.Default = 8
+	// The relay probes every five seconds and retries offline neighbors every two.
+	options[1].Probe.Interval = 5 * time.Second
 	nodes, err := demo.Listen(context.Background(), "udp", options)
 	if err != nil {
 		return err
@@ -88,6 +91,10 @@ func run() error {
 	}
 	fmt.Printf("active circuit: A -> R -> B, next hop %s advertises no endpoints\n", next)
 
+	if err := nodes[1].SetTransitDraining(true); err != nil {
+		return err
+	}
+	fmt.Printf("draining relay with %d transit circuit(s)\n", nodes[1].RelayStatus().TransitCircuits)
 	if err := demo.ExchangeIPv6(ctx, nodes[0], nodes[2], circuit[2]); err != nil {
 		return err
 	}

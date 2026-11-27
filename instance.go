@@ -148,9 +148,8 @@ func (n *Node) admitSessionLocked(s *session) error {
 		n.conflicts[s.peer] = c
 		n.admissions++
 		recorded = true
-		if !incumbent.probing && n.tryTaskLocked(n.probeSlots, func() { n.probeSession(incumbent) }) {
-			incumbent.lastProbe, incumbent.probing = now, true
-		}
+		incumbent.confirmProbe = true
+		n.requestProbeLocked(incumbent)
 	}
 	if recorded {
 		if !c.selected && c.addClaim(s.handshakeClaim()) {

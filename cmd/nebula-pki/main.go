@@ -128,6 +128,20 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	if op == "root" || op == "issue" {
 		fs.IntVar(&days, "days", 30, "validity in days")
 		fs.IntVar(&profile.MaxPathLen, "path-len", 0, "allowed intermediate CA depth")
+		fs.Func("signature-algorithm", "CA certificate signature (e.g. SHA256-RSAPSS); default chosen by crypto/x509 for the issuer key", func(name string) error {
+			for _, alg := range []x509.SignatureAlgorithm{
+				x509.SHA256WithRSA, x509.SHA384WithRSA, x509.SHA512WithRSA,
+				x509.SHA256WithRSAPSS, x509.SHA384WithRSAPSS, x509.SHA512WithRSAPSS,
+				x509.ECDSAWithSHA256, x509.ECDSAWithSHA384, x509.ECDSAWithSHA512,
+				x509.PureEd25519, x509.MLDSA44, x509.MLDSA65, x509.MLDSA87,
+			} {
+				if strings.EqualFold(name, alg.String()) {
+					profile.SignatureAlgorithm = alg
+					return nil
+				}
+			}
+			return fmt.Errorf("unknown CA signature algorithm %q", name)
+		})
 	}
 	if op == "issue" || op == "verify" {
 		fs.StringVar(&role, "role", "node", "node, grant or ca (issue only)")
@@ -140,6 +154,9 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	}
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
+	}
+	if op == "issue" && role != "ca" && profile.SignatureAlgorithm != 0 {
+		return errors.New("-signature-algorithm requires -role ca")
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	var data []byte
@@ -336,7 +353,7 @@ func inspect(b []byte, fingerprint bool) ([]byte, error) {
 	var detail string
 	if c, e := x509.ParseCertificate(b); e == nil {
 		spki = c.RawSubjectPublicKeyInfo
-		detail = fmt.Sprintf("certificate subject=%s issuer=%s serial=%s expires=%s", c.Subject, c.Issuer, c.SerialNumber, c.NotAfter)
+		detail = fmt.Sprintf("certificate subject=%s issuer=%s serial=%s expires=%s publicKey=%s signature=%s", c.Subject, c.Issuer, c.SerialNumber, c.NotAfter, c.PublicKeyAlgorithm, c.SignatureAlgorithm)
 		if c.IsCA {
 			scope, present, err := pki.CertificateScope(c)
 			if err != nil {

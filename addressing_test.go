@@ -44,7 +44,7 @@ func TestBoundedGroupQueues(t *testing.T) {
 	}
 	p, err := n.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
-	require.True(t, n.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	require.True(t, n.shaper.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
 	write := func(dst netip.Addr) error { return p.WriteIP(PeerID{}, testIPv4(f.ips[0], dst, "bounded")) }
 	require.NoError(t, write(f.ips[1]))
 	require.Eventually(t, func() bool { return p.Stats().Queued == 0 }, time.Second, time.Millisecond)
@@ -259,7 +259,7 @@ func TestAnycastSubmissionAndWithdrawal(t *testing.T) {
 	f.cfg.Members[0].BytesPerSecond = 1
 	require.NoError(t, client.ApplyTopology(t.Context(), f.cfg))
 	require.NoError(t, client.ConnectPeer(t.Context(), a.Addresses().IPv4))
-	require.True(t, client.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	require.True(t, client.shaper.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
 	write(a.id, "in flight")
 	require.Eventually(t, func() bool { return out.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	write(a.id, "queued")
@@ -282,12 +282,12 @@ func queueShapedPackets(t *testing.T, a, b *Node, dst netip.Addr, bodies ...stri
 	results := make(chan TransmitResult, len(bodies))
 	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}, ObserveTransmit: func(r TransmitResult) { results <- r }})
 	require.NoError(t, err)
-	require.True(t, a.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	require.True(t, a.shaper.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
 	for _, body := range bodies {
 		require.NoError(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, dst, body)))
 	}
 	require.Eventually(t, func() bool {
-		return a.limiter.Tokens() < 0 && port.Stats().Queued == len(bodies)-1
+		return a.shaper.limiter.Tokens() < 0 && port.Stats().Queued == len(bodies)-1
 	}, time.Second, time.Millisecond)
 	return port, results, received
 }
@@ -484,7 +484,7 @@ func TestChaosRelayOnlyWhileShaping(t *testing.T) {
 	}
 	require.Eventually(t, func() bool {
 		path, ok := a.PreferredPath(b.id)
-		return ok && path.Transport == "relay" && a.limiter.Tokens() < 0
+		return ok && path.Transport == "relay" && a.shaper.limiter.Tokens() < 0
 	}, 2*time.Second, time.Millisecond)
 	f.cfg.Members[0].BytesPerSecond = 0
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))

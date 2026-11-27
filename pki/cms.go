@@ -249,7 +249,7 @@ func encodeObject(network, kind string, body []byte, cert tls.Certificate, sign 
 }
 
 // VerifyObjectSignature checks the CMS signature, domain and certificate set.
-// VerifyObjectSigner establishes node identity and cluster membership for mesh objects.
+// Pass the returned certificates to [VerifyObjectSigner] to verify cluster membership.
 func VerifyObjectSignature(der []byte, network, kind string) ([]byte, []*x509.Certificate, error) {
 	s, err := parseCMS(der)
 	if err != nil {

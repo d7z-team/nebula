@@ -4,7 +4,7 @@
 
 ## 代码位置
 
-- 根包 `nebula` 管理节点、路径选择和原始 IP 收发。[handshake.go](handshake.go) 负责 TLS 身份认证和集群授权交换，[session.go](session.go) 负责会话注册与流分派，[publication.go](publication.go) 管理签名主题消息的发布、订阅和补发。
+- 根包 `nebula` 管理节点、路径选择和原始 IP 收发。[handshake.go](handshake.go) 负责 TLS 身份认证和集群授权交换，[session.go](session.go) 负责会话注册与流分派，[publication.go](publication.go) 管理签名主题消息的发布、订阅和补发。[relay_route.go](relay_route.go) 搜索中继路径，[circuit.go](circuit.go) 管理电路准入、排空和转发，[shaping.go](shaping.go) 按邻居调度字节。
 - `portshare/` 负责与宿主服务共享 TCP、UDP 监听端口。`meshwire/` 定义 mesh ALPN 和共享 UDP 套接字接口。[接入示例](examples/portshare/main.go)
 - `pki/` 负责 X.509 证书与签名对象，`cmd/nebula-pki/` 提供离线命令行工具。
 - `nebulagvisor/` 将节点接入调用方的 gVisor 栈。双栈网关用法见[接入指南](docs/integration.md)。

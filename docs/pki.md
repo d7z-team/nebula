@@ -47,6 +47,8 @@ go build -o "$lab/nebula-pki" ./cmd/nebula-pki
 
 `keygen` 默认生成 Ed25519 私钥，`-algorithm` 也可指定 `p256`、`rsa`（3072 位）或 `ml-dsa-44`。CLI 输出 PKCS#8 私钥和 PKCS#10 申请的 PEM 编码。Go 调用方可用 `pki.GenerateKey` 生成密钥，也可将已有的 `crypto.Signer` 交给 `CreateRoot`、`CreateCSR` 或 `Issuer`。
 
+`CAProfile.SignatureAlgorithm` 只指定当前 CA 证书的签名算法。零值由 Go 根据签发者私钥选择。例如，使用 RSA 根签发集群 CA 时，可设置 `SignatureAlgorithm: x509.SHA256WithRSAPSS`，或给 CLI 的 `issue -role ca` 传入 `-signature-algorithm SHA256-RSAPSS`。自签根的 `root` 命令也接受该参数。运行 `nebula-pki inspect -in ca.pem` 可同时查看集群 CA 自己的公钥类型 `publicKey` 和上级使用的签名算法 `signature`。TLS 密钥交换组由节点单独配置。[Go 签发接口](../pki/issuance.go) · [TLS 配置](integration.md#跨机器连接)
+
 分别用 `Issuer.IssueCA`、`IssueNode` 和 `IssueGrant` 签发 CA、节点证书及授权。`ReadClusterCA` 解析集群地址规划。`VerifyNode` 校验节点角色及根直签，`VerifyGrant` 使用可信根、固定的集群 CA 和预期公钥指纹校验授权链及其委派范围。[站点 CA 的 Go 示例](../examples/pki/main.go) · [双进程接入](quickstart.md#使用磁盘凭据启动两个进程)
 
 ## 证书配置

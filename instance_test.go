@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,37 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestInstanceConflictWhileProbesBusy(t *testing.T) {
+	f := newFixture(t, slices.Repeat([]string{"tcp"}, 6)...)
+	f.opts[0].Probe.Interval = time.Hour
+	f.opts[0].DialTimeout = 3 * time.Second
+	f.opts[5].Auth.Certificates = f.opts[1].Auth.Certificates
+	f.start()
+	hub := f.nodes[0]
+
+	// Hold the four initial Hello exchanges, including the incumbent's.
+	hub.introMu.Lock()
+	resume := sync.OnceFunc(hub.introMu.Unlock)
+	defer resume()
+	for _, m := range f.cfg.Members[1:5] {
+		_, err := hub.ConnectEndpoint(t.Context(), m.Endpoints[0])
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.probes.active == maxPathProbes
+	}, time.Second, time.Millisecond)
+	_, err := hub.ConnectEndpoint(t.Context(), f.cfg.Members[5].Endpoints[0])
+	require.ErrorIs(t, err, ErrInstanceConflict)
+	require.Empty(t, hub.InstanceConflicts())
+	resume()
+	require.Eventually(t, func() bool {
+		holds := hub.InstanceConflicts()
+		return len(holds) == 1 && holds[0].Retained == f.nodes[1].instance
+	}, 2*time.Second, time.Millisecond)
+}
 
 func TestInstanceConflictRecovery(t *testing.T) {
 	for _, revoke := range []bool{false, true} {

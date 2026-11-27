@@ -87,7 +87,7 @@ func (n *Node) transmitIP(ctx context.Context, peer PeerID, q *ipQueue) (*sessio
 	if err != nil {
 		return s, err
 	}
-	if err := n.shape(ctx, len(packet.data)); err != nil {
+	if _, err := n.shaper.schedule(ctx, PeerID{}, len(packet.data)); err != nil {
 		return nil, err
 	}
 	s, err = n.outboundSession(peer, q, true)

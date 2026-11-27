@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/netip"
 	"slices"
@@ -24,14 +25,14 @@ type observation struct {
 	expires  time.Time
 }
 
-func (n *Node) advert(s *session) advert {
+func (n *Node) advert(s *session) (advert, time.Time) {
 	p := n.policy.Load()
 	var a advert
 	if s.q != nil {
 		a.Observed = s.remoteEndpoint()
 	}
 	if !n.memberOf(p) {
-		return a
+		return a, time.Time{}
 	}
 	now := time.Now()
 	n.mu.Lock()
@@ -44,7 +45,28 @@ func (n *Node) advert(s *session) advert {
 		a.Record = intro.record
 	}
 	n.addPublicationInventory(s, &a)
-	return a
+	return a, intro.Expires
+}
+
+// exchangeAdvert schedules renewal from the expiry of the actual signed record.
+// Different paths may have last received different versions of the record.
+func (n *Node) exchangeAdvert(s *session) {
+	a, expires := n.advert(s)
+	body, _ := json.Marshal(a)
+	reply, err := s.request(s.ctx, opHello, body, maxControlFrame)
+	var remote advert
+	var next time.Time
+	if err == nil && json.Unmarshal(reply, &remote) == nil {
+		n.receiveAdvert(s, remote)
+		next = expires.Add(-introductionRefreshLead)
+	}
+	now := time.Now()
+	if !next.After(now) {
+		next = now.Add(n.o.Probe.scanInterval())
+	}
+	n.mu.Lock()
+	s.nextHello = next
+	n.mu.Unlock()
 }
 
 func (n *Node) endpointsLocked(peer PeerID) []Endpoint {

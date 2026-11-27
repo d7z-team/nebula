@@ -180,7 +180,7 @@ func (n *Node) establishPath(peer PeerID) error {
 		return ErrPathPolicy
 	}
 	if mode.allowsRelay() {
-		relayErr = n.dialRelay(n.ctx, peer, maxCircuitAttempts)
+		relayErr = n.dialRelay(peer, maxCircuitAttempts)
 		if relayErr == nil || n.preferredSession(peer, false) != nil {
 			return nil
 		}

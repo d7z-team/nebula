@@ -71,6 +71,16 @@ opts.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
 
 ## 跨机器连接
 
+通信双方在 `nebula.New` 前设置相同的 `opts.Transport.ALPN`，默认值为 `nebula-mesh`。共享端口的分流器使用同一个值。通过 TCP 字节透传入口拨号时，TLS 握手由两端节点完成。[共享端口配置](portshare.md#接入与关闭)
+
+`opts.Transport.CurvePreferences` 为空时使用 Go 的默认 TLS 密钥交换组。若本节点要求混合密钥交换，可在 `New` 前限定允许的组。
+
+```go
+opts.Transport.CurvePreferences = []tls.CurveID{tls.X25519MLKEM768}
+```
+
+此设置同时用于入站和出站 TCP、QUIC 及中继端到端握手。Go 在双方都支持的组中按内部顺序选择，交集为空时握手失败。中继相邻节点的连接逐跳协商，电路两端单独协商端到端组。用 `node.Paths()` 中各路径的 `TLSGroup` 查看实际结果。[可运行示例](quickstart.md)
+
 `Options.Transport.UDP4`、`UDP6` 用于对应地址族的 QUIC 监听、拨号和打洞。`TCP4`、`TCP6` 接收入站 TCP。只需出站 TCP 时可将传输配置留空，节点使用 `net.Dialer`；自有网络栈可提供 `DialTCP`。UDP 和 TCP 可绑定相同端口号，与网站共用这些端口时，将 `portshare` 的 mesh 分支交给节点。[与网站共享监听端口](portshare.md#接入与关闭)
 
 | 已知信息 | 连接方式 |
@@ -86,6 +96,12 @@ opts.Transport.AllowAdvertiseEndpoint = func(c nebula.EndpointCandidate) bool {
 并发的 `ConnectEndpoint` 按物理端点共享拨号，`ConnectPeer` 和 `ConnectPeerID` 按完整成员身份共享拨号。任一调用方取消 context 只结束自己的等待。`ConnectEndpoint` 成功表示本机已注册直连。邻居也完成注册后，其他成员才能通过这条邻接查询新节点。期间遇到 `ErrPeerUnavailable` 可在调用方的截止时间内重试。[按地址发现的示例](../examples/discovery/main.go)
 
 按需连接失去最后一条路径后，可以再次调用连接 API，也可以向已知成员写包来触发建链。
+
+### 在首个业务包前预连接
+
+游戏匹配完成、已知对端 `PeerID` 时，可在加载阶段调用 `node.ConnectPeerID(ctx, peerID)`。成功返回表示本机已有到该成员的认证路径。同一对节点上的多个游戏端口可以复用这条会话。如果业务要求开局时使用 UDP 直连，连接成功后读取 `path, ok := node.PreferredPath(peerID)`，在 `ok && path.Transport == "udp"` 时开始发送。这个检查反映查询时的首选路径，后续可能随网络情况变化。[可运行示例](../examples/quickstart/main.go)
+
+向已知成员发送首个单播包时，`IPPort.WriteIP` 成功只表示本机已接受该包入队。若由首包触发建链，握手期间排队的多帧状态可能在路径就绪后集中送达。预连接把这段等待提前到加载阶段。
 
 ### 按地址发现成员和下游网关
 
@@ -104,9 +120,9 @@ for _, m := range matches {
 | 查询目的 | API | 返回哪些成员 |
 | --- | --- | --- |
 | 找到主地址所有者或已知网关 | `ResolveIP(ctx, dst)` | 命中本机有效的签名介绍时直接返回，否则查询邻居。主地址精确匹配；下游地址返回每个网关最具体的匹配前缀。 |
-| 已有默认出口，寻找新加入的站点网关 | `RefreshIP(ctx, dst)` | 对成员网段和 VIP 池外的下游单播地址发起或加入一轮查询，返回本机匹配的介绍及本轮收到且仍有效的候选。邻居可以转交签名缓存。 |
+| 已有默认出口，寻找新加入的站点网关 | `RefreshIP(ctx, dst)` | 对成员网段和 VIP 池外的下游单播地址发起或加入一轮查询。结果包含本节点自身匹配的通告，以及本轮收到的有效应答。邻居也可用缓存的签名介绍应答。 |
 
-两者都按前缀长度降序、再按成员身份排序。某网关本轮缺席，其有效缓存仍可供 `ResolveIP` 使用。对同一目的地址的并发网络查询共享请求，各调用方可以独立取消等待。[可运行示例](../examples/discovery/main.go)
+两者都按前缀长度降序、再按成员身份排序。一次查询受邻接和时间预算限制，某网关本轮缺席时，其有效缓存仍可供 `ResolveIP` 使用。同一地址的并发网络查询共享请求，各调用方可以独立取消等待。[可运行示例](../examples/discovery/main.go)
 
 `IPMatch.Addresses` 给出签名授权中的两个主地址。选中结果后调用 `ConnectPeerID(ctx, m.Peer)`，握手验证该公钥持有者及其在本集群的双栈地址授权。向该网关转发下游 IP 包之前，宿主须核准网关及其前缀，并用 `ApplyTopology` 安装相应授权。再调用 `port.WriteIP(m.Peer, packet)`，收发双方根据各自拓扑和会话使用的集群授权校验数据。[网关实例](../examples/gateway/main.go) · [组地址与任播交付](addressing.md)
 
@@ -137,15 +153,6 @@ for _, m := range matches {
 
 `SetPeerPathPolicy(peerID, mode)` 绑定节点公钥指纹，可在建链和发现前预设。只有一个主地址时，可先用 `LookupPeer(ip)` 确认当前归属。调用 `configured, effective := node.PeerPathPolicy(peerID)` 可读取配置值和叠加拓扑限制后的有效模式。`Auto` 清除本机覆盖并允许在合规路径间选路，`DirectOnly` 只许直连，`RelayOnly` 只许经中继，`Blocked` 封锁到该成员的路径。两端任一成员启用 `Restricted` 后，只有列在双向 `Links` 的邻居才能直连。电路每个中间成员还须启用 `Transit`。
 
-`Options` 中以下参数取零时使用默认值。
-
-| 参数 | 默认值 | 作用范围 |
-| --- | --- | --- |
-| `MaxInboundHandshakes` | 256 | 本节点所有地址族的 TCP 和 QUIC 共用的入站建链名额。建链结束即释放，已注册的直连会话不占名额。[共享端口容量](portshare.md#容量和部署边界) |
-| `MaxCircuits` | 512 | 本机发起、终止和转发的电路合计占用，含正在建立的电路。用 `ControlStatus().Circuits` 读取当前占用。 |
-| `MaintenanceInterval` | 2 秒 | 邻居维护及已建路径探活的调度间隔。 |
-| `DialTimeout` | 4 秒 | 拨号、握手、控制交换和传输写入的基础超时。中继建链按剩余跳数计算预算。 |
-
 ```go
 if err := node.SetPeerPathPolicy(peerID, nebula.RelayOnly); err != nil {
     return err
@@ -164,6 +171,40 @@ if path, ok := node.PreferredPath(peerID); ok {
 
 `PreferredPath` 只读取本机已建立且获准承载一般流量的会话并返回独立快照。尚未建链或已失去全部路径时返回 `false`。直连的下一跳就是对端，`Endpoint` 为当前连接地址。中继的 `Circuit` 从本机到对端按顺序列出成员，`Endpoint` 为零值。要查某个下游 IP，可先用 `ResolveIP` 找到网关，再查到该网关的路径。某个包实际采用的电路以 `ObserveTransmit` 为准。
 
+### 拨号、探活与容量参数
+
+`Options` 中以下参数取零时使用默认值。
+
+| 参数 | 默认值 | 作用范围 |
+| --- | --- | --- |
+| `MaxInboundHandshakes` | 256 | 所有地址族共用的入站直连建链名额。TCP 在 TLS 握手前占用，QUIC 在 TLS 握手后占用，两者均在会话注册或建链失败时释放。[共享端口容量](portshare.md#容量和部署边界) |
+| `MaxCircuits` | 512 | 本机发起、终止和转发的电路合计占用，含正在建立的电路。用 `ControlStatus().Circuits` 读取当前占用。 |
+| `MaintenanceInterval` | 2 秒 | 重试拓扑中的离线邻居，清理过期路径、发现记录和主题消息。 |
+| `Probe.Interval` | 继承 `MaintenanceInterval` | 本机对每条已建路径发起探活的目标间隔。 |
+| `Probe.FailureThreshold` | 3 | 本机连续多少次探活失败后关闭该路径。成功一次就清零。 |
+| `DialTimeout` | 4 秒 | 拨号、握手、控制交换和传输写入的基础超时。中继建链按剩余跳数计算预算。 |
+
+例如，`opts.Probe.Interval = 5 * time.Second` 让本机每 5 秒调度一次路径探活，离线邻居仍按默认的 2 秒重试。实际摘除时间还受探活排队、超时和底层连接状态影响。依赖探活维持空闲 UDP 路径时，应为 NAT 映射和双方协商的 QUIC 空闲超时留出余量。quic-go 的默认空闲超时为 30 秒。[中继示例](../examples/relay/main.go)
+
+### 中继额度、权重与排空
+
+骨干承载的并发电路数取决于通信的成员对数。例如 208 个接入节点各连接 4 个服务，每对保持一条电路，经过同一骨干就占 832 个名额。以下示例为骨干设置 1024 个名额。[容量验收](testing.md#中继容量验收)
+
+```go
+opts.MaxCircuits = 1024
+opts.InboundCircuitLimits = nebula.InboundCircuitLimits{
+    Default: 16,
+    ByPeer:  map[nebula.PeerID]int{backboneID: 0},
+}
+opts.RelayWeights = map[nebula.PeerID]uint16{backboneID: 8}
+```
+
+每个入站电路从开始建链起占用直接邻居的额度，包括在本机终止的电路。示例将普通邻居限制在 16 条，指定骨干的零值覆盖允许它使用本机总容量。本机始发电路只计入总量。`RelayStatus().InboundCircuits` 给出各邻居的当前占用，`RejectedCapacity`、`RejectedPeerLimit`、`RejectedDraining` 分别累计本机因总量、邻居额度和排空而拒绝的次数。
+
+回程流量经同一骨干汇聚时，本机只能看到一个入向邻居。示例为它设置 8 倍字节权重，其他邻居默认为 1。本机拓扑条目的 `BytesPerSecond` 限制 IP、主题消息与中继流共用的字节速率（字节/秒）。零值允许使用全部可用带宽，中继仍按邻居调度并限制每对邻居的并发写入。[调度与计量](mesh.md#数据交付整形与主题消息)
+
+计划维护时调用 `SetTransitDraining(true)`，等待 `RelayStatus().TransitCircuits` 降到零。排空期间停止接纳新中转电路，既有电路仍可承载新操作，以本机为终点的连接仍可建立。宿主决定等待期限，通过 `SetTransitDraining(false)` 恢复接纳。立即撤回转发授权可用 `ApplyTopology` 撤销 `Transit`。[可运行示例](../examples/relay/main.go)
+
 ### 让节点通过已连接的邻居提供中继
 
 在 `A — R1 — H — R2 — B` 中，H 可以只与 R1、R2 建立物理连接，同时为 A、B 转发流量。
@@ -172,7 +213,7 @@ if path, ok := node.PreferredPath(peerID); ok {
 2. 各跳宿主在自己的拓扑中批准电路的双向 `Links`，并为 R1、H、R2 设置 `Transit`。将 H 标为 `Restricted`，它的 `Links` 只列 R1、R2。在 H 的本地视图填入这两个邻居的可达物理端点。接收入站的邻居也必须允许 H 的连接。如果邻居本身受限，需要在它的私有视图批准 H 的物理来源。
 3. H 启动后会维护这两个邻居，也可调用 `ConnectPeerID` 等待邻接就绪。其他成员可以复用 H 主动建立的双向会话。期望 A 到 B 始终使用中继时，在 A、B 对彼此设置 `RelayOnly`。撤回 H 的 `Transit` 会拆除经 H 的电路，获准以 H 为终点的连接仍可建立。
 
-启用 `HideEndpoints` 的 H 收到会合请求时只回复签名介绍。H 自己发起的拨号、打洞和备线路径探测仍遵循路径策略，`Restricted` 与双向 `Links` 将这些操作限定到获准邻居。直接邻居能从套接字看到 H 的物理地址，此前已分发的签名记录也可能缓存至有效期结束。[三节点可运行示例](../examples/relay/main.go) · [五节点故障重放](testing.md#运行测试)
+H 收到会合请求时只回复签名介绍。H 主动拨号、打洞和探测备线时，`Restricted` 与双向 `Links` 将直连范围限定到获准邻居。直接邻居能从套接字看到 H 的物理地址，此前已分发的签名记录也可能缓存至到期。[三节点示例](../examples/relay/main.go) · [五节点故障重放](testing.md#重放故障)
 
 ## IP 收发与网关
 
@@ -204,11 +245,9 @@ return err
 
 异步上限示例可用 `go test -v -run '^ExampleIPPort_WriteIP$' .` 运行。[可执行示例](../example_test.go) · [双进程应用回执](quickstart.md#使用磁盘凭据启动两个进程)
 
-在本机拓扑成员上设置 `BytesPerSecond` 并应用拓扑，可以限制本机提交的 IP、主题消息及中继应用字节总量，单位为字节每秒，零表示不限速。
-
 网关示例在外层使用 TLS/TCP。客户端用 `RefreshIP` 发现网关、用 `ApplyTopology` 批准下游前缀，在 gVisor 中为站点前缀和默认出口安装路由。两个下游的 IPv4 和 IPv6 UDP 回显可核对实际出口。[双栈网关源码](../examples/gateway/main.go)
 
-通过 `nebulagvisor.NewEndpoint` 独占节点 IP 端口，再用 `CreateNIC` 加入用户态网络栈。注册失败调用 `Endpoint.Close`，成功后用 `RemoveNIC` 拆卸。节点的 `Options.MaxIPSize` 默认 65535 字节，可设为 1280～65535。双栈 NIC 的默认 MTU 取 1300 字节与该上限的较小值。逐路由设置 MTU 可调用 `node.RecommendedMTU(gateway, destination.Is6(), int(ep.MTU()))`，无可用路径时只按本机上限计算。[适配器](../nebulagvisor/endpoint.go) · [路径 MTU](mesh.md#路由-mtu)
+通过 `nebulagvisor.NewEndpoint` 独占节点 IP 端口，再用 `CreateNIC` 加入用户态网络栈。注册失败调用 `Endpoint.Close`，成功后用 `RemoveNIC` 拆卸。`Options.MaxIPSize` 默认 65535 字节，可设为 1280～65535。双栈 NIC 的默认 MTU 取 1300 字节与该上限的较小值。用 `node.RecommendedMTU(gateway, destination.Is6(), int(ep.MTU()))` 按路径估算路由 MTU。建链前取节点和 NIC 上限的较小值，建链后再考虑对端收包上限和 QUIC 数据报预算。[适配器](../nebulagvisor/endpoint.go) · [路径 MTU](mesh.md#路由-mtu)
 
 访问下游失败时，沿报文方向检查以下设置。
 

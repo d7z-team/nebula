@@ -112,7 +112,7 @@ func (n *Node) updateView(ctx context.Context, next *topologyView) error {
 		clear(n.discoveredOwners)
 		clear(n.observations)
 		if next != nil {
-			n.setShapingRate(p.members[n.id].BytesPerSecond)
+			n.shaper.setRate(n.ctx, p.members[n.id].BytesPerSecond)
 		}
 		n.mu.Unlock()
 		n.enforcePathPolicy()

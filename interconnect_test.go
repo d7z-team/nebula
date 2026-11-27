@@ -123,6 +123,7 @@ func TestRelaySearchAfterLastCandidate(t *testing.T) {
 	f.link(1, 2)
 	f.cfg.Members[1].Transit = true
 	for i := range f.opts {
+		f.opts[i].Transport.ALPN = "lab-mesh"
 		f.opts[i].MaintenanceInterval = time.Hour
 	}
 	// The only transit node initially declines the canary's one candidate.
@@ -133,12 +134,13 @@ func TestRelaySearchAfterLastCandidate(t *testing.T) {
 	f.start()
 	a, relay, b := f.nodes[0], f.nodes[1], f.nodes[2]
 	require.NoError(t, a.SetPeerPathPolicy(b.id, RelayOnly))
-	require.Error(t, a.dialRelay(t.Context(), b.id, 1))
+	require.Error(t, a.dialRelay(b.id, 1))
 	require.NoError(t, relay.ApplyTopology(t.Context(), f.cfg))
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
 	path, ok := a.PreferredPath(b.id)
 	require.True(t, ok)
 	require.Equal(t, []PeerID{a.id, relay.id, b.id}, path.Circuit)
+	require.Equal(t, f.opts[0].Transport.ALPN, path.ALPN)
 }
 
 func TestIntroductionLookupAndAuthorization(t *testing.T) {
@@ -167,10 +169,8 @@ func TestIntroductionLookupAndAuthorization(t *testing.T) {
 		hub.mu.Unlock()
 		require.True(t, learned.authorizedUntil.Equal(until))
 		require.True(t, learned.Expires.After(until))
-		seen := hub.advert(&session{peer: peer.id}).Seen
-		s := &session{peer: hub.id}
-		s.acknowledgedIntro.Store(seen)
-		require.Empty(t, peer.advert(s).Record)
+		ack, _ := hub.advert(&session{peer: peer.id})
+		require.Equal(t, learned.Expires.UnixNano(), ack.Seen)
 	}
 	peer := f.nodes[1]
 	cutoff.Store(time.Now().Add(150 * time.Millisecond).UnixNano())
@@ -294,7 +294,7 @@ func TestMaintenanceProbesWholeHub(t *testing.T) {
 	for i := range f.opts {
 		f.opts[i].MaintenanceInterval = time.Hour
 	}
-	f.opts[0].MaintenanceInterval = interval
+	f.opts[0].Probe.Interval = interval
 	f.start()
 	hub := f.nodes[0]
 	for _, peer := range f.nodes[1:] {
@@ -357,6 +357,88 @@ func TestMaintenanceReachesLaterNeighbors(t *testing.T) {
 		}
 		return healthy && joined
 	}, 4*time.Second, 10*time.Millisecond)
+}
+
+func TestSlowProbeRenewsIntroductionAndReconnects(t *testing.T) {
+	f := newFixture(t, "", "tcp")
+	f.link(0, 1)
+	for i := range f.opts {
+		f.opts[i].MaintenanceInterval = 40 * time.Millisecond
+		f.opts[i].Probe.Interval = 2 * time.Minute
+	}
+	var online atomic.Bool
+	f.opts[0].Transport.DialTCP = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if !online.Load() {
+			return nil, errors.New("link down")
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+
+	// Start with a valid signed record about to enter its renewal window.
+	intro := a.localIntroduction(a.policy.Load())
+	intro.Expires = time.Now().UTC().Add(introductionRefreshLead + 2*time.Second)
+	var err error
+	intro.record, err = a.signStatement("introduction", intro.introduction, a.cred.Load().cmsSigner)
+	require.NoError(t, err)
+	a.introMu.Lock()
+	a.introCache = intro
+	a.introMu.Unlock()
+	online.Store(true)
+	require.Eventually(t, func() bool {
+		m := b.ipMatches(a.Addresses().IPv4, nil)
+		return len(m) == 1 && m[0].ValidUntil.Equal(intro.Expires)
+	}, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool {
+		m := b.ipMatches(a.Addresses().IPv4, nil)
+		return len(m) == 1 && m[0].ValidUntil.After(intro.Expires)
+	}, 7*time.Second, 10*time.Millisecond)
+	require.True(t, time.Now().Before(intro.Expires))
+	path, ok := a.PreferredPath(b.id)
+	require.True(t, ok)
+	require.Zero(t, path.RTT)
+
+	online.Store(false)
+	failures := a.ControlStatus().DialFailures
+	a.preferredSession(b.id, true).close()
+	require.Eventually(t, func() bool {
+		return len(a.Paths()) == 0 && a.ControlStatus().DialFailures > failures
+	}, 2*time.Second, 5*time.Millisecond)
+	online.Store(true)
+	require.Eventually(t, func() bool { return len(a.Paths()) == 1 }, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestProbeFailureThresholdAfterRecovery(t *testing.T) {
+	f := newFixture(t, "udp", "udp")
+	for i := range f.opts {
+		f.opts[i].MaintenanceInterval = time.Hour
+	}
+	f.opts[0].Probe = ProbeOptions{Interval: 400 * time.Millisecond, FailureThreshold: 2}
+	f.opts[0].DialTimeout = 250 * time.Millisecond
+	f.start()
+	a, b := f.nodes[0], f.nodes[1]
+	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
+	s := a.preferredSession(b.id, true)
+	require.NotNil(t, s)
+	checkFailures := func(count int) {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			p, ok := a.PreferredPath(b.id)
+			return ok && p.Failures == count
+		}, 4*time.Second, 5*time.Millisecond)
+	}
+	f.sockets[0].drop.Store(true)
+	checkFailures(1)
+	f.sockets[0].drop.Store(false)
+	checkFailures(0)
+	f.sockets[0].drop.Store(true)
+	checkFailures(1)
+	require.Eventually(t, func() bool { return len(a.Paths()) == 0 }, 4*time.Second, 5*time.Millisecond)
+	s.healthMu.Lock()
+	failures := s.failures
+	s.healthMu.Unlock()
+	require.Equal(t, 2, failures)
 }
 
 type interruptedListener struct {
@@ -492,7 +574,7 @@ func TestNeighborDialWhilePublicationsArePaced(t *testing.T) {
 	f.start()
 	a, b, c := f.nodes[0], f.nodes[1], f.nodes[2]
 	require.NoError(t, a.ConnectPeerID(t.Context(), b.id))
-	require.True(t, a.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
+	require.True(t, a.shaper.limiter.AllowN(time.Now(), MaxIPPacketSize+1))
 	var id string
 	for i := range cap(a.backgroundSlots) + 2 {
 		var err error

@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -65,7 +66,7 @@ func (s *meteredSocket) count(a netip.AddrPort) int {
 }
 
 func labAddresses(ipv4 netip.Addr) pki.Addresses {
-	return pki.Addresses{IPv4: ipv4, IPv6: netip.MustParseAddr(fmt.Sprintf("fd42::%x", ipv4.As4()[3]))}
+	return pki.Addresses{IPv4: ipv4, IPv6: netip.MustParseAddr(fmt.Sprintf("fd42::%x", uint16(ipv4.As4()[2])<<8|uint16(ipv4.As4()[3])))}
 }
 
 // Fixed lab keys keep independent fixtures and wire-format tests reproducible.
@@ -101,6 +102,10 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 	root := pki.Issuer{Chain: []*x509.Certificate{anchor}, Signer: rootKey}
 	req, e := pki.CreateCSR(key, pkix.Name{})
 	require.NoError(t, e)
+	memberPrefix := netip.MustParsePrefix("10.13.0.0/24")
+	if len(transports) >= 192 {
+		memberPrefix = netip.MustParsePrefix("10.13.0.0/16")
+	}
 	ca, e := root.IssueCA(req, pki.CAProfile{
 		Subject: pkix.Name{CommonName: "lab cluster"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
 		Scope: &pki.Scope{
@@ -108,7 +113,7 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 			RoutedPrefixes: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
 			AnycastPools:   []netip.Prefix{netip.MustParsePrefix("10.13.0.192/27"), netip.MustParsePrefix("fd42::c0/123"), netip.MustParsePrefix("198.51.100.192/28")},
 		},
-		PermittedIPs: []netip.Prefix{netip.MustParsePrefix("10.13.0.0/24"), netip.MustParsePrefix("fd42::/64")},
+		PermittedIPs: []netip.Prefix{memberPrefix, netip.MustParsePrefix("fd42::/64")},
 		MaxPathLen:   -1,
 	}, sha256.Sum256(req.RawSubjectPublicKeyInfo))
 	require.NoError(t, e)
@@ -116,7 +121,12 @@ func newFixture(t testing.TB, transports ...string) *fixture {
 	f.cluster, e = pki.ReadClusterCA(ca)
 	require.NoError(t, e)
 	for i, kind := range transports {
-		a := netip.MustParseAddr(fmt.Sprintf("10.13.0.%d", i+1))
+		host := i + 1
+		if host >= 192 {
+			// Continue in the next /24 beyond the fixture's VIP pool.
+			host += 65
+		}
+		a := netip.AddrFrom4([4]byte{10, 13, byte(host >> 8), byte(host)})
 		id := labPeer(a)
 		cert := f.issue(a, pki.Scope{})
 		o := Options{
@@ -286,7 +296,6 @@ func TestIPDeliveryAndMemberWithdrawal(t *testing.T) {
 	require.ErrorIs(t, out.WriteIP(y.ID(), testIPv4(b, a, "spoof")), ErrAddressUnauthorized)
 	paths := x.Paths()
 	require.NotEmpty(t, paths)
-	require.Equal(t, tls.X25519MLKEM768, paths[0].TLSGroup)
 	require.Equal(t, uint16(tls.VersionTLS13), paths[0].TLSVersion)
 	require.True(t, slices.ContainsFunc(paths, func(p PathStatus) bool { return p.StreamFallbacks > 0 }))
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
@@ -519,7 +528,7 @@ func TestParallelCircuitFailover(t *testing.T) {
 	s := a.preferredSession(b.id, false)
 	require.NotNil(t, s)
 	path := slices.Clone(s.path)
-	require.ErrorIs(t, a.startCircuit(t.Context(), path), ErrPathPolicy)
+	require.ErrorIs(t, a.startCircuit(path), ErrPathPolicy)
 	require.NoError(t, a.SetPeerPathPolicy(path[1], Blocked))
 	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
 	next := a.preferredSession(b.id, false)
@@ -602,6 +611,7 @@ func TestNodeOptionLimits(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { n.Close() })
 	require.Equal(t, 2*time.Second, n.o.MaintenanceInterval)
+	require.Equal(t, ProbeOptions{Interval: n.o.MaintenanceInterval, FailureThreshold: 3}, n.o.Probe)
 	require.Equal(t, 4*time.Second, n.o.DialTimeout)
 	require.Equal(t, 256, cap(n.handshakeSlots))
 	require.Equal(t, 512, n.o.MaxCircuits)
@@ -612,9 +622,12 @@ func TestNodeOptionLimits(t *testing.T) {
 		opts  Options
 	}{
 		{"MaintenanceInterval", Options{MaintenanceInterval: -time.Second}},
+		{"Probe.Interval", Options{Probe: ProbeOptions{Interval: -time.Second}}},
+		{"Probe.FailureThreshold", Options{Probe: ProbeOptions{FailureThreshold: -1}}},
 		{"DialTimeout", Options{DialTimeout: -time.Second}},
 		{"MaxInboundHandshakes", Options{MaxInboundHandshakes: -1}},
 		{"MaxCircuits", Options{MaxCircuits: -1}},
+		{"ALPN", Options{Transport: TransportOptions{ALPN: strings.Repeat("a", 256)}}},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
 			tc.opts.Auth, tc.opts.Topology = opts.Auth, opts.Topology

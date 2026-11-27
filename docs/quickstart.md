@@ -6,9 +6,10 @@
 go run ./examples/quickstart
 ```
 
-成功时会看到一条签名主题消息和一个内层 IPv6 包。
+Bob 按 Alice 的 `PeerID` 预连接并确认首选路径为 UDP 直连。首行显示 Go 实际协商的密钥交换组。运行 `go run ./examples/quickstart -hybrid` 时，两端都要求 `X25519MLKEM768`，输出如下。[预连接用法](integration.md#在首个业务包前预连接)
 
 ```text
+connected to Alice over udp with X25519MLKEM768
 hello from <Bob 的 PeerID>
 IPv6 fd13::2 -> fd13::1 (40 bytes)
 ```

@@ -15,6 +15,7 @@ import (
 
 // TCP owns a physical listener and delivers original, unhandshaken connections to two listeners.
 type TCP struct {
+	alpn        string
 	done        chan struct{}
 	raw         net.Listener
 	mesh, other *listener
@@ -30,10 +31,24 @@ type listener struct {
 	once sync.Once
 }
 
-// NewTCP takes ownership of l and starts classifying incoming client connections.
+// NewTCP takes ownership of l and classifies incoming connections using meshwire.ALPN.
 func NewTCP(l net.Listener) *TCP {
+	return newTCP(l, meshwire.ALPN)
+}
+
+// NewTCPWithALPN takes ownership of l on success. Clients offering only alpn
+// go to Mesh. An empty alpn selects meshwire.ALPN.
+func NewTCPWithALPN(l net.Listener, alpn string) (*TCP, error) {
+	alpn, err := meshwire.ResolveALPN(alpn)
+	if err != nil {
+		return nil, err
+	}
+	return newTCP(l, alpn), nil
+}
+
+func newTCP(l net.Listener, alpn string) *TCP {
 	branch := func() *listener { return &listener{addr: l.Addr(), in: make(chan net.Conn), done: make(chan struct{})} }
-	t := &TCP{done: make(chan struct{}), raw: l, mesh: branch(), other: branch()}
+	t := &TCP{alpn: alpn, done: make(chan struct{}), raw: l, mesh: branch(), other: branch()}
 	t.workers.Go(func() {
 		slots := make(chan struct{}, maxPending)
 		for {
@@ -164,7 +179,7 @@ func (t *TCP) dispatch(c net.Conn) {
 			return
 		}
 		if len(hello) >= size {
-			if meshHello(hello[:size]) {
+			if offersOnlyALPN(hello[4:size], t.alpn) {
 				branch = t.mesh
 			}
 			break

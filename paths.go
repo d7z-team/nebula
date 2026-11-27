@@ -1,8 +1,6 @@
 package nebula
 
 import (
-	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"slices"
 	"time"
@@ -153,127 +151,50 @@ func (n *Node) dialNeighborsLocked(next int) int {
 }
 
 func (n *Node) maintain() {
-	tick := time.NewTicker(n.o.MaintenanceInterval)
-	defer tick.Stop()
-	next := 0
-	// Workers take the next due path from the same round, including when a
-	// slow peer occupies one of the other probe slots. Node.mu guards pending.
-	var pending []*session
-	interval := n.o.MaintenanceInterval - n.o.MaintenanceInterval/4
-	due := func(s *session, now time.Time) bool {
-		return !s.probing && now.Sub(s.lastProbe) >= interval
-	}
-	probe := func() {
-		for {
-			n.mu.Lock()
-			if len(pending) == 0 || n.state != running {
-				n.mu.Unlock()
-				return
-			}
-			s := pending[0]
-			pending[0] = nil
-			pending = pending[1:]
-			now := time.Now()
-			if !due(s, now) || !n.usableLocked(s) {
-				n.mu.Unlock()
-				continue
-			}
-			s.lastProbe, s.probing = now, true
-			n.mu.Unlock()
-			n.probeSession(s)
-		}
-	}
-	for {
+	maintenance := time.NewTicker(n.o.MaintenanceInterval)
+	defer maintenance.Stop()
+	probes := time.NewTicker(n.o.Probe.scanInterval())
+	defer probes.Stop()
+
+	nextNeighbor := 0
+	upkeep := func() {
 		n.prunePaths()
 		n.mu.Lock()
-		now := time.Now()
-		n.expirePublicationsLocked(now)
-		next = n.dialNeighborsLocked(next)
-		if len(pending) == 0 {
-			pending = slices.DeleteFunc(n.sessionListLocked(), func(s *session) bool { return !due(s, now) })
-			slices.SortFunc(pending, func(a, b *session) int { return a.lastProbe.Compare(b.lastProbe) })
-		}
-		for range min(len(pending), cap(n.probeSlots)) {
-			if !n.tryTaskLocked(n.probeSlots, probe) {
-				break
-			}
-		}
+		n.expirePublicationsLocked(time.Now())
+		nextNeighbor = n.dialNeighborsLocked(nextNeighbor)
 		n.mu.Unlock()
+	}
+	upkeep()
+	for {
 		select {
 		case <-n.ctx.Done():
 			return
-		case <-tick.C:
+		case <-maintenance.C:
+			upkeep()
+		case <-probes.C:
+			n.mu.Lock()
+			n.probes.rescan = true
+			n.dispatchProbesLocked()
+			n.mu.Unlock()
 		}
 	}
-}
-
-func (n *Node) probeSession(s *session) {
-	defer func() { n.mu.Lock(); s.probing = false; n.mu.Unlock() }()
-	s.refreshBudget()
-	var nonce [8]byte
-	rand.Read(nonce[:])
-	at := time.Now()
-	b, err := s.request(s.ctx, opPing, nonce[:], 8)
-	rtt := time.Since(at)
-	s.healthMu.Lock()
-	if s.q != nil {
-		q := s.q.ConnectionStats()
-		if q.PacketsSent > s.sent {
-			var lost uint64
-			if q.PacketsLost > s.lost {
-				lost = q.PacketsLost - s.lost
-			}
-			sample := min(1.0, float64(lost)/float64(q.PacketsSent-s.sent))
-			s.loss = (s.loss + sample) / 2
-		}
-		s.sent, s.lost = q.PacketsSent, q.PacketsLost
-	}
-	if err != nil || !slices.Equal(b, nonce[:]) {
-		s.failures++
-	} else {
-		s.failures = 0
-		if s.rtt != 0 {
-			s.jitter = (3*s.jitter + (rtt - s.rtt).Abs()) / 4
-			s.rtt = (3*s.rtt + rtt) / 4
-		} else {
-			s.rtt = rtt
-		}
-	}
-	failures := s.failures
-	s.healthMu.Unlock()
-	if failures >= 3 {
-		s.close()
-		return
-	}
-	if failures == 0 {
-		n.mu.Lock()
-		s.lastAlive = time.Now()
-		if c, ok := n.conflicts[s.peer]; ok && c.confirmedAt.IsZero() && !at.Before(c.since) && s.lastAlive.Before(c.confirmBy) && n.usableLocked(s) && c.keep == s.instance {
-			c.confirmedAt = s.lastAlive
-			n.conflicts[s.peer] = c
-			n.admissions++
-		}
-		n.mu.Unlock()
-		ad := n.advert(s)
-		body, _ := json.Marshal(ad)
-		b, err = s.request(s.ctx, opHello, body, maxControlFrame)
-		var remote advert
-		if err == nil && json.Unmarshal(b, &remote) == nil {
-			n.receiveAdvert(s, remote)
-		}
-	}
-	n.tryTask(n.backgroundSlots, func() { n.probeAlternatePaths(s, failures) })
 }
 
 // Establish a missing path before considering it for active traffic.
 func (n *Node) probeAlternatePaths(s *session, failures int) {
 	n.mu.Lock()
-	paths := n.peers[s.peer]
-	interval := max(5*n.o.MaintenanceInterval, 5*time.Second)
-	if failures == 1 {
-		interval = n.o.MaintenanceInterval
+	if !n.usableLocked(s) {
+		n.mu.Unlock()
+		return
 	}
-	if paths == nil || !n.usableLocked(s) || time.Since(paths.lastCanary) < interval {
+	paths := n.peers[s.peer]
+	elapsed := time.Since(paths.lastCanary)
+	// Compare by division so very long configured intervals cannot overflow.
+	due := elapsed >= 5*time.Second && elapsed/5 >= n.o.Probe.Interval
+	if failures == 1 {
+		due = elapsed >= n.o.Probe.Interval
+	}
+	if !due {
 		n.mu.Unlock()
 		return
 	}
@@ -340,7 +261,7 @@ func (n *Node) probeAlternatePaths(s *session, failures int) {
 	}
 	n.mu.Unlock()
 	if relays < 2 {
-		_ = n.dialRelay(n.ctx, s.peer, 1)
+		_ = n.dialRelay(s.peer, 1)
 	}
 }
 

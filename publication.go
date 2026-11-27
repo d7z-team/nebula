@@ -220,7 +220,7 @@ func (n *Node) acceptPublication(ctx context.Context, from *session, record stat
 
 // Push and fetch both recheck the cached signature and path after waiting for bandwidth.
 func (n *Node) pacePublication(ctx context.Context, s *session, id string, record statement) bool {
-	if n.shape(ctx, len(record)) != nil {
+	if _, err := n.shaper.schedule(ctx, PeerID{}, len(record)); err != nil {
 		return false
 	}
 	n.mu.Lock()

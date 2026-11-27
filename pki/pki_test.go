@@ -44,7 +44,13 @@ func TestIssuanceAndCMS(t *testing.T) {
 	profile.Scope = nil
 	profile.Subject = req.Subject
 	profile.MaxPathLen = 0
-	inter, err := (Issuer{[]*x509.Certificate{root}, key}).IssueCA(req, profile, sha256.Sum256(req.RawSubjectPublicKeyInfo))
+	clusterIssuer := Issuer{[]*x509.Certificate{root}, key}
+	approved := sha256.Sum256(req.RawSubjectPublicKeyInfo)
+	legacy := profile
+	legacy.SignatureAlgorithm = x509.ECDSAWithSHA1
+	_, err = clusterIssuer.IssueCA(req, legacy, approved)
+	require.ErrorIs(t, err, x509.InsecureAlgorithmError(x509.ECDSAWithSHA1))
+	inter, err := clusterIssuer.IssueCA(req, profile, approved)
 	require.NoError(t, err)
 	issuer := Issuer{[]*x509.Certificate{inter, root}, interKey}
 	cluster, err := ReadClusterCA(root)

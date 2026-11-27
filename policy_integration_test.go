@@ -31,16 +31,7 @@ func TestQueueRevokedDuringShaping(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
-	in := make(chan []byte, 3)
-	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { in <- pkt }})
-	require.NoError(t, err)
-	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
-	require.NoError(t, err)
-	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	for _, body := range []string{"shaping", "queued", "queued again"} {
-		require.NoError(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, body)))
-	}
-	require.Eventually(t, func() bool { return port.Stats().Queued == 2 && a.limiter.Tokens() < 0 }, time.Second, time.Millisecond)
+	port, _, in := queueShapedPackets(t, a, b, b.Addresses().IPv4, "shaping", "queued", "queued again")
 	denied.Store(true)
 	require.NoError(t, a.Revalidate(t.Context()))
 	require.Zero(t, port.Stats().Queued)
@@ -54,16 +45,7 @@ func TestClearPendingByPeer(t *testing.T) {
 	f.start()
 	a, b := f.nodes[0], f.nodes[1]
 	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
-	received := make(chan []byte, 3)
-	_, err := b.OpenIPPort(IPPortOptions{Deliver: func(_ PeerID, pkt []byte) { received <- pkt }})
-	require.NoError(t, err)
-	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
-	require.NoError(t, err)
-	require.True(t, a.limiter.AllowN(time.Now(), 65536))
-	held := testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "held")
-	require.NoError(t, port.WriteIP(b.id, held))
-	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
-	require.NoError(t, port.WriteIP(b.id, held))
+	port, _, received := queueShapedPackets(t, a, b, b.Addresses().IPv4, "in flight", "queued")
 	require.Equal(t, 1, port.ClearPending(b.id))
 
 	fresh := testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "fresh")
@@ -72,7 +54,7 @@ func TestClearPendingByPeer(t *testing.T) {
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	select {
 	case got := <-received:
-		require.Equal(t, fresh, got)
+		require.Equal(t, "fresh", got)
 	case <-time.After(time.Second):
 		t.Fatal("replacement queue did not deliver")
 	}
@@ -334,31 +316,32 @@ func TestRestrictedEndpointUpdates(t *testing.T) {
 	require.True(t, n.endpointAllowed("tcp", next, true))
 }
 
-func TestPeerNameAndTLSAdmission(t *testing.T) {
-	f := newFixture(t, "tcp", "tcp", "tcp")
+func TestTLSAdmissionAndPeerIdentity(t *testing.T) {
+	f := newFixture(t, "tcp", "tcp", "tcp", "tcp")
+	f.opts[1].Transport.CurvePreferences = []tls.CurveID{tls.CurveP256}
+	f.opts[2].Transport.ALPN = "other-app"
+	f.opts[3].Transport.CurvePreferences = []tls.CurveID{tls.X25519}
 	f.start()
+	// New owns its copy even when the caller reuses the options.
+	f.opts[1].Transport.CurvePreferences[0] = tls.X25519
 	a, b := f.nodes[0], f.nodes[1]
-	for name, change := range map[string]func(*tls.Config){
-		"alpn":  func(c *tls.Config) { c.NextProtos = []string{"other-app"} },
-		"group": func(c *tls.Config) { c.CurvePreferences = []tls.CurveID{tls.X25519} },
-	} {
-		t.Run(name, func(t *testing.T) {
-			cfg := a.tlsConfig(b.id, true, a.cred.Load())
-			change(cfg)
-			d := tls.Dialer{Config: cfg}
-			c, err := d.DialContext(t.Context(), "tcp", b.o.Transport.TCP4.Addr().String())
-			if c != nil {
-				c.Close()
-			}
-			require.Error(t, err)
-		})
-	}
+	t.Run("alpn", func(t *testing.T) {
+		_, err := f.nodes[2].ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+		require.ErrorContains(t, err, "application protocol")
+	})
+	t.Run("group", func(t *testing.T) {
+		_, err := f.nodes[3].ConnectEndpoint(t.Context(), f.cfg.Members[1].Endpoints[0])
+		require.ErrorContains(t, err, "handshake failure")
+	})
 	// A trusted node at a different endpoint cannot take the intended peer's place.
 	f.cfg.Members[2].Endpoints = f.cfg.Members[1].Endpoints
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))
 	require.Error(t, a.ConnectPeer(t.Context(), f.ips[2]))
 	require.Empty(t, a.Paths())
 	require.NoError(t, a.ConnectPeer(t.Context(), b.Addresses().IPv4))
+	path, ok := a.PreferredPath(b.id)
+	require.True(t, ok)
+	require.Equal(t, tls.CurveP256, path.TLSGroup)
 }
 
 func TestAddressPairPolicyAndReassignment(t *testing.T) {
@@ -390,7 +373,7 @@ func TestAddressPairPolicyAndReassignment(t *testing.T) {
 	f.cfg.Members = slices.Delete(f.cfg.Members, 1, 2)
 	port, err := a.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
-	require.True(t, a.limiter.AllowN(time.Now(), 65536))
+	require.True(t, a.shaper.limiter.AllowN(time.Now(), 65536))
 	require.NoError(t, port.WriteIP(b.id, testIPv4(a.Addresses().IPv4, b.Addresses().IPv4, "held for previous owner")))
 	require.Eventually(t, func() bool { return port.Stats().Queued == 0 }, time.Second, time.Millisecond)
 	require.NoError(t, a.ApplyTopology(t.Context(), f.cfg))

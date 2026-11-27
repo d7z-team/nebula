@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -66,7 +67,7 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	}
 	n.mu.Unlock()
 	s, back := &session{peer: other.id}, &session{peer: n.id}
-	first := n.advert(s)
+	first, _ := n.advert(s)
 	firstBytes, err := json.Marshal(first)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(firstBytes), 64<<10)
@@ -74,7 +75,8 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	require.Less(t, len(first.Inventory), maxPublications)
 
 	ids := map[string]bool{}
-	for _, page := range []advert{first, n.advert(s)} {
+	second, _ := n.advert(s)
+	for _, page := range []advert{first, second} {
 		for _, id := range page.Inventory {
 			ids[id] = true
 		}
@@ -82,8 +84,9 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 	require.Len(t, ids, maxPublications)
 	_, ok := other.learnIntroduction(t.Context(), first.Record, nil)
 	require.True(t, ok)
-	s.acknowledgedIntro.Store(other.advert(back).Seen)
-	steady := n.advert(s)
+	seen, _ := other.advert(back)
+	s.acknowledgedIntro.Store(seen.Seen)
+	steady, _ := n.advert(s)
 	require.Empty(t, steady.Record)
 	require.Len(t, steady.Inventory, maxPublications)
 	steadyBytes, err := json.Marshal(steady)
@@ -122,16 +125,23 @@ func TestMaximumPublicationAndInventoryFrames(t *testing.T) {
 
 func TestPublicationRepairAndPolicyWithdrawal(t *testing.T) {
 	f := newFixture(t, "tcp", "tcp", "tcp")
-	// The first delivery uses push. Only the late joiner polls for inventory.
-	f.opts[0].MaintenanceInterval, f.opts[1].MaintenanceInterval = time.Hour, time.Hour
+	// Publish after the initial inventory exchange to isolate the push.
+	f.opts[0].Probe.Interval, f.opts[1].Probe.Interval = time.Hour, time.Hour
 	f.start()
 	a, mid, b := f.nodes[0], f.nodes[1], f.nodes[2]
 	require.NoError(t, a.ConnectPeer(t.Context(), mid.Addresses().IPv4))
 	_, err := mid.ConnectEndpoint(t.Context(), f.cfg.Members[0].Endpoints[0])
 	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		return len(a.Paths()) == 2 && len(mid.Paths()) == 2
-	}, time.Second, time.Millisecond)
+	for _, n := range []*Node{a, mid} {
+		require.Eventually(t, func() bool {
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			ss := n.sessionListLocked()
+			return len(ss) == 2 && !slices.ContainsFunc(ss, func(s *session) bool {
+				return s.nextHello.Before(time.Now().Add(introductionRefreshLead))
+			})
+		}, time.Second, time.Millisecond)
+	}
 	sub, err := b.Subscribe("app/test/update")
 	require.NoError(t, err)
 	defer sub.Close()

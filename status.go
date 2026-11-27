@@ -18,7 +18,9 @@ type PathStatus struct {
 	// Instance identifies the authenticated remote run.
 	Instance InstanceID
 	// Transport is "udp" (QUIC), "tcp" (TLS), or "relay" (an end-to-end circuit).
-	Transport, ALPN               string
+	Transport string
+	// ALPN is the TLS application protocol negotiated on this path.
+	ALPN                          string
 	TLSGroup                      tls.CurveID
 	TLSVersion                    uint16
 	GrantSerial, LocalGrantSerial string
@@ -147,7 +149,7 @@ func (n *Node) ControlStatus() ControlStatus {
 		Closed:                    n.state == closed,
 		Ready:                     n.state != closed && n.ready(n.policy.Load()),
 		Circuits:                  len(n.circuits),
-		BytesScheduled:            n.bytesScheduled.Load(),
+		BytesScheduled:            n.shaper.bytesScheduled.Load(),
 		DialFailures:              n.dialFailures.Load(),
 		RejectedInboundHandshakes: n.handshakeRejections,
 		LastError:                 n.lastConnectError,

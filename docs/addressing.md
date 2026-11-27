@@ -53,7 +53,9 @@ if err := cluster.ValidateMember(pair); err != nil {
 | 服务 VIP | `node.AnycastMembers(vip)` 返回本机拓扑许可的成员副本，其中可以包含本机。选定远端后调用 `port.WriteIP(peerID, packet)`。本机服务由宿主栈交付。 |
 | 下游地址 | 传入有相应路由授权的网关 ID。两个网关承载同一前缀时，原始端口的 `Deliver(from, packet)` 提供入站网关的认证 ID，宿主可以将回包写给该 ID。 |
 
-VIP 或下游地址使用零 ID 时，端口在入队前调用一次可选的 `ResolveNextHop(dst, packet)`。回调收到只读包，可以查询节点或应用的流绑定表。回调结束后，端口用最新拓扑重新检查所选成员；回调返回的错误直接交给写入方。显式下一跳、已归属的主地址和组流量均跳过回调。调用方未配置解析器或解析器返回零 ID 时，写入返回 `ErrNextHopRequired`。目的为本机尚未知的普通主地址时，先显式调用 `ResolveIP(ctx, dst)`，选中结果后可调用 `ConnectPeerID(ctx, match.Peer)`，向该身份写包。
+VIP 或下游地址使用零 ID 时，端口在入队前调用可选的 `ResolveNextHop(dst, packet)`。回调可按只读包查询应用的流绑定表，返回成员 ID 或路由错误。端口按最新拓扑复核选中的成员。缺少解析器或返回零 ID 时，写入返回 `ErrNextHopRequired`。
+
+成员网段内的普通地址按主地址归属交付。用零 ID 写往未知主地址会返回 `ErrPeerUnavailable`。调用 `ResolveIP(ctx, dst)` 取得签名介绍后，可用结果的 `Peer` 写包，也可先用 `ConnectPeerID` 预连接。[地址查询](integration.md#按地址发现成员和下游网关)
 
 查询下游地址得到多个候选时，应用可按流选定网关。宿主核准网关及其下游前缀后，用 `ApplyTopology` 安装本机视图。实际收发时会核对该会话出示的集群授权。[地址查询与缓存](integration.md#按地址发现成员和下游网关) · [IP 端口](../ip_port.go)
 
