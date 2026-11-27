@@ -287,6 +287,11 @@ func TestConnectEndpointRecoveryAfterUDPBlackout(t *testing.T) {
 	require.NoError(t, err)
 	port, err := b.OpenIPPort(IPPortOptions{Deliver: func(PeerID, []byte) {}})
 	require.NoError(t, err)
+	// ConnectEndpoint returns when A registers its path. B registers independently.
+	require.Eventually(t, func() bool {
+		path, ok := b.PreferredPath(a.ID())
+		return ok && path.Transport == "udp"
+	}, 3*time.Second, time.Millisecond, "B did not register the recovered UDP path to A")
 	require.NoError(t, port.WriteIP(a.ID(), testIPv4(b.Addresses().IPv4, a.Addresses().IPv4, "after recovery")))
 	select {
 	case msg := <-reply:
