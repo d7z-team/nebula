@@ -22,7 +22,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula/pki"
 
 	"github.com/stretchr/testify/require"
 )

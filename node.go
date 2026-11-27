@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/meshwire"
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula/meshwire"
+	"gopkg.d7z.net/nebula/pki"
 
 	quic "github.com/quic-go/quic-go"
 	"golang.org/x/time/rate"

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/pki"
-	"code.d7z.net/d7z-team/nebula/portshare"
+	"gopkg.d7z.net/nebula/pki"
+	"gopkg.d7z.net/nebula/portshare"
 
 	"github.com/stretchr/testify/require"
 )

@@ -17,14 +17,7 @@ Bob sends Alice a signed publication and an IPv6 packet over a loopback QUIC con
 Add the module to your application.
 
 ```sh
-go get code.d7z.net/d7z-team/nebula
-```
-
-To develop against a local checkout, point your module at that directory.
-
-```sh
-go mod edit -replace=code.d7z.net/d7z-team/nebula=/absolute/path/to/nebula
-go get code.d7z.net/d7z-team/nebula@v0.0.0
+go get gopkg.d7z.net/nebula
 ```
 
 1. Give `nebula.New` the root CA, pinned cluster CA, node certificate and same-key cluster grant in `Options.Auth`. The local topology can start with just your own member.

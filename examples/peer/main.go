@@ -19,8 +19,8 @@ import (
 	"os/signal"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/pki"
 )
 
 func main() {

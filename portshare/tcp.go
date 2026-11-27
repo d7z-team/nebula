@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/meshwire"
+	"gopkg.d7z.net/nebula/meshwire"
 )
 
 // TCP owns a physical listener and delivers original, unhandshaken connections to two listeners.

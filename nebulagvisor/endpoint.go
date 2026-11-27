@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"code.d7z.net/d7z-team/nebula"
+	"gopkg.d7z.net/nebula"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"

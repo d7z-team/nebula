@@ -17,9 +17,9 @@ import (
 	"net/http"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/examples/demo"
-	"code.d7z.net/d7z-team/nebula/portshare"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/examples/demo"
+	"gopkg.d7z.net/nebula/portshare"
 
 	"github.com/quic-go/quic-go/http3"
 )

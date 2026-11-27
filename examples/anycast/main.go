@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/examples/demo"
-	"code.d7z.net/d7z-team/nebula/nebulagvisor"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/examples/demo"
+	"gopkg.d7z.net/nebula/nebulagvisor"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"

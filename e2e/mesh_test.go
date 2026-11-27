@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/meshwire"
-	"code.d7z.net/d7z-team/nebula/nebulagvisor"
-	"code.d7z.net/d7z-team/nebula/pki"
-	"code.d7z.net/d7z-team/nebula/portshare"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/meshwire"
+	"gopkg.d7z.net/nebula/nebulagvisor"
+	"gopkg.d7z.net/nebula/pki"
+	"gopkg.d7z.net/nebula/portshare"
 
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"

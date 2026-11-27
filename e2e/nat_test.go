@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
+	"gopkg.d7z.net/nebula"
 
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"

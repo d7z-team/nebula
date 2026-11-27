@@ -1,4 +1,4 @@
-module code.d7z.net/d7z-team/nebula
+module gopkg.d7z.net/nebula
 
 go 1.27.3
 

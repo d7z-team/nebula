@@ -9,7 +9,7 @@ formatters:
       custom-order: true
       sections:
         - standard
-        - prefix(code.d7z.net/d7z-team/nebula)
+        - prefix(gopkg.d7z.net/nebula)
         - blank
         - default
     gofumpt:

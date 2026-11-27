@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/meshwire"
+	"gopkg.d7z.net/nebula/meshwire"
 
 	"golang.org/x/crypto/cryptobyte"
 )

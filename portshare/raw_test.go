@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/meshwire"
+	"gopkg.d7z.net/nebula/meshwire"
 
 	"github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/require"

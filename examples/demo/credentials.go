@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula/pki"
 )
 
 // NewIssuers creates the ordinary root and its demo cluster authority.

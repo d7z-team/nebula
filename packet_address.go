@@ -7,7 +7,7 @@ import (
 	"slices"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula/pki"
 )
 
 var ErrInvalidPacketAddress = errors.New("invalid inner IP packet")

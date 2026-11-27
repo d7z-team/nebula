@@ -8,7 +8,7 @@ import (
 	"slices"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula/pki"
 )
 
 // Endpoint identifies a UDP or TCP address on the physical network.

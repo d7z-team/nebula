@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula/pki"
 )
 
 // IPMatch identifies the owner of a primary address or a gateway advertising Prefix.

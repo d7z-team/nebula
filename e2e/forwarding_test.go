@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/nebulagvisor"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/nebulagvisor"
 
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/buffer"

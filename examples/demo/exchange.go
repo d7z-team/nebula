@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"code.d7z.net/d7z-team/nebula"
+	"gopkg.d7z.net/nebula"
 )
 
 // ExchangeIPv6 sends a request to the selected identity through the client IP

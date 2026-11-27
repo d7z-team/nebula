@@ -8,9 +8,9 @@ import (
 	"net/netip"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/examples/demo"
-	"code.d7z.net/d7z-team/nebula/pki"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/examples/demo"
+	"gopkg.d7z.net/nebula/pki"
 )
 
 func ExampleIPPort_WriteIP() {

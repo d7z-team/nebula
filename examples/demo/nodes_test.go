@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"code.d7z.net/d7z-team/nebula"
-	"code.d7z.net/d7z-team/nebula/examples/demo"
+	"gopkg.d7z.net/nebula"
+	"gopkg.d7z.net/nebula/examples/demo"
 
 	"github.com/stretchr/testify/require"
 )
